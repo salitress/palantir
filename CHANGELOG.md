@@ -3,7 +3,16 @@
 High-level history of `palantir.py`. This is a summary, not a line-by-line
 commit log — see `git log` for that.
 
-## Active Directory / Kerberos
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+this project follows [Semantic Versioning](https://semver.org/).
+
+## [Unreleased]
+
+## [1.0.0] - 2026-11-10
+
+Initial public release.
+
+### Active Directory / Kerberos
 
 - SMB/LDAP anonymous-session enumeration: RID cycling, group membership for
   high-value groups (Domain/Enterprise Admins, custom RID≥1000 groups),
@@ -31,7 +40,7 @@ commit log — see `git log` for that.
   and more reliable than looping one `nxc` process per pair), falling back to
   `nxc` for the rest and for pass-the-hash.
 
-## Scanning engine
+### Scanning engine
 
 - Four-phase nmap pipeline: ping-sweep (CIDR/range pruning), full TCP port
   discovery, `-sV` + curated NSE scripts, optional UDP sweep of the ports
@@ -46,7 +55,7 @@ commit log — see `git log` for that.
 - Multi-target support (CIDR, range, list, file) with optional parallel
   scanning (`--jobs N`) and an aggregate `index.html` across targets.
 
-## Web
+### Web
 
 - Extension-aware directory fuzzing (IIS/PHP/Tomcat/Apache), parallel
   fuzzing across multiple web ports, vhost fuzzing with automatic catch-all
@@ -58,7 +67,7 @@ commit log — see `git log` for that.
   off by default — all of them are slower and noisier than the default
   recon pass.
 
-## Known exploits & default credentials
+### Known exploits & default credentials
 
 - Offline `searchsploit` lookups per detected product/version, with a
   heuristic severity estimate (always verify the EDB-ID by hand).
@@ -66,7 +75,7 @@ commit log — see `git log` for that.
   confirmed with a real read operation (not just "it connected") to avoid
   false positives — explicitly **not** brute force.
 
-## Reporting
+### Reporting
 
 - Self-contained `report.html` (no CDNs), `report.md`, and `findings.json`,
   grouped by protocol, with a Quick Wins section (most actionable findings
@@ -77,7 +86,7 @@ commit log — see `git log` for that.
   final report replaces it — so a run that's interrupted never leaves you
   without a report.
 
-## Tooling / installation
+### Tooling / installation
 
 - Pre-flight check for required/optional tools, with `--install-missing`
   installing what it can (`apt` where available, `pip`/`pipx` or a

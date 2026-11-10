@@ -114,3 +114,18 @@ lists of these dicts, so they render (`render_footprint`) and export
 - Keep the read-only / no-auto-exploit philosophy above — if a change would
   cross that line, open an issue to discuss it first.
 - One logical change per PR is easier to review than a grab-bag.
+
+## Versioning
+
+Releases follow [Semantic Versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
+
+- **MAJOR** — a flag is removed/renamed, a default behavior changes in a way
+  that could surprise an existing user (e.g. a phase that used to run by
+  default now doesn't), or the report/JSON format changes incompatibly.
+- **MINOR** — a new flag, a new protocol, or a new check added without
+  changing any existing behavior.
+- **PATCH** — a bugfix, a wording/report fix, or anything else that doesn't
+  change the CLI surface.
+
+Each release is tagged `vX.Y.Z` on `main` and gets an entry in
+[CHANGELOG.md](CHANGELOG.md).

@@ -1,7 +1,10 @@
 # palantir
 
 [![selftest](https://github.com/salitress/palantir/actions/workflows/selftest.yml/badge.svg)](https://github.com/salitress/palantir/actions/workflows/selftest.yml)
+[![Release](https://img.shields.io/github/v/tag/salitress/palantir?label=release)](https://github.com/salitress/palantir/tags)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Stars](https://img.shields.io/github/stars/salitress/palantir)](https://github.com/salitress/palantir/stargazers)
 [![Español](https://img.shields.io/badge/README-Español-red.svg)](README.es.md)
 
 **Nmap-driven recon automation for authorized labs and engagements (OSCP / CPTS / HTB).**

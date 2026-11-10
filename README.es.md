@@ -1,7 +1,10 @@
 # palantir
 
 [![selftest](https://github.com/salitress/palantir/actions/workflows/selftest.yml/badge.svg)](https://github.com/salitress/palantir/actions/workflows/selftest.yml)
+[![Release](https://img.shields.io/github/v/tag/salitress/palantir?label=release)](https://github.com/salitress/palantir/tags)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Stars](https://img.shields.io/github/stars/salitress/palantir)](https://github.com/salitress/palantir/stargazers)
 [![English](https://img.shields.io/badge/README-English-blue.svg)](README.md)
 
 Scanner de reconocimiento guiado por Nmap para labs (HTB / CPTS). ve puertos, servicios, **footprinting por protocolo**, **exploits conocidos** y superficie web antes de tocar nada. **Educativo**: imprime cada comando que lanza con su *por qué*, en pantalla y en el informe HTML. Python 3, **solo stdlib** en el núcleo; herramientas externas **opcionales** (se saltan solas si no están): `nmap` (obligatorio), `ffuf` (fuzzing web), `searchsploit` (exploits conocidos), y para el footprinting: `nxc`/`netexec` (SMB, LDAP, WinRM, RDP, VNC, WMI, MSSQL, NFS), `smbclient`/`rpcclient`/`smbmap`/`enum4linux-ng`, `impacket-rpcdump`, `showmount`, `dig`, `whois`, `crt.sh` (Certificate Transparency), `ldapsearch`, `whatweb`, `wafw00f`, `snmpwalk`/`onesixtyone`, `tnscmd10g`, `redis-cli`, `certipy` (AD CS: plantillas de certificados vulnerables), `impacket-GetNPUsers`/`GetUserSPNs` (AS-REP roast / Kerberoasting), `adidnsdump` (DNS interno vía LDAP). Pensado para Kali.
