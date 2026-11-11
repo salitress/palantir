@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Resultados de palantir (por si se ejecuta dentro del repo)
+htb/
+*/report.html
+*/report.md
+*/findings.json
+*/commands.log
+
+# Basura de herramientas ejecutadas dentro del repo
+hydra.restore
