@@ -2378,14 +2378,19 @@ def fp_smb(ip, ports, services, host, deep):
             # (nxc/modules/zerologon.py): "VULNERABLE" si lo es, "Attack failed. Target is
             # probably patched." si no — las dos frases no comparten "VULNERABLE", así que
             # basta el substring sin falsos positivos.
-            # El propio módulo de nxc es un bucle de hasta 2000 intentos (MAX_ATTEMPTS, código
-            # fuente de nxc/modules/zerologon.py) porque el bypass es probabilístico: ~256
-            # intentos de media si el DC SÍ es vulnerable (2 RPC por intento), y solo 0.04% de
-            # falso negativo si llega a completar los 2000 — así que un objetivo vulnerable que
-            # sale como "no vulnerable" casi siempre es el proceso MATADO a mitad del bucle por
-            # un timeout corto, no mala suerte del propio check ni un fallo de parseo. Por eso el
-            # timeout es generoso y se dobla con --tunnel/pivoting (más latencia por intento).
-            zlog_timeout = 240 if TUNNEL else 120
+            # El propio módulo de nxc reintenta en bucle hasta 2000 veces (MAX_ATTEMPTS, código
+            # fuente de nxc/modules/zerologon.py) porque el bypass es probabilístico (~256
+            # intentos de media si el DC SÍ es vulnerable) — pero en la práctica, contra un DC
+            # real, nxc encuentra el hallazgo en segundos (confirmado: <15s en dos ejecuciones
+            # manuales seguidas), así que el timeout corto NO es "necesitaba más intentos". Un
+            # caso real SÍ dio output COMPLETAMENTE VACÍO con el timeout de 60s (ver
+            # findings.json), que encaja más con el intento de conexión quedándose colgado
+            # (posiblemente el propio DC más lento tras el resto de SMB/RPC que palantir ya le
+            # había lanzado — rpcclient/enum4linux-ng/nxc --rid-brute, justo antes de este paso)
+            # que con agotar intentos de verdad. El timeout se sube de 60s a 120s como margen de
+            # seguridad igualmente — no hace daño — pero si se repite, el problema de fondo
+            # probablemente sea contención/carga durante el escaneo, no el propio check.
+            zlog_timeout = 120
             rc, zout = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "zerologon"], timeout=zlog_timeout)
             zvuln = "VULNERABLE" in (zout or "")
             _step(res, f"{nxc} smb {ip} -u '' -p '' -M zerologon", zvuln, zout,
