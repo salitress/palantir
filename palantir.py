@@ -2378,7 +2378,15 @@ def fp_smb(ip, ports, services, host, deep):
             # (nxc/modules/zerologon.py): "VULNERABLE" si lo es, "Attack failed. Target is
             # probably patched." si no — las dos frases no comparten "VULNERABLE", así que
             # basta el substring sin falsos positivos.
-            rc, zout = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "zerologon"], timeout=60)
+            # El propio módulo de nxc es un bucle de hasta 2000 intentos (MAX_ATTEMPTS, código
+            # fuente de nxc/modules/zerologon.py) porque el bypass es probabilístico: ~256
+            # intentos de media si el DC SÍ es vulnerable (2 RPC por intento), y solo 0.04% de
+            # falso negativo si llega a completar los 2000 — así que un objetivo vulnerable que
+            # sale como "no vulnerable" casi siempre es el proceso MATADO a mitad del bucle por
+            # un timeout corto, no mala suerte del propio check ni un fallo de parseo. Por eso el
+            # timeout es generoso y se dobla con --tunnel/pivoting (más latencia por intento).
+            zlog_timeout = 240 if TUNNEL else 120
+            rc, zout = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "zerologon"], timeout=zlog_timeout)
             zvuln = "VULNERABLE" in (zout or "")
             _step(res, f"{nxc} smb {ip} -u '' -p '' -M zerologon", zvuln, zout,
                   note="CVE-2020-1472: ¿el DC es vulnerable a Zerologon? Comprobación de solo lectura, SIN credenciales — nxc no explota, solo confirma")
