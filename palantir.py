@@ -6050,7 +6050,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
 
     try:
         if np == "smb":
-            rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["--shares"], timeout=90, quiet=True)
+            rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["--shares"], timeout=120, quiet=True)
             _step(res, f"{nxc} smb {ip} {shown_auth} --shares", _nxc_ok(out), mask(out),
                   note=f"comparticiones y permisos CON la credencial de «{u}» (no como null/guest)")
             readable = _smb_readable_shares(out)
@@ -6066,8 +6066,13 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # ldap, '[-] [REMOVED]'; va por LDAP más abajo.)
             for mod, note in (("--users", f"usuarios ({_scope}) — con credencial, lista completa; base para spraying/roasting"),
                               ("--pass-pol", "política de contraseñas (longitud, bloqueo)"),
-                              ("--rid-brute", "RID cycling por IPC$ (saca usuarios aunque --users esté capado)")):
-                rc, out = _run_capture_retry([nxc, "smb", ip] + A() + [mod], timeout=120, quiet=True)
+                              ("--rid-brute", "RID cycling por IPC$ (saca usuarios aunque --users esté capado) — en un "
+                                              "dominio con muchas cuentas puede tardar bastante más que en un lab pequeño")):
+                # --rid-brute en concreto escala con el tamaño del dominio (más cuentas = más RIDs
+                # que probar) — contra un AD con varios cientos de cuentas, 120s se queda corto
+                # de forma CONSISTENTE (no es un timeout transitorio, _run_capture_retry no ayuda
+                # si el fallo se repite siempre con el mismo límite corto).
+                rc, out = _run_capture_retry([nxc, "smb", ip] + A() + [mod], timeout=240, quiet=True)
                 _step(res, f"{nxc} smb {ip} {shown_auth} {mod}", rc == 0, mask(out), note=note)
                 _surface_ad_enum(res, u, mod, out, base, seen)
             # --loggedon-users: ¿quién tiene sesión abierta AHORA en el objetivo? Necesita admin
@@ -6075,7 +6080,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # devuelve 'Error enumerating logged on users' y el paso solo lo registra. Cuando SÍ
             # entra, es oro para el movimiento lateral: delata en qué equipo está logueado un
             # usuario privilegiado (ahí se le roba el token / se cosechan sus credenciales).
-            rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["--loggedon-users"], timeout=90, quiet=True)
+            rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["--loggedon-users"], timeout=120, quiet=True)
             logged = _parse_loggedon_users(out)
             _step(res, f"{nxc} smb {ip} {shown_auth} --loggedon-users", bool(logged), mask(out),
                   note="usuarios con sesión abierta ahora mismo en el objetivo (necesita admin local): "
@@ -6100,7 +6105,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             if is_dc:
                 for mod, label in (("gpp_password", "GPP cpassword (Groups.xml)"),
                                     ("gpp_autologin", "GPP autologon (Registry.xml)")):
-                    rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["-M", mod], timeout=90, quiet=True)
+                    rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["-M", mod], timeout=120, quiet=True)
                     hit = bool(re.search(r"Found credentials in", out or ""))
                     _step(res, f"{nxc} smb {ip} {shown_auth} -M {mod}", hit, mask(out),
                           note=f"{label}: contraseñas que quedaron en SYSVOL cifradas con la clave AES PÚBLICA "
@@ -6116,7 +6121,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 # suplantar un DC → de ahí, Domain Admin. Formato de salida confirmado en el código
                 # fuente de nxc (nxc/modules/nopac.py): con hallazgo hace
                 # context.log.highlight("VULNERABLE") (mayúsculas, sin más texto alrededor).
-                rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["-M", "nopac"], timeout=60, quiet=True)
+                rc, out = _run_capture_retry([nxc, "smb", ip] + A() + ["-M", "nopac"], timeout=120, quiet=True)
                 npvuln = "VULNERABLE" in (out or "")
                 _step(res, f"{nxc} smb {ip} {shown_auth} -M nopac", npvuln, mask(out),
                       note="noPac (CVE-2021-42278/42287): ¿puede esta cuenta de dominio estándar suplantar "
