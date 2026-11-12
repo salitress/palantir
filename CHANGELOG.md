@@ -10,6 +10,14 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- ADWS (9389/tcp, `mc-nmf`) now gets its own footprint: it's treated as an
+  additional strong Domain Controller signal (alongside Kerberos), and flags
+  the port with a note that the PowerShell `ActiveDirectory` module talks
+  over this same channel instead of LDAP. Modern ADWS-based BloodHound
+  collectors (SOAPHound, SOAPy and forks) exist but were deliberately left
+  out as a concrete next-step: several active forks with differing syntax,
+  none verified against their own source — consistent with this project's
+  rule of never writing an unverified command into a public suggestion.
 - New manual next-step suggestions in the LDAP credential-enum path, all
   suggestion-only (never executed): `addcomputer.py` + `rbcd.py` when
   MachineAccountQuota > 0, `raiseChild.py` when a parent-child forest trust

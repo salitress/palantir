@@ -1459,6 +1459,8 @@ def classify(p):
         return "rmi"
     if n in ("kerberos-sec", "kerberos") or port == 88:
         return "kerberos"
+    if n == "mc-nmf" or port == 9389:
+        return "adws"
     if port in (2375, 2376):
         return "docker"
     if n == "tftp" or port == 69:
@@ -2083,11 +2085,11 @@ def nxc_auth(nxc, proto, ip, res):
 
 
 def is_domain_controller(services):
-    """Heurística de DC de AD: Kerberos (88) abierto es la señal fuerte; LDAP
-    (389/3268) junto a SMB (139/445) también. Evita lanzar la enum AD contra un
-    simple servidor SMB de workgroup."""
+    """Heurística de DC de AD: Kerberos (88) o ADWS (9389, mc-nmf) abiertos son señal
+    fuerte por sí solos; LDAP (389/3268) junto a SMB (139/445) también. Evita lanzar la
+    enum AD contra un simple servidor SMB de workgroup."""
     ports = {p["port"] for p in services}
-    if 88 in ports:
+    if 88 in ports or 9389 in ports:
         return True
     return bool(ports & {389, 3268}) and bool(ports & {139, 445})
 
@@ -4307,6 +4309,27 @@ def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None):
     return res
 
 
+def fp_adws(ip, ports, services, host, deep):
+    """ADWS (9389/tcp, mc-nmf): solo existe en Domain Controllers — igual de fiable que
+    Kerberos como señal de DC. Es el canal que usa el propio módulo PowerShell
+    ActiveDirectory (Get-ADUser, Get-ADComputer...) en vez de LDAP; también hay
+    colectores tipo BloodHound (SOAPHound, SOAPy) que recolectan por ADWS para evitar
+    el LDAP cuando está monitorizado — se quedan fuera como next-step porque son varios
+    forks activos con sintaxis distinta y no se ha verificado ninguno línea a línea
+    contra su propio código (a diferencia del resto de sugerencias de este fichero).
+    Solo lectura: nmap no trae scripts NSE propios para 9389, así que no hay nada que
+    enumerar aquí sin más herramientas."""
+    res = _fp("adws", "ADWS", [p["port"] for p in ports])
+    res["findings"].append(("info",
+        "ADWS (9389) abierto — corrobora que es un Domain Controller; mismo canal que "
+        "usa el módulo PowerShell ActiveDirectory (Get-AD*) en vez de LDAP"))
+    res["next"].append(
+        "Import-Module ActiveDirectory; Get-ADUser -Filter * -Properties MemberOf,ServicePrincipalName   "
+        "# si ya tienes PowerShell con RSAT en un host del dominio, el módulo ActiveDirectory habla "
+        "por ADWS en vez de LDAP — útil si el LDAP está limitado/monitorizado")
+    return res
+
+
 def fp_docker(ip, ports, services, host, deep):
     """Docker Remote API (2375 sin TLS / 2376 con TLS). Un GET de solo lectura a /version
     confirma acceso sin autenticar: desde ahí, montar la raíz del host y escapar a root
@@ -4604,6 +4627,8 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
                 out.append(fp_rmi(ip, ports, services, host, deep))
             elif proto == "kerberos":
                 out.append(fp_kerberos(ip, ports, services, host, deep, domain=ad_domain, base=base))
+            elif proto == "adws":
+                out.append(fp_adws(ip, ports, services, host, deep))
             elif proto == "docker":
                 out.append(fp_docker(ip, ports, services, host, deep))
             elif proto == "finger":
@@ -7395,6 +7420,10 @@ _TIPS = (
      "mismo repo del exploit). Aun así, el DC queda con el canal seguro roto durante la ventana "
      "entre el reset y la restauración — piénsalo si el lab lo necesita sano para algo más "
      "mientras tanto."),
+    (re.compile(r"ADWS \(9389\)", re.I),
+     "Si LDAP te da poco (filtrado, ACL restrictiva, o simplemente quieres otra vía), el módulo "
+     "PowerShell ActiveDirectory habla por este mismo puerto — pero solo sirve si ya tienes "
+     "ejecución en un host con RSAT instalado, no desde Linux sin más."),
     (re.compile(r"noPac", re.I),
      "Confirmado VULNERABLE, no explotado: antes de lanzar noPac.py confirma el hostname "
      "EXACTO del DC (nbtstat/rdp-ntlm-info) — con el nombre equivocado el ataque falla sin "
@@ -8764,8 +8793,11 @@ def selftest():
     # Detección de DC + parseo de RID cycling (sin tocar la red)
     assert is_domain_controller([{"port": 445}, {"port": 88}])           # Kerberos → DC
     assert is_domain_controller([{"port": 389}, {"port": 139}])          # LDAP + SMB → DC
+    assert is_domain_controller([{"port": 445}, {"port": 9389}])         # ADWS solo → DC
     assert not is_domain_controller([{"port": 445}, {"port": 139}])      # SMB solo → no
     assert not is_domain_controller([{"port": 80}, {"port": 22}])
+    assert classify({"name": "mc-nmf", "port": 9389}) == "adws"
+    assert classify({"name": "", "port": 9389}) == "adws"
     # Fase 5d: parse_provided_creds (user:pass, ':' en la pass, dedup) + dominio + sanitize + rpcdump
     import types as _types
     def _pc(**kw):   # args de sobra para parse_provided_creds/confirm_creds_spray (defaults razonables)
@@ -10488,6 +10520,12 @@ def selftest():
     assert any("impacket-GetNPUsers " in n for n in _kb_fpr["next"]), _kb_fpr["next"]
     assert any("impacket-GetUserSPNs " in n for n in _kb_fpr["next"]), _kb_fpr["next"]
     assert not any("GetNPUsers.py" in n or "GetUserSPNs.py" in n for n in _kb_fpr["next"])
+
+    # fp_adws: puerto 9389 (mc-nmf) → finding de DC + next-step del módulo PowerShell AD
+    _adws_fpr = fp_adws("10.0.0.1", [{"port": 9389, "name": "mc-nmf", "scripts": {}}],
+                         [{"port": 9389, "name": "mc-nmf", "scripts": {}}], {}, False)
+    assert any("Domain Controller" in f[1] for f in _adws_fpr["findings"]), _adws_fpr["findings"]
+    assert any("Get-ADUser" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
 
     # _secretsdump_bin: el nombre de apt ('impacket-secretsdump') va PRIMERO — confirmado
     # contra un Kali real que no tiene 'secretsdump.py' así en el PATH (ver _impacket_suggest_bin
