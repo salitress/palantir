@@ -8,6 +8,18 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- New manual next-step suggestions in the LDAP credential-enum path, all
+  suggestion-only (never executed): `addcomputer.py` + `rbcd.py` when
+  MachineAccountQuota > 0, `raiseChild.py` when a parent-child forest trust
+  is found, `ticketer.py` (Golden Ticket) when DCSync recovers the krbtgt
+  hash, and `dacledit.py -action read` against a handful of high-value
+  objects (Domain Admins, domain root, krbtgt, AdminSDHolder) whenever the
+  domain is known. Every command's exact flags were verified against
+  Impacket's own source before being added (several prior suggestions in
+  this project had invented flags that didn't match any real tool).
+
 ### Changed
 
 - PetitPotam/PrinterBug/PrintNightmare next-step suggestions in the MSRPC

