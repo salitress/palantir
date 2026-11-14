@@ -6203,14 +6203,18 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 if maq_f:
                     _add_once(res, maq_f[0], maq_f[1], "MachineAccountQuota", seen)
                     if maq_f[0] == "alta":
+                        # -hashes *** (NO solo el ':' vacío del ident) cuando is_hash: sin esto, el
+                        # comando sugerido autenticaría con contraseña VACÍA en vez de con el hash —
+                        # mismo patrón que shown_hs/k_auth más abajo para GetUserSPNs/secretsdump.
                         ident = f"{domain}/{shlex.quote(u)}:{'' if is_hash else '***'}"
+                        hs = "-hashes *** " if is_hash else ""
                         res["next"].append(
                             f"addcomputer.py -computer-name 'EVIL$' -computer-pass 'Passw0rd123!' "
-                            f"-dc-ip {ip} {ident}   # MachineAccountQuota>0 confirmado arriba: crea una "
+                            f"-dc-ip {ip} {hs}{ident}   # MachineAccountQuota>0 confirmado arriba: crea una "
                             "cuenta de equipo propia (paso MANUAL, 1er paso de RBCD/noPac/Shadow Credentials)")
                         res["next"].append(
                             f"rbcd.py -delegate-to 'EQUIPO_OBJETIVO$' -delegate-from 'EVIL$' -action write "
-                            f"{ident} -dc-ip {ip}   # RBCD: con la cuenta de equipo de arriba ya creada, "
+                            f"{hs}{ident} -dc-ip {ip}   # RBCD: con la cuenta de equipo de arriba ya creada, "
                             "delega sobre EQUIPO_OBJETIVO para pedir un ticket a su nombre (paso MANUAL)")
                 # Trusts de dominio/bosque: con una credencial YA validada (bind simple sobre
                 # LDAP, no SASL) se lee donde el anónimo de fp_ldap casi nunca llega. nxc NO
@@ -6240,6 +6244,9 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                         # el dominio escaneado es HIJO del partner (nombre DNS subdominio del partner)
                         # Y la credencial actual ya es Domain Admin EN ESE HIJO (palantir no lo
                         # confirma solo, se deja como precondición explícita en el texto).
+                        # (sin '-hashes'/ident con secreto: este bloque solo se alcanza con sec_file,
+                        # que a su vez solo existe con secreto EN CLARO — is_hash=True nunca llega
+                        # aquí, ver el 'if domain and sec_file ...' que envuelve todo el trust lookup)
                         if domain.lower().endswith("." + t["partner"].lower()):
                             res["next"].append(
                                 f"raiseChild.py {domain}/{shlex.quote(u)}   # trust padre-hijo con "
@@ -6388,8 +6395,9 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # 'read' es la acción por defecto, el objetivo va con -target/-target-dn.
             if domain:
                 dom_dn = ",".join(f"DC={p}" for p in domain.split("."))
+                dacl_hs = "-hashes *** " if is_hash else ""
                 res["next"].append(
-                    f"dacledit.py -target 'Domain Admins' {domain}/{shlex.quote(u)}:{'' if is_hash else '***'} "
+                    f"dacledit.py -target 'Domain Admins' {dacl_hs}{domain}/{shlex.quote(u)}:{'' if is_hash else '***'} "
                     f"-dc-ip {ip}   # ACL de 'Domain Admins' — repite cambiando -target por "
                     f"'{dom_dn}' (raíz del dominio), 'krbtgt' y 'CN=AdminSDHolder,CN=System,{dom_dn}' — busca "
                     "GenericAll/WriteDACL/WriteOwner/GenericWrite/AllExtendedRights en un trustee que no sea "
@@ -9796,6 +9804,29 @@ def selftest():
     assert any("dacledit.py" in n and "DC=child,DC=corp,DC=local" in n for n in _chfind["next"])
     assert any("ticketer.py" in n and "16e26ba33e455a8c338142af8d89ffbc" in n and "DOMAIN_SID" in n for n in _chfind["next"])
     assert all("Password123" not in n for n in _chfind["next"])   # el secreto nunca va en texto plano en un next-step
+
+    # Mismo escenario pero con is_hash=True: addcomputer.py/rbcd.py/dacledit.py deben llevar
+    # '-hashes ***' — bug real encontrado por inspección: con is_hash=True, el ':' del ident queda
+    # vacío y, SIN '-hashes', el comando sugerido autenticaría con contraseña VACÍA en vez de con
+    # el hash (mismo patrón que shown_hs/k_auth ya usa para GetUserSPNs/secretsdump más abajo).
+    # (raiseChild.py NO se prueba aquí: ese next-step vive dentro del 'if domain and sec_file...'
+    # del trust lookup, y sec_file solo existe con secreto EN CLARO — con is_hash=True nunca sale.)
+    globals()["nxc_bin"], globals()["run_capture"], globals()["certipy_bin"], globals()["_secretsdump_bin"], globals()["have"] = (
+        (lambda: "FAKE_NXC"), _fake_ldap_full_chain, (lambda: None), (lambda: "FAKE_SECRETSDUMP"),
+        (lambda t: t == "ldapsearch"))
+    try:
+        _chres_h = provided_creds_check("10.0.0.1", [{"port": 389, "name": "ldap"}, {"port": 88, "name": "kerberos-sec"}],
+                                        [("wley", "8846f7eaee8fb117ad06bdd830b7586c")], domain="child.corp.local",
+                                        is_hash=True)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"], globals()["certipy_bin"], globals()["_secretsdump_bin"], globals()["have"] = (
+            _real_nxc_bin2, _real_run_capture, _real_certipy_bin, _real_sd_bin, have)
+    _chfind_h = next(r for r in _chres_h if r["proto"] == "reuse-ldap")
+    assert any("addcomputer.py" in n and "-hashes ***" in n for n in _chfind_h["next"])
+    assert any("rbcd.py" in n and "-hashes ***" in n for n in _chfind_h["next"])
+    assert any("dacledit.py" in n and "-hashes ***" in n for n in _chfind_h["next"])
+    assert not any("raiseChild.py" in n for n in _chfind_h["next"])   # sec_file no existe con is_hash=True → no sale
+    assert all("8846f7eaee8fb117ad06bdd830b7586c" not in n for n in _chfind_h["next"])   # el hash real nunca en texto plano
 
     # Sin dominio conocido todavía (domain=None, el caso normal: Fase 5d corre antes de
     # discover_domains()): certipy NO se ejecuta a ciegas con un dominio adivinado — se
