@@ -27,6 +27,13 @@ this project follows [Semantic Versioning](https://semver.org/).
   - `-M obsolete` (LDAP, con credenciales): equipos del dominio con un SO Windows sin soporte
     (XP/Vista/7/8/Server 2003-2012) — candidatos directos a movimiento lateral si alguno sigue
     vivo en la red.
+- `_run_capture_progressive` (el timeout adaptativo de arriba) ahora imprime un latido cada ~20s
+  mientras espera ("… sigue esperando (N línea(s) de salida hasta ahora, Xs desde la última
+  nueva)"), SIEMPRE, incluso cuando se llama con `quiet=True` — reportado en vivo: contra un AD
+  con más de 2000 usuarios, el operador llevaba 15 minutos sin NINGUNA señal en pantalla durante
+  `--users`/`--rid-brute` y no tenía forma de distinguir "sigue avanzando, tardará lo que tarde"
+  de "se quedó colgado". `ad_users.txt` tampoco ayuda ahí: solo se escribe UNA VEZ, cuando el
+  comando termina del todo, no según va encontrando usuarios.
 - LDAP signing / LDAPS channel binding: read from the banner nxc already prints on every
   `nxc ldap` connection (no extra module — the old dedicated `-M ldap-checker` module is
   retired upstream, confirmed reading nxc's own source). Not enforced → "media" finding

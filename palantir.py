@@ -753,7 +753,8 @@ def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1):
     return rc, out
 
 
-def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval=2, quiet=False):
+def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval=2, quiet=False,
+                             heartbeat_interval=20):
     """Como run_capture, pero para comandos que en un AD GRANDE pueden tardar mucho de verdad
     (--users/--rid-brute contra cientos o miles de cuentas) y donde un timeout FIJO corta la
     enumeración a mitad sin avisar — reportado en vivo: el operador notó que le faltaba un
@@ -794,7 +795,7 @@ def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval
 
     th = threading.Thread(target=_reader, daemon=True)
     th.start()
-    start = last_growth = time.monotonic()
+    start = last_growth = last_heartbeat = time.monotonic()
     last_len = 0
     stalled = False
     while proc.poll() is None:
@@ -807,6 +808,17 @@ def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval
             break
         if now - start > timeout:
             break
+        # Late de vida cada ~20s — SIEMPRE, ignora `quiet`: sin esto, un comando que tarda
+        # varios minutos (--users/--rid-brute contra un AD con miles de cuentas) deja la
+        # pantalla muda y es indistinguible de un cuelgue de verdad desde fuera. Reportado en
+        # vivo: 15 min sin ninguna señal, sin forma de saber si seguía avanzando o no. `quiet`
+        # solo evita el eco del "$ comando" cuando esto se llama MUCHAS veces seguidas (spray) —
+        # aquí se llama un puñado de veces por objetivo, así que el late nunca satura la pantalla.
+        if now - last_heartbeat > heartbeat_interval:
+            last_heartbeat = now
+            print(f"{C_GREY}      … sigue esperando ({len(lines)} línea(s) de salida hasta ahora, "
+                  f"{int(now - last_growth)}s desde la última nueva) — se corta solo tras "
+                  f"{stall_timeout}s SIN ninguna línea nueva{C_RESET}", flush=True)
         time.sleep(poll_interval)
     if proc.poll() is None:   # seguía vivo: lo paramos (estancado, o tocó el techo de seguridad)
         proc.terminate()
@@ -11537,6 +11549,27 @@ def selftest():
     assert _out_p.splitlines() == ["user0", "user1", "user2", "user3", "user4"], _out_p
     assert _elapsed_p < 10, _elapsed_p          # cortado por el estancamiento, NO esperó el colgado de 100s
     assert _rc_p is not None and _rc_p < 0      # terminado con señal (SIGTERM), no "acabó solo"
+
+    # Latido de vida cada heartbeat_interval, SIEMPRE (incluso con quiet=True) — bug real
+    # reportado en vivo: contra un AD de >2000 usuarios, 15 minutos sin NINGUNA señal en pantalla
+    # durante --users/--rid-brute, sin forma de distinguir "sigue avanzando" de "se colgó" (y
+    # ad_users.txt tampoco ayuda: se escribe UNA VEZ al terminar, no según va progresando).
+    import io as _io_rcp, contextlib as _cl_rcp
+    _buf_rcp = _io_rcp.StringIO()
+    with _cl_rcp.redirect_stdout(_buf_rcp):
+        _run_capture_progressive(
+            ["python3", "-c", "import sys,time\n"
+             "for i in range(6):\n print(f'x{i}'); sys.stdout.flush(); time.sleep(0.3)"],
+            timeout=30, stall_timeout=300, poll_interval=0.2, quiet=True, heartbeat_interval=0.5)
+    _hb_out = _buf_rcp.getvalue()
+    assert "sigue esperando" in _hb_out and "línea(s) de salida hasta ahora" in _hb_out, _hb_out
+    # Una espera CORTA (bajo el intervalo de latido) no imprime ninguno — no es ruido para el
+    # caso normal (la mayoría de --users/--pass-pol terminan en segundos).
+    _buf_rcp2 = _io_rcp.StringIO()
+    with _cl_rcp.redirect_stdout(_buf_rcp2):
+        _run_capture_progressive(["python3", "-c", "print('rapido')"],
+                                 timeout=30, stall_timeout=300, poll_interval=0.2, quiet=True)
+    assert "sigue esperando" not in _buf_rcp2.getvalue()
 
     # Termina SOLO antes de cualquier límite → vuelve casi al instante, sin esperar nada de más.
     _t1 = _time_rcp.monotonic()
