@@ -1,0 +1,18 @@
+name: selftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Sintaxis
+        run: python3 -m py_compile palantir.py
+      - name: Selftest (parsers, informes, utilidades — sin red)
+        run: python3 palantir.py --selftest
