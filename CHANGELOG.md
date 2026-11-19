@@ -109,6 +109,25 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Quick Wins only ever looked for next-step commands inside the exact same footprint-dict as
+  the finding — but Fase 5d (credentialed) findings live in a *separate* dict from the
+  anonymous-footprint dict of the same protocol (`reuse-winrm` vs `winrm`, etc. — see
+  `_group_footprints_by_protocol`, already used by the HTML/Markdown renderer for exactly this
+  split). Found live: the single most actionable finding in a whole report — admin access
+  confirmed via WinRM (`Pwn3d!`) — showed up in Quick Wins with **no command at all**, because
+  the matching `evil-winrm -i ip -u USER -p PASS` suggestion (already filled with the real
+  credential, see the `_fill_cred_placeholder` entry above) lived in the sibling anonymous
+  `winrm` dict, not in `reuse-winrm`. `quick_wins()` now pools next-steps across the whole
+  protocol (anonymous + default-creds + provided-creds) before picking commands for a finding.
+- The initial, credential-less kerbrute user count (`Kerberos: N usuario(s) AD válidos por
+  kerbrute`) stayed in Quick Wins even after a later, credentialed domain enumeration produced
+  the complete list from the same `ad_users.txt` (`AD (cred X): N usuarios del dominio`) —
+  found live, side by side: 57 users (partial, wordlist-guessed, pre-credential) and 2901
+  (complete, queried directly with a validated credential), as two separate "where to start"
+  entries pointing at the same file, confusing rather than helpful. Quick Wins now drops the
+  partial kerbrute entry once a complete, credentialed domain-user finding exists anywhere in
+  the report — the full report itself keeps both (they're genuine, distinct findings from
+  different phases), only the condensed Quick Wins view is deduplicated.
 - A credential that nxc returned **completely empty output** for (a transient SMB/LDAP
   connection hiccup, common after several back-to-back calls to the same host) was silently
   recorded as "checked, invalid" — a false negative that skipped the entire credentialed

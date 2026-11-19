@@ -8397,14 +8397,50 @@ def quick_wins(footprints, vulns=None):
     `vulns` (de vuln_search), también saca ahí las filas known=True — un producto
     identificado por KNOWN_VULN_WEB_PRODUCTS es crítico aunque el searchsploit local
     no tenga copia del exploit (no depende de que exploit-db esté actualizado).
-    Alimenta la caja de 'quick wins' de pantalla, HTML y Markdown."""
+    Alimenta la caja de 'quick wins' de pantalla, HTML y Markdown.
+
+    Los next-steps se buscan en TODO el protocolo (anónimo + credenciales por defecto +
+    credenciales aportadas, ver _group_footprints_by_protocol — el mismo agrupado que ya usa
+    el HTML/Markdown), no solo en el footprint-dict exacto donde vive el hallazgo. Bug real
+    visto en vivo: un Pwn3d! de credenciales aportadas por WinRM vive en el dict 'reuse-winrm',
+    pero 'evil-winrm -i ip -u USER -p PASS' (con la credencial YA rellenada, ver
+    _fill_cred_placeholder) vive en el dict 'winrm' anónimo — sin este agrupado, el quick win
+    MÁS accionable del informe entero (admin ya confirmado) salía sin NINGÚN comando."""
+    combined_next = {}
+    for g in _group_footprints_by_protocol(footprints):
+        merged, seen_merged = [], set()
+        for kind in ("anon", "default", "provided"):
+            fpr_g = g.get(kind)
+            if not fpr_g:
+                continue
+            for n in fpr_g["next"]:
+                if n not in seen_merged:
+                    seen_merged.add(n)
+                    merged.append(n)
+        for kind in ("anon", "default", "provided"):
+            fpr_g = g.get(kind)
+            if fpr_g is not None:
+                combined_next[id(fpr_g)] = merged
+    # El kerbrute inicial ("Kerberos: N usuario(s) AD válidos") es una lista PARCIAL (solo pilla
+    # nombres que coinciden con la wordlist probada a ciegas, sin credenciales); si luego hay
+    # credenciales, la enumeración de dominio real (SAMR/LDAP, "AD (cred X): N usuarios del
+    # dominio") la vuelca COMPLETA — ambas acaban en el MISMO ad_users.txt. En el informe
+    # completo las dos se quedan (son hallazgos reales, de fases distintas), pero en Quick Wins
+    # mostrar las dos es ruido: la más completa ya cubre a la parcial, confundía al operador ver
+    # dos números distintos para "lo mismo" (reportado en vivo: 57 vs 2901 del mismo fichero).
+    _has_full_ad_users = any(
+        re.match(r"^AD \(cred [^)]+\): \d+ usuarios del dominio", t)
+        for fpr in footprints for _s, t in fpr["findings"])
     wins = []
     for fpr in footprints:
         hot = [(s, t) for s, t in fpr["findings"] if s in ("critica", "alta")]
         if not hot:
             continue
+        next_pool = combined_next.get(id(fpr), fpr["next"])
         for s, t in hot:
-            wins.append({"sev": s, "title": t, "cmds": _cmds_for(t, fpr["next"]), "tip": _tip_for(t)})
+            if _has_full_ad_users and re.match(r"^Kerberos: \d+ usuario\(s\) AD válidos por kerbrute", t):
+                continue
+            wins.append({"sev": s, "title": t, "cmds": _cmds_for(t, next_pool), "tip": _tip_for(t)})
     for v in (vulns or []):
         if not v.get("known"):
             continue
@@ -11956,7 +11992,7 @@ def selftest():
     loot = _interesting_files(spider_out)
     assert loot == ["id_rsa", "contents\\flag.txt", "contents\\web.config"], loot
     assert _ANSI_RE.sub("", "\x1b[92menum\x1b[0m\x1b[94m[*]\x1b[0m") == "enum[*]"
-    qw = quick_wins([{"title": "SMB", "ports": [445], "steps": [],
+    qw = quick_wins([{"proto": "smb", "title": "SMB", "ports": [445], "steps": [],
                       "findings": [("alta", "share READ"), ("critica", "Pwn3d!")],
                       "next": ["cmd1", "cmd2"], "missing": []}])
     assert qw and qw[0]["sev"] == "critica" and qw[0]["cmds"][0] == "cmd1"
@@ -11965,7 +12001,7 @@ def selftest():
     # en un DC, fp_smb añade el next-step de RID cycling (sin relación) ANTES que el de explotar
     # Zerologon, así que el quick win de Zerologon enseñaba 'rpcclient: queryuser <RID>' como 1er
     # comando y el exploit de verdad (zerologon_tester.py) como 2º.
-    qw_zero = quick_wins([{"title": "SMB / RPC", "ports": [445], "steps": [],
+    qw_zero = quick_wins([{"proto": "smb", "title": "SMB / RPC", "ports": [445], "steps": [],
                            "findings": [("critica", "SMB: Zerologon (CVE-2020-1472) — el DC es "
                                         "VULNERABLE (comprobado, sin credenciales)")],
                            "next": ["rpcclient: 'queryuser <RID>' / brute de RIDs con seq+queryuser",
@@ -11976,6 +12012,34 @@ def selftest():
     assert "queryuser" in qw_zero[0]["cmds"][1]        # …el RID cycling (sin relación) después, no se pierde
     # sin ningún next-step que casara, sigue cayendo al orden original (hallazgo genérico)
     assert _cmds_for("Puerto 80 abierto", ["a", "b", "c", "d"]) == ["a", "b", "c"]
+
+    # quick_wins() busca next-steps en TODO el protocolo (anon+default+provided), no solo en el
+    # dict exacto del hallazgo — bug real visto en vivo: Pwn3d! por WinRM (Fase 5d, dict
+    # 'reuse-winrm', sin next-steps propios) y 'evil-winrm -i ip -u X -p Y' (footprint anónimo,
+    # dict 'winrm') — sin el agrupado, el quick win MÁS accionable del informe salía sin comando.
+    _qwx_anon = {"proto": "winrm", "title": "WinRM", "ports": [5985], "steps": [],
+                 "findings": [], "next": ["evil-winrm -i 10.0.0.1 -u X -p Y   # shell"], "missing": []}
+    _qwx_reuse = {"proto": "reuse-winrm", "title": "Credenciales aportadas — WINRM", "ports": [5985],
+                  "steps": [], "findings": [("critica", "WINRM: credencial aportada «X:Y» da acceso de ADMINISTRADOR (Pwn3d!)")],
+                  "next": [], "missing": []}
+    _qwx = quick_wins([_qwx_anon, _qwx_reuse])
+    assert len(_qwx) == 1 and _qwx[0]["cmds"] == ["evil-winrm -i 10.0.0.1 -u X -p Y   # shell"], _qwx
+
+    # El kerbrute inicial (lista PARCIAL, por wordlist, sin credenciales) queda suprimido de
+    # Quick Wins cuando YA hay una enumeración de dominio completa (con credenciales) del MISMO
+    # ad_users.txt — bug real: el operador veía "57 usuarios" y "2901 usuarios" como dos quick
+    # wins separados, confuso, cuando el segundo ya incluye al primero por completo.
+    _qwk_kerb = {"proto": "kerberos", "title": "Kerberos", "ports": [88], "steps": [],
+                 "findings": [("alta", "Kerberos: 57 usuario(s) AD válidos por kerbrute (→ /tmp/ad_users.txt): aa, bb")],
+                 "next": [], "missing": []}
+    _qwk_full = {"proto": "reuse-smb", "title": "x", "ports": [445], "steps": [],
+                 "findings": [("alta", "AD (cred X): 2901 usuarios del dominio (→ /tmp/ad_users.txt): Administrator, Guest")],
+                 "next": [], "missing": []}
+    _qwk_both = quick_wins([_qwk_kerb, _qwk_full])
+    assert len(_qwk_both) == 1 and "2901 usuarios" in _qwk_both[0]["title"], _qwk_both   # el de 57 NO sale
+    # sin la lista completa, el de kerbrute SÍ sale (es lo único que hay todavía)
+    _qwk_only = quick_wins([_qwk_kerb])
+    assert len(_qwk_only) == 1 and "57 usuario" in _qwk_only[0]["title"], _qwk_only
     # _tip_for: "qué hacer A MANO" por categoría de hallazgo — pedido explícito para uso en
     # OSCP (nada de explotación automatizada). Puro, por coincidencia de texto; cada win de
     # quick_wins() lleva su "tip" ya resuelto (None si ninguna categoría aplica).
