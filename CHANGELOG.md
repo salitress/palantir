@@ -56,6 +56,23 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A single corrupted credential harvested from an `--lsa` dump could silently wipe out the
+  *entire* "credenciales aportadas" phase for a target — found live, against a real DC/box
+  pair, mid-`--resume` run. After a valid credential gets admin on SMB, palantir auto-chains
+  `nxc --sam`/`--lsa` and feeds anything that looks like `usuario:secreto` in the LSA output
+  back into the credential-reuse pool to retry against the other protocols. One real LSA dump
+  returned a line whose "usuario" field was `INLANEFREIGHT.LOCAL\x00/tpetty` — a raw/binary
+  parsing artifact, not an actual credential — and that embedded NUL byte reached
+  `subprocess.run()` unfiltered once the reuse chain tried it, crashing with `ValueError:
+  embedded null byte`. Because that exception wasn't caught inside `provided_creds_check`,
+  it propagated all the way up and got swallowed by the generic per-phase handler, which
+  discarded every footprint dict that phase had already built for that target — the valid
+  credential finding, the SAM hashes, the rest of the LSA secrets, all of it — not just the
+  one bad retry; the report ended up with no "credenciales aportadas" section at all for
+  that host. `_pool_add` (the single choke point every discovered credential goes through
+  before being replayed automatically) now rejects any user/secret containing a NUL byte
+  instead of pooling it, and `provided_creds_check` no longer lets a failure inside the
+  reuse-chain step discard results gathered earlier in the same phase.
 - The shared `index.html` (`<outdir>/index.html`, listing every target scanned into that
   output directory) could end up permanently un-writable after mixing a `sudo` run with a
   later non-`sudo` run — found live: `no pude escribir el índice: [Errno 13] Permission

@@ -7194,10 +7194,23 @@ _REUSE_MAX_CREDS = 20
 
 def _pool_add(pool, user, secret, is_hash):
     """Añade (user, secret, is_hash) al pool de reutilización si no estaba ya. `secret` es una
-    contraseña (is_hash=False) o un hash NTLM (is_hash=True, pass-the-hash)."""
+    contraseña (is_hash=False) o un hash NTLM (is_hash=True, pass-the-hash).
+    Descarta cualquier entrada con un byte NUL en user/secret: un volcado LSA real (--lsa) mezcla,
+    junto a credenciales en texto claro de verdad, artefactos binarios (claves cacheadas, blobs
+    DPAPI) que _parse_nxc_lsa no puede distinguir de una línea 'usuario:secreto' con su regex
+    genérico — confirmado contra un volcado real que coló 'INLANEFREIGHT.LOCAL\\x00/tpetty' como
+    "usuario". Sin este filtro, esa entrada entra en el pool y _reuse_chain la pasa tal cual al
+    argv de subprocess.run() más adelante, que revienta con 'ValueError: embedded null byte' —
+    y como provided_creds_check no tenía por qué esperar eso, la excepción sube sin capturar y
+    _phase_fail descarta TODO lo que esa fase ya había encontrado para el objetivo (credencial
+    aportada válida, SAM, el resto de LSA…), no solo el intento que falló."""
     if not user:
         return
     secret = secret or ""
+    if "\x00" in user or "\x00" in secret:
+        warn(f"credencial descartada del pool de reutilización (byte NUL — artefacto binario del "
+             f"volcado, no una credencial real): «{user!r}»")
+        return
     if any(c["user"] == user and c["secret"] == secret and c["is_hash"] == bool(is_hash) for c in pool):
         return
     pool.append({"user": user, "secret": secret, "is_hash": bool(is_hash)})
@@ -7527,9 +7540,16 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                 enriched.add(np)   # BD: lista bases/tablas no de sistema (+ impersonación/linked/sysadmin en MSSQL)
                 _db_enum(res, np, ip, port, u, p, base, is_hash=is_hash)
     # RETROALIMENTACIÓN: reprueba todo lo descubierto (logins válidos + creds/hashes volcados) contra
-    # el resto de servicios y enumera lo que abra — puede destapar más credenciales en cadena.
-    _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enriched,
-                 nxc, local_auth, is_dc, base, ad_seen, domain)
+    # el resto de servicios y enumera lo que abra — puede destapar más credenciales en cadena. Si
+    # esto revienta a medias (p. ej. una credencial con un carácter que nxc no esperaba) NO debe
+    # tirar todo lo que `results`/`res_by_proto` YA tenían de los bucles de arriba (login válido,
+    # SAM/LSA, enum con la credencial…) — son los mismos dicts por referencia, así que lo ya
+    # escrito sobrevive igual si _reuse_chain se para a mitad.
+    try:
+        _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enriched,
+                     nxc, local_auth, is_dc, base, ad_seen, domain)
+    except Exception as e:
+        _phase_fail("credenciales aportadas (retroalimentación)", e, base)
     return results
 
 
@@ -10048,6 +10068,17 @@ def selftest():
     _pool_add(_pp, "a", "b", False); _pool_add(_pp, "a", "b", False); _pool_add(_pp, "a", "b", True)
     assert len(_pp) == 2 and not _pp[0]["is_hash"] and _pp[1]["is_hash"]
 
+    # _pool_add descarta entradas con un byte NUL (caso real: --lsa devolvió
+    # 'INLANEFREIGHT.LOCAL\x00/tpetty' como "usuario" — un artefacto binario del volcado, no una
+    # credencial — y _reuse_chain lo pasaba tal cual a subprocess.run(), que revienta con
+    # 'ValueError: embedded null byte' y tiraba TODA la fase 5d del objetivo).
+    _ppnul = []
+    _pool_add(_ppnul, "INLANEFREIGHT.LOCAL\x00/tpetty", "secreto", False)
+    _pool_add(_ppnul, "usuario_sano", "secreto\x00binario", True)
+    assert _ppnul == []
+    _pool_add(_ppnul, "usuario_sano", "secreto_normal", False)
+    assert len(_ppnul) == 1
+
     # _reuse_chain: una credencial hallada en un servicio se reprueba en los demás; si abre uno
     # nuevo (smb/ldap) se enumera con ella (la retroalimentación). robin (ya hallado por ssh) →
     # válido por smb → hallazgo de reutilización + _creds_enum por smb.
@@ -10074,6 +10105,31 @@ def selftest():
     assert any(s == "alta" and "reutilizada" in t.lower() for s, t in _rz_smb["findings"])
     assert "smb" in _rz_enriched                                  # y se enumeró smb con la credencial reutilizada
     assert any("--shares" in " ".join(c) for c in _rz_cmds)       # _creds_enum corrió de verdad
+
+    # provided_creds_check no debe perder lo que YA encontró (login válido, SAM/LSA…) si
+    # _reuse_chain revienta a mitad (el bug real: un NUL en una credencial dumpeada abortaba toda
+    # la fase y el host se quedaba sin NADA de "credenciales aportadas" en el informe, no solo sin
+    # la retroalimentación). _reuse_chain real ya está cubierto arriba; aquí solo se comprueba que
+    # una excepción DENTRO de ella no tira los footprint-dicts que provided_creds_check ya tenía.
+    _real_reuse_chain = _reuse_chain
+
+    def _boom_reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enriched,
+                           nxc, local_auth, is_dc, base, ad_seen, domain):
+        next(iter(res_by_proto.values()))["findings"].append(("alta", "hallazgo justo antes de reventar"))
+        raise ValueError("embedded null byte")
+
+    import tempfile as _tempfile_pcc
+    _pcc_base = Path(_tempfile_pcc.mkdtemp())
+    globals()["_reuse_chain"] = _boom_reuse_chain
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), (lambda *a, **kw: (1, "STATUS_LOGON_FAILURE"))
+    try:
+        _pcc_results = provided_creds_check("10.0.0.1", [{"port": 445, "name": "microsoft-ds"}],
+                                            [("svc_sql", "lucky7")], base=_pcc_base)
+    finally:
+        globals()["_reuse_chain"] = _real_reuse_chain
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert any("hallazgo justo antes de reventar" in t for r in _pcc_results for _, t in r["findings"])
+    assert (_pcc_base / "error.log").exists()
 
     # --local-auth en provided_creds_check: se añade en protocolos NTLM (smb, aquí) cuando
     # se pide, y se EXCLUYE a propósito en ssh (nxc no distingue dominio/local ahí — ver
