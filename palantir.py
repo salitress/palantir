@@ -9060,7 +9060,17 @@ def write_index(outdir):
     idx_path = Path(outdir) / "index.html"
     try:
         idx_path.write_text(out, encoding="utf-8")
+        # BUG real (confirmado con un run real: un primer escaneo con sudo deja este fichero
+        # con dueño root — chown_dirs/chown_results dan la propiedad de las CARPETAS al
+        # usuario real, pero nunca de ESTE fichero en concreto, porque vive en el outdir
+        # padre y no dentro de ningún 'base' de un objetivo — así que un run SIN sudo
+        # posterior no puede sobreescribirlo: PermissionError, aunque el directorio que lo
+        # contiene sí sea suyo). Si estamos bajo sudo, se lo damos ya al usuario real.
+        _chown_real(idx_path)
         good(f"Índice de objetivos: {idx_path}")
+    except PermissionError as e:
+        err(f"no pude escribir el índice ({e}) — probablemente quedó de un run anterior con "
+            f"sudo: sudo chown $(id -un):$(id -gn) {idx_path}")
     except OSError as e:
         err(f"no pude escribir el índice: {e}")
 
@@ -11612,6 +11622,30 @@ def selftest():
     assert "5 objetivos" in _idx_html3   # NO "7 objetivos" — los symlinks no cuentan aparte
     assert _idx_html3.count("10.10.10.7/report.html") == 1   # un solo enlace a esa carpeta, no tres
     assert "dc01.nexura.htb/report.html" not in _idx_html3 and "nexura.htb/report.html" not in _idx_html3
+
+    # BUG real (confirmado con un run real: un primer escaneo con sudo, luego uno sin sudo,
+    # 'no pude escribir el índice: [Errno 13] Permission denied'): chown_dirs/chown_results dan
+    # la propiedad de las CARPETAS al usuario real bajo sudo, pero nunca de index.html en sí
+    # (vive en el outdir padre, fuera de cualquier 'base' de un objetivo) — write_index() ahora
+    # se lo da expresamente a quien corresponda cada vez que lo escribe.
+    _idx_chown_calls = []
+    _real_chown_idx = _chown_real
+    globals()["_chown_real"] = lambda path, ids=None: _idx_chown_calls.append(str(path))
+    try:
+        write_index(str(_idx_dir))
+    finally:
+        globals()["_chown_real"] = _real_chown_idx
+    assert _idx_chown_calls and _idx_chown_calls[0] == str(_idx_dir / "index.html")
+    # Si falla con PermissionError (justo el síntoma real), el aviso da el comando exacto para
+    # arreglarlo — no el genérico de cualquier otro OSError.
+    import io as _io_idx, contextlib as _cl_idx
+    _real_wt = Path.write_text
+    Path.write_text = lambda self, *a, **kw: (_ for _ in ()).throw(PermissionError(13, "Permission denied"))
+    _idx_buf = _io_idx.StringIO()
+    with _cl_idx.redirect_stderr(_idx_buf):
+        write_index(str(_idx_dir))
+    Path.write_text = _real_wt
+    assert "sudo chown" in _idx_buf.getvalue() and str(_idx_dir / "index.html") in _idx_buf.getvalue()
 
     # _make_hostname_symlinks: symlink de conveniencia por hostname ESPECÍFICO, nunca por el
     # dominio base a secas (lo comparten todas las cajas del dominio AD y se pisarían).

@@ -56,6 +56,16 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The shared `index.html` (`<outdir>/index.html`, listing every target scanned into that
+  output directory) could end up permanently un-writable after mixing a `sudo` run with a
+  later non-`sudo` run — found live: `no pude escribir el índice: [Errno 13] Permission
+  denied`. `chown_dirs`/`chown_results` hand the real user ownership of the per-target
+  *folders* under `sudo`, but never of this one file, since it lives in the parent output
+  directory rather than inside any single target's folder — so a first `sudo` run leaves it
+  root-owned, and a later non-`sudo` run can't overwrite it even though the directory holding
+  it was already fixed. `write_index` now chowns the file itself right after writing it, and
+  a `PermissionError` specifically (as opposed to any other `OSError`) now prints the exact
+  `sudo chown` command to unstick an index left over from before this fix.
 - A comma-separated target list like `172.16.6.3,50` silently scanned a bogus second target
   instead of failing clearly — found live, mid-run, against a real target. `172.16.6.3,50`
   splits into two specs (`172.16.6.3` and `50`); the bare `50` isn't a valid IP/CIDR/range, so
