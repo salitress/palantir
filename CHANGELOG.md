@@ -54,8 +54,33 @@ this project follows [Semantic Versioning](https://semver.org/).
   `-checkpoint` pointing inside its own temp dir, so a brutespray run never leaves stray
   files in the directory palantir itself was launched from.
 
+### Changed
+
+- "No account lockout" (`AD: sin bloqueo de cuentas`, lockout None/0) is now an `alta`
+  finding instead of `media`, so it surfaces in Quick Wins — flagged by the operator as more
+  important than its old severity implied. On a DC, no lockout policy combined with the user
+  list palantir has already enumerated is a direct, low-risk password-spraying path (spray one
+  likely password across every account at once without locking anyone out), which is exactly
+  the kind of "where do I start" entry Quick Wins exists for. A dedicated tip now explains the
+  spray approach (and warns that "no lockout" still isn't "no logging" — each failure bumps
+  `badPwdCount`). Bumped in all three places the finding is emitted (null-session SMB,
+  null-session LDAP, and the credentialed `_surface_ad_enum` path).
+
 ### Fixed
 
+- A credential that nxc returned **completely empty output** for (a transient SMB/LDAP
+  connection hiccup, common after several back-to-back calls to the same host) was silently
+  recorded as "checked, invalid" — a false negative that skipped the entire credentialed
+  enumeration for that protocol. Confirmed live: `nxc smb IP -u AB920 -p weasal` came back
+  empty during palantir's credential-reuse step and was marked failed, yet the operator re-ran
+  the exact same command moments later and it authenticated with `(Pwn3d!)`. A real auth
+  failure returns text (`STATUS_LOGON_FAILURE`), so empty output specifically means nxc never
+  answered. `_run_capture_retry` already existed for exactly this symptom (its own docstring
+  describes it) but wasn't wired into the credential checks: `_cc_nxc` (default creds),
+  `_nxc_try_cred` (the reuse chain), and the explicit `-u/-p`/`--creds-file` loop now retry on
+  empty output before giving up, and say so in the step text instead of leaving a blank that
+  reads like "nothing found". Seen across the same run on multiple hosts (4/4 default-cred SMB
+  checks empty on one, 3/4 on another).
 - Generic "USER"/"PASS" placeholders in next-step suggestions (`evil-winrm -i ip -u USER -p
   PASS`, `impacket-wmiexec DOMINIO/USER:PASS@ip`, `nxc smb ip -u USER -p PASS -x whoami`,
   `xfreerdp … /u:USER /p:PASS`, `soapy DOMINIO/USER:'PASS'@ip`) stayed unfilled even when a
