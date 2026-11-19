@@ -12467,6 +12467,31 @@ def selftest():
     assert _nf["findings"] == [] and _nf["next"] == [] and _nf["steps"] == [] and _nf["title"] == "FTP"
     assert _norm_fp({"proto": "smb", "findings": [["alta", "x"]], "title": "SMB"})["findings"] == [["alta", "x"]]
 
+    # _merge_creds_provided_footprint: ACUMULA credenciales aportadas entre --resume en vez de
+    # perder las de antes — bug real: un --resume nunca recargaba _phase=="creds_provided" del
+    # findings.json viejo, así que probar una credencial NUEVA (o relanzar sin ninguna) borraba
+    # en silencio TODO lo que una credencial anterior ya había confirmado (findings.json se
+    # sobreescribe entero). 'old' simula venir de JSON (findings como LISTAS, no tuplas — así
+    # era tras json.loads) para probar que el dedup no asume un tipo concreto.
+    _mcp_old = {"proto": "reuse-smb", "title": "x", "ports": [445],
+                "steps": [{"cmd": "nxc smb ip -u user1 -p ***", "output": "ok1", "ok": True}],
+                "findings": [["alta", "SMB: credencial aportada válida — «user1:pass1»"]],
+                "next": ["nxc smb ip -u user1 -p pass1 -x whoami"], "missing": []}
+    _mcp_new = {"proto": "reuse-smb", "title": "x", "ports": [445],
+                "steps": [{"cmd": "nxc smb ip -u user2 -p ***", "output": "ok2", "ok": True}],
+                "findings": [("critica", "SMB: credencial aportada «user2:pass2» da acceso de ADMINISTRADOR (Pwn3d!)")],
+                "next": ["nxc smb ip -u user2 -p pass2 -x whoami"], "missing": ["enum4linux-ng"]}
+    _mcp = _merge_creds_provided_footprint(_mcp_old, _mcp_new)
+    assert len(_mcp["findings"]) == 2
+    assert any("user1:pass1" in t for _s, t in _mcp["findings"])    # lo de user1 NO se pierde…
+    assert any("user2:pass2" in t for _s, t in _mcp["findings"])    # …y lo de user2 también está
+    assert _mcp["findings"][0][1] == _mcp_new["findings"][0][1]     # lo más reciente (user2) va PRIMERO
+    assert len(_mcp["steps"]) == 2 and _mcp["missing"] == ["enum4linux-ng"]
+    assert len(_mcp["next"]) == 2
+    # Exactamente la MISMA entrada repetida (misma credencial re-probada) no se duplica.
+    _mcp_dup = _merge_creds_provided_footprint(_mcp_old, dict(_mcp_old))
+    assert len(_mcp_dup["findings"]) == 1 and len(_mcp_dup["steps"]) == 1
+
     # Regresión CRÍTICA: el informe "temprano" de run_one (antes de la Fase 5, con banner +
     # auto-refresh) NO debe vaciar findings.json en un --resume con datos previos buenos. El bug:
     # antes se llamaba a write_reports(..., [], [], ..., phases_done=[], ...) a secas, PISANDO
@@ -13835,6 +13860,32 @@ def _norm_fp(f):
     return f
 
 
+def _merge_creds_provided_footprint(old, new):
+    """Combina el footprint-dict de credenciales aportadas (Fase 5d, proto 'reuse-*'/'creds-*')
+    de un --resume ANTERIOR con el de ESTE run para el MISMO protocolo — ACUMULA en vez de
+    sustituir. Bug real: antes, un --resume nunca recargaba `_phase == "creds_provided"` del
+    findings.json viejo (solo "footprint"/"creds_default" se reutilizaban) y write_reports
+    sobreescribe el JSON entero con lo que haya en memoria — así que probar una credencial
+    nueva (o relanzar --resume sin pasar ninguna) borraba sin avisar TODO lo que una credencial
+    ANTERIOR ya había confirmado para ese protocolo (shares, usuarios del dominio, Pwn3d!…).
+    `new` manda en proto/title (no cambian de un run a otro); steps/findings/next se concatenan
+    NEW primero (lo más reciente arriba) + lo de OLD que no sea un duplicado EXACTO — old puede
+    venir de JSON (listas) y new recién calculado (tuplas): se normaliza a tupla para comparar,
+    nunca se asume un tipo concreto. 'missing'/'ports' se unen sin duplicar."""
+    merged = dict(new)
+    seen_steps = {(s.get("cmd"), s.get("output")) for s in new.get("steps", [])}
+    merged["steps"] = list(new.get("steps", [])) + [
+        s for s in old.get("steps", []) if (s.get("cmd"), s.get("output")) not in seen_steps]
+    seen_find = {tuple(f) for f in new.get("findings", [])}
+    merged["findings"] = list(new.get("findings", [])) + [
+        f for f in old.get("findings", []) if tuple(f) not in seen_find]
+    seen_next = set(new.get("next", []))
+    merged["next"] = list(new.get("next", [])) + [n for n in old.get("next", []) if n not in seen_next]
+    merged["missing"] = sorted(set(old.get("missing", [])) | set(new.get("missing", [])))
+    merged["ports"] = sorted(set(old.get("ports", [])) | set(new.get("ports", [])))
+    return merged
+
+
 def run_one(ip, name, args, folder=None):
     """Escaneo + footprint + creds + exploits + fuzz + informes de UN objetivo.
     'name' es el hostname (si el objetivo se dio por nombre); se añade a los dominios.
@@ -14051,6 +14102,15 @@ def run_one(ip, name, args, folder=None):
             creds_default_ok = True
         except Exception as e:
             _phase_fail("credenciales por defecto", e, base)
+    # Credenciales aportadas (Fase 5d) de un --resume ANTERIOR: a diferencia de "footprint"/
+    # "creds_default" de arriba, esto NUNCA se recargaba — se perdía en silencio en cuanto
+    # write_reports sobreescribía el JSON, aunque este run no tocara el protocolo o probara una
+    # credencial distinta. Se acumula (ver _merge_creds_provided_footprint): lo fresco de ESTE
+    # run se fusiona con lo viejo del MISMO protocolo; un protocolo que este run no retesteó
+    # (sin credenciales, o con un servicio que ya no está) se conserva tal cual.
+    prev_creds_provided = {f["proto"]: _norm_fp(f) for f in (prev.get("footprints", []) if prev else [])
+                           if f.get("_phase") == "creds_provided"}
+    fresh_creds_provided = []
     _win = _target_is_windows(services, host)   # Windows: usuarios case-insensitive → no dupliques Fiona/fiona
     pcreds = parse_provided_creds(args, windows=_win)
     if pcreds:
@@ -14085,7 +14145,7 @@ def run_one(ip, name, args, folder=None):
                                                 is_hash=bool(args.hash), base=base, domain=_early_ad_domain)
                 for f in newcreds:
                     f["_phase"] = "creds_provided"
-                footprints += newcreds
+                fresh_creds_provided += newcreds
             except Exception as e:
                 _phase_fail("credenciales aportadas", e, base)
             # telnet/pop3/imap/redis/snmp/smtp: provided_creds_check (arriba) no los toca — ni
@@ -14098,9 +14158,19 @@ def run_one(ip, name, args, folder=None):
                     bs_creds = brutespray_extra_creds_check(ip, services, pcreds, bulk=bulk, base=base)
                     for f in bs_creds:
                         f["_phase"] = "creds_provided"
-                    footprints += bs_creds
+                    fresh_creds_provided += bs_creds
                 except Exception as e:
                     _phase_fail("credenciales aportadas (brutespray)", e, base)
+    # Fusión final: lo fresco de ESTE run (si lo hay) con lo viejo del MISMO protocolo; lo viejo
+    # que este run no retesteó en absoluto (proto ausente en fresh_creds_provided) sobrevive
+    # igual — así ni "--resume sin -u/-p" ni "--resume con una credencial distinta" lo borran.
+    fresh_by_proto = {f["proto"]: f for f in fresh_creds_provided}
+    for proto, f in fresh_by_proto.items():
+        old = prev_creds_provided.get(proto)
+        footprints.append(_merge_creds_provided_footprint(old, f) if old else f)
+    for proto, old in prev_creds_provided.items():
+        if proto not in fresh_by_proto:
+            footprints.append(old)
     render_footprint(footprints)
 
     # Se guarda en findings.json (ver write_reports) para que un futuro --resume sepa qué

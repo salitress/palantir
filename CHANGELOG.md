@@ -10,6 +10,18 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `--resume` now **accumulates** Fase 5d (provided-credentials) findings across runs instead
+  of silently losing them. Found via a direct question before it ever caused real damage:
+  running `--resume -u user1 -p pass1`, then later `--resume -u user2 -p pass2` (or even
+  `--resume` with no credentials at all) made every finding user1's credential had confirmed
+  for that protocol vanish — not overwritten in some visible way, just gone, because
+  `_phase == "creds_provided"` footprints were never reloaded from the previous
+  `findings.json` (only `"footprint"`/`"creds_default"` were), and `write_reports` rewrites
+  the whole file from whatever is in memory for that run. `_merge_creds_provided_footprint`
+  now combines the old and new footprint-dict for the same protocol (newest findings/steps/
+  next-steps first, owner's untouched protocols from before kept as-is, exact duplicates not
+  repeated) before saving — the full report keeps everything every credential ever confirmed
+  for a target, not just the most recent one tried.
 - Five more nxc checks, all auto-run, all solo-lectura (ninguno escribe/explota nada) and all
   verified against nxc's own real source on GitHub before writing a parser — not guessed, same
   standard as the rest of this list:
