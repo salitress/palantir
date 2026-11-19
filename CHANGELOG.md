@@ -10,6 +10,23 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Five more nxc checks, all auto-run, all solo-lectura (ninguno escribe/explota nada) and all
+  verified against nxc's own real source on GitHub before writing a parser — not guessed, same
+  standard as the rest of this list:
+  - `ms17-010` (EternalBlue, CVE-2017-0143 y relacionadas) y `smbghost` (CVE-2020-0796): igual
+    que Zerologon ya hacía, pero para CUALQUIER host SMB (no solo un DC) y sin credenciales —
+    dos comprobaciones de un solo paquete crudo por socket, nxc no explota nada. EternalBlue
+    además detecta si el host ya está infectado con DoublePulsar.
+  - `webdav`: ¿está el servicio WebClient activo en el equipo? (pipe `DAV RPC Service` en
+    IPC$). Si lo está, es una superficie de coacción NTLM alternativa al spooler/MS-EFSR — la
+    víctima se puede forzar a autenticarse por HTTP en vez de SMB.
+  - `--pso` (LDAP, con credenciales): políticas de contraseña granulares (Fine-Grained
+    Password Policy) — pueden ser más laxas que la política del dominio para ciertos
+    usuarios/grupos. Ya no es un módulo (`-M pso` está retirado upstream, "moved to the core
+    option --pso" en su propio código fuente); se usa el flag nativo.
+  - `-M obsolete` (LDAP, con credenciales): equipos del dominio con un SO Windows sin soporte
+    (XP/Vista/7/8/Server 2003-2012) — candidatos directos a movimiento lateral si alguno sigue
+    vivo en la red.
 - LDAP signing / LDAPS channel binding: read from the banner nxc already prints on every
   `nxc ldap` connection (no extra module — the old dedicated `-M ldap-checker` module is
   retired upstream, confirmed reading nxc's own source). Not enforced → "media" finding

