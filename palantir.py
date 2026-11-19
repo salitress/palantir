@@ -5816,7 +5816,7 @@ _NXC_PROTO_OF = {"smb": "smb", "ssh": "ssh", "winrm": "winrm", "rdp": "rdp",
 # attribute 'decode'" contra -u <fichero>), así que cuanto antes se confirme/enriquezca
 # por SMB/LDAP, menos falta hace llegar a probarlo. Lo que no aparece aquí (ftp/ssh/vnc,
 # mysql/postgres aparte) mantiene su orden de descubrimiento (por puerto), al final.
-_CREDS_PROTO_PRIORITY = ("smb", "ldap", "winrm", "rdp", "mssql", "wmi")
+_CREDS_PROTO_PRIORITY = ("ldap", "smb", "winrm", "rdp", "mssql", "wmi")
 
 # Protocolos de nxc donde "local vs. dominio" tiene sentido (NTLM) y --local-auth existe de
 # verdad como opción — confirmado para SMB (doc oficial + --sam/--lsa); WinRM/RDP/WMI/MSSQL/
@@ -6484,10 +6484,26 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # las del dominio, en un host suelto las locales; ambas valen (RID cycling sobre todo, que
             # saca usuarios aunque --users esté capado). (--groups NO: nxc 1.5.1 lo movió al protocolo
             # ldap, '[-] [REMOVED]'; va por LDAP más abajo.)
+            # LDAP (_CREDS_PROTO_PRIORITY lo prueba ANTES que SMB) ya puede haber sacado la lista
+            # COMPLETA de usuarios del dominio con esta o con otra credencial aportada — y por
+            # LDAP tarda segundos, mientras que por SMB/SAMR (--users y sobre todo --rid-brute,
+            # que cicla RID a RID por IPC$) puede tardar varios minutos contra un AD con miles de
+            # cuentas (confirmado en vivo). Si ya la tenemos, SMB se la salta — mismo dominio,
+            # misma lista — y solo deja la política de contraseñas (--pass-pol: SMB-específico,
+            # no lo sustituye LDAP). Si LDAP no la consiguió (p. ej. 0 resultados, acceso LDAP
+            # restringido) SMB sigue intentándolo igual: es el fallback, no al revés.
+            _skip_smb_userenum = is_dc and seen is not None and "usuarios del dominio" in seen
+            if _skip_smb_userenum:
+                res["findings"].append(("info",
+                    f"SMB (cred {u}): me salto --users/--rid-brute — LDAP ya sacó la lista completa "
+                    "de usuarios del dominio (mismo dominio, misma lista) y por LDAP es mucho más "
+                    "rápido; ver el hallazgo 'AD: … usuarios del dominio' / ad_users.txt."))
             for mod, note in (("--users", f"usuarios ({_scope}) — con credencial, lista completa; base para spraying/roasting"),
                               ("--pass-pol", "política de contraseñas (longitud, bloqueo)"),
                               ("--rid-brute", "RID cycling por IPC$ (saca usuarios aunque --users esté capado) — en un "
                                               "dominio con muchas cuentas puede tardar bastante más que en un lab pequeño")):
+                if _skip_smb_userenum and mod in ("--users", "--rid-brute"):
+                    continue
                 # --users/--rid-brute escalan con el tamaño del dominio (más cuentas = más que
                 # listar/probar) — contra un AD con varios cientos/miles de cuentas, un timeout
                 # FIJO corta la enumeración a mitad sin avisar (reportado en vivo: faltaba un
@@ -7811,9 +7827,17 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                 # a mano segundos después autenticó (Pwn3d!). Sin reintento, _nxc_ok("")=False da un
                 # falso negativo silencioso y _creds_enum (--users/--shares/roasting…) se salta ENTERA.
                 elif not (out or "").strip():
+                    # Mismo margen (120s) que el reintento de arriba por timeout-con-salida-parcial,
+                    # no los 40s originales: un pivot/objetivo cargado puede necesitar bastante más
+                    # que eso para ni siquiera devolver el banner — con solo 40s de margen total
+                    # (40+40), una credencial VÁLIDA de verdad podía acabar descartada como "no
+                    # responde" antes de que la Fase 5d llegara a intentar --users/--shares con ella
+                    # (bug real: --resume con una credencial nueva que SÍ autenticaba a mano, pero
+                    # a la que palantir nunca le vio ni el login por este timeout tan corto).
                     warn(f"{np.upper()}: la credencial aportada «{u}» salió sin NINGUNA respuesta — reintento "
-                         "(posible fallo transitorio de la conexión, no necesariamente credencial inválida).")
-                    rc2, out2 = run_capture(cmd, timeout=40, quiet=True)
+                         "con más margen (120s; posible fallo transitorio de la conexión, no necesariamente "
+                         "credencial inválida).")
+                    rc2, out2 = run_capture(cmd, timeout=120, quiet=True)
                     if (out2 or "").strip():
                         rc, out = rc2, out2
             finally:
@@ -10444,6 +10468,90 @@ def selftest():
         globals()["run_capture"] = _real_rc_ce
     assert not any("PSO" in t or "SO obsoleto" in t for _s, t in _ceres3["findings"])
 
+    # LDAP primero (_CREDS_PROTO_PRIORITY la pone antes que SMB): si YA sacó la lista COMPLETA
+    # de usuarios del dominio, SMB se la ahorra (--users/--rid-brute, mucho más lentos contra un
+    # AD grande por SAMR/RID-cycling) y solo hace --pass-pol (SMB-específico, no lo cubre LDAP).
+    # Se simula el orden real de provided_creds_check llamando a _creds_enum dos veces —
+    # primero ldap, luego smb— con el MISMO set `seen` (ahí es `ad_seen`, compartido entre
+    # protocolos para deduplicar hallazgos; aquí además decide el salto).
+    _real_rc_skip, _real_rcp_skip = run_capture, globals().get("_run_capture_progressive")
+    _real_certipy_skip, _real_have_skip = globals().get("certipy_bin"), globals()["have"]
+    globals()["certipy_bin"] = lambda: None
+    globals()["have"] = lambda name: False   # sin ldapsearch: fuera de alcance de este test (trusts/pre2k)
+
+    def _fake_ldap_users_rc(cmd, timeout=None, stall_timeout=None, quiet=False, **kw):
+        if "--users" in cmd:
+            return 0, ("LDAP 10.0.0.1 389 DC01 jon\n"
+                       "LDAP 10.0.0.1 389 DC01 asmith\n"
+                       "LDAP 10.0.0.1 389 DC01 bjones")
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ldap_users_rc
+    globals()["_run_capture_progressive"] = _fake_ldap_users_rc
+    _seen_shared = set()
+    _ceres_ldap = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_ldap, "FAKE_NXC", "ldap", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   389, 389, None, _seen_shared, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_skip
+    assert "usuarios del dominio" in _seen_shared   # LDAP SÍ la metió en el seen compartido con SMB
+    assert any("3 usuarios del dominio" in t for _s, t in _ceres_ldap["findings"])
+
+    _smb_cmds = []
+
+    def _fake_smb_skip_rc(cmd, timeout=None, stall_timeout=None, quiet=False, **kw):
+        _smb_cmds.append(cmd)
+        return 0, "SMB 10.0.0.1 445 DC01 [*] ok"
+    globals()["run_capture"] = _fake_smb_skip_rc
+    globals()["_run_capture_progressive"] = _fake_smb_skip_rc
+    _ceres_smb = _fp("reuse-smb", "x", [445])
+    try:
+        _creds_enum(_ceres_smb, "FAKE_NXC", "smb", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   445, 445, None, _seen_shared, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"], globals()["_run_capture_progressive"] = _real_rc_skip, _real_rcp_skip
+        globals()["certipy_bin"], globals()["have"] = _real_certipy_skip, _real_have_skip
+    assert not any("--users" in c or "--rid-brute" in c for c in _smb_cmds), _smb_cmds   # SMB se SALTÓ los dos: LDAP ya los tenía
+    assert any("--pass-pol" in c for c in _smb_cmds)   # --pass-pol SÍ sigue (SMB-específico, no lo cubre LDAP)
+    assert any(s == "info" and "me salto --users/--rid-brute" in t for s, t in _ceres_smb["findings"])
+
+    # Fallback: si LDAP no consiguió la lista (0 usuarios, p. ej. acceso LDAP restringido), SMB
+    # sigue intentándolo igual — es el fallback, no al revés (misma lógica que "en uno 78 y en
+    # otro 0 si lo tiene desactivado").
+    globals()["certipy_bin"] = lambda: None
+    globals()["have"] = lambda name: False
+
+    def _fake_ldap_zero_rc(cmd, timeout=None, stall_timeout=None, quiet=False, **kw):
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"   # --users sin NINGUNA fila de usuario
+    globals()["run_capture"] = _fake_ldap_zero_rc
+    globals()["_run_capture_progressive"] = _fake_ldap_zero_rc
+    _seen_empty = set()
+    _ceres_ldap0 = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_ldap0, "FAKE_NXC", "ldap", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   389, 389, None, _seen_empty, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_skip
+    assert "usuarios del dominio" not in _seen_empty   # LDAP NO la consiguió (0 usuarios)
+
+    _smb_cmds0 = []
+
+    def _fake_smb_fallback_rc(cmd, timeout=None, stall_timeout=None, quiet=False, **kw):
+        _smb_cmds0.append(cmd)
+        return 0, "SMB 10.0.0.1 445 DC01 [*] ok"
+    globals()["run_capture"] = _fake_smb_fallback_rc
+    globals()["_run_capture_progressive"] = _fake_smb_fallback_rc
+    _ceres_smb0 = _fp("reuse-smb", "x", [445])
+    try:
+        _creds_enum(_ceres_smb0, "FAKE_NXC", "smb", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   445, 445, None, _seen_empty, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"], globals()["_run_capture_progressive"] = _real_rc_skip, _real_rcp_skip
+        globals()["certipy_bin"], globals()["have"] = _real_certipy_skip, _real_have_skip
+    assert any("--users" in c for c in _smb_cmds0), _smb_cmds0   # fallback: SMB SÍ lo intenta (LDAP no lo consiguió)
+    assert any("--rid-brute" in c for c in _smb_cmds0), _smb_cmds0
+    assert not any("me salto --users/--rid-brute" in t for _s, t in _ceres_smb0["findings"])
+
     # _smb_ad_enum: con la MISMA salida real de arriba, --pass-pol ahora también sale como
     # hallazgo 'info' (antes solo se leía en commands.log salvo lockout None/0).
     _real_rc_smbad = run_capture
@@ -10824,10 +10932,14 @@ def selftest():
     # no vuelve a disparar _creds_enum: "smb" ya está en 'enriched')
     assert len(_mix[0]["steps"]) == 9
 
-    # Orden de protocolos (_CREDS_PROTO_PRIORITY): SMB antes que WMI (más lento y con un bug
-    # confirmado de nxc contra listas de usuarios) y que LDAP/WinRM/RDP/MSSQL, sea el orden de
+    # Orden de protocolos (_CREDS_PROTO_PRIORITY): SMB y LDAP antes que WMI (más lento y con un
+    # bug confirmado de nxc contra listas de usuarios) y que WinRM/RDP/MSSQL, sea el orden de
     # puertos que sea (aquí WMI/135 va ANTES que SMB/445 en 'services' — justo el caso real que
     # lo destapó: un DC con 135 abierto antes de 139/445 probaba 56 usuarios por WMI primero).
+    # (LDAP va ANTES que SMB dentro de ese grupo — ver el test de más abajo para el motivo: por
+    # LDAP la lista de usuarios del dominio sale en segundos; por SMB/SAMR puede tardar minutos
+    # contra un AD grande, así que si LDAP ya la sacó, _creds_enum se salta --users/--rid-brute
+    # por SMB.)
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), (
         lambda cmd, timeout=None, quiet=False, **kw: (1, "[-] STATUS_LOGON_FAILURE"))
     try:
@@ -10839,6 +10951,7 @@ def selftest():
     _ord = [r["proto"] for r in _ord_res]
     assert _ord.index("reuse-smb") < _ord.index("reuse-wmi")
     assert _ord.index("reuse-ldap") < _ord.index("reuse-wmi")
+    assert _ord.index("reuse-ldap") < _ord.index("reuse-smb")   # LDAP antes que SMB: --users es mucho más rápido ahí
     globals()["hydra_bin"] = _real_hydra_bin_b   # fin de la tanda que forzaba el fallback a nxc
 
     # ── Fase 5d con HYDRA (nuevo): brute de listas ssh/ftp/smb por hydra ──
@@ -11178,6 +11291,37 @@ def selftest():
     _tldap = next(r for r in _tres if r["proto"] == "reuse-ldap")
     assert any(s == "alta" and "wwhite" in t for s, t in _tldap["findings"])   # la credencial SÍ cuenta como válida
     assert any("--users" in c for c in [s["cmd"] for s in _tldap["steps"]])   # _creds_enum SÍ corrió (no se saltó)
+
+    # Regresión REAL (distinta de la de arriba): salida COMPLETAMENTE VACÍA (ni banner, ni '[+]',
+    # ni STATUS_LOGON_FAILURE) en la comprobación de la credencial — no es un timeout con salida
+    # parcial, es que nxc no respondió NADA. El reintento de este caso usaba el MISMO margen
+    # corto (40s) del 1er intento en vez de los 120s de margen del caso de arriba — contra un
+    # pivot/objetivo cargado, 40+40=80s podía no bastar ni para el login, y una credencial que SÍ
+    # era válida (confirmada a mano segundos después) se descartaba como "no responde" antes de
+    # que _creds_enum llegara a intentar --users/--shares con ella.
+    _smb_attempts = []
+
+    def _fake_smb_empty_then_ok(cmd, timeout=None, quiet=False, **kw):
+        if len(cmd) == 7 and cmd[:6] == ["FAKE_NXC", "smb", "10.0.0.1", "-u", "wwhite", "-p"]:
+            _smb_attempts.append(timeout)
+            if len(_smb_attempts) == 1:
+                return 1, ""   # completamente vacío: ni éxito ni mensaje de fallo
+            return 0, "SMB 10.0.0.1 445 DC01 [+] inlanefreight\\wwhite:Secret123"   # reintento: SÍ responde
+        if "--shares" in cmd:
+            return 0, "SMB 10.0.0.1 445 DC01 [+] inlanefreight\\wwhite:\nSMB 10.0.0.1 445 DC01 IT          READ"
+        if any(m in cmd for m in _ENUM_MODS):
+            return 0, "SMB 10.0.0.1 445 DC01 [+] (enum ok)"
+        return 0, "SMB 10.0.0.1 445 DC01 [+] inlanefreight\\wwhite:Secret123"
+
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_smb_empty_then_ok
+    try:
+        _eres2 = provided_creds_check("10.0.0.1", [{"port": 445, "name": "microsoft-ds"}], [("wwhite", "Secret123")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
+    assert _smb_attempts == [40, 120]   # 1er intento al timeout normal, el reintento con el MISMO margen que el otro caso
+    _tsmb = next(r for r in _eres2 if r["proto"] == "reuse-smb")
+    assert any(s == "alta" and "wwhite" in t for s, t in _tsmb["findings"])
+    assert any("--users" in c for c in [s["cmd"] for s in _tsmb["steps"]])
 
     # Certipy (AD CS): la rama LDAP de _creds_enum dispara 'certipy find -vulnerable' SOLO
     # si hay credencial válida + dominio YA resuelto (domain=…) + certipy instalado — sin

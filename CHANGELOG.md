@@ -109,6 +109,17 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Fase 5d (provided credentials) now tries **LDAP before SMB** (`_CREDS_PROTO_PRIORITY`
+  reordered). Prompted by a live comparison: `nxc ldap IP --users` against a DC with ~2900
+  domain accounts finished in under 30s, while the equivalent `nxc smb IP --users`/
+  `--rid-brute` (SAMR, RID-cycling over IPC$) was still running 15+ minutes later on the same
+  domain. Both ultimately enumerate the same domain user list, so once LDAP has it (tracked via
+  the existing `ad_seen`/`seen` marker `"usuarios del dominio"`, already shared between
+  protocols to dedupe findings), `_creds_enum`'s SMB branch now skips its own `--users`/
+  `--rid-brute` entirely and says so as an `info` finding — `--pass-pol` still runs (it's
+  SMB-specific info LDAP doesn't have). If LDAP comes back with 0 users (e.g. LDAP access is
+  restricted while SMB/SAMR isn't), SMB still runs its own enumeration as a fallback, same as
+  before — the skip only fires when LDAP already produced a non-empty list.
 - "No account lockout" (`AD: sin bloqueo de cuentas`, lockout None/0) is now an `alta`
   finding instead of `media`, so it surfaces in Quick Wins — flagged by the operator as more
   important than its old severity implied. On a DC, no lockout policy combined with the user
@@ -121,6 +132,14 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The explicit `-u/-p`/`--creds-file` loop's retry for **completely empty** nxc output (added
+  in the entry below) reused the same short `timeout=40` as the first attempt (so ~80s total
+  margin), while its sibling retry — for a timeout that cut `nxc` off mid-run but left *partial*
+  output — already used a more generous `timeout=120`. Found live against a loaded pivot/target
+  (`BR086` on a lab DC over a tunnel): the credential authenticated fine run by hand seconds
+  later, but 40+40s wasn't always enough margin for nxc to even print its banner through the
+  tunnel, so a genuinely valid credential could still be discarded as "no responde" before
+  Fase 5d ever got to `--users`/`--shares` with it. Both retries now use the same `timeout=120`.
 - Quick Wins only ever looked for next-step commands inside the exact same footprint-dict as
   the finding — but Fase 5d (credentialed) findings live in a *separate* dict from the
   anonymous-footprint dict of the same protocol (`reuse-winrm` vs `winrm`, etc. — see
