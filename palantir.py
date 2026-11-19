@@ -11458,6 +11458,17 @@ def selftest():
     assert expand_targets(["10.10.10.1-3"]) == [("10.10.10.1", ""), ("10.10.10.2", ""), ("10.10.10.3", "")]
     assert expand_targets(["10.10.10.5", "10.10.10.5"]) == [("10.10.10.5", "")]
     assert expand_targets(["# comentario", "", "  "]) == []
+    # BUG real (confirmado con '172.16.6.3,50' — la coma parte el spec en dos y '50' llega
+    # suelto a expand_targets): socket.gethostbyname() hereda el truco de inet_aton() que
+    # interpreta un token puramente numérico como un entero empaquetado ('50' -> '0.0.0.50',
+    # '172.50' -> '172.0.0.50') — un objetivo fantasma que gastaba un escaneo entero de 12
+    # minutos y dejaba una carpeta 0.0.0.50/ de basura. Sin mockear gethostbyname: estos
+    # tokens deben descartarse ANTES de intentar resolverlos, así que un gethostbyname real
+    # (si el fix fallara y SÍ se llamara) haría saltar esto por red real en vez de colarse.
+    assert expand_targets(["50"]) == []
+    assert expand_targets(["172.50"]) == []
+    assert expand_targets(["0x32"]) == []
+    assert expand_targets(["172.16.6.3,50".split(",")[1]]) == []   # el caso real exacto
     # Fase 0 (ping-sweep): qué specs son "multi-host" (podables) y qué IPs salen de ellos.
     assert _is_multihost_spec("10.0.0.0/24") is True
     assert _is_multihost_spec("10.0.0.1-5") is True
@@ -12907,6 +12918,16 @@ def expand_targets(specs):
         if m and 0 <= int(m.group(2)) <= int(m.group(3)) <= 255:
             base, lo, hi = m.group(1), int(m.group(2)), int(m.group(3))
             out += [(f"{base}{i}", "") for i in range(lo, hi + 1)]
+            continue
+        # BUG real (confirmado con '172.16.6.3,50': la coma lo parte en dos specs, '50' llega
+        # aquí suelto): socket.gethostbyname() hereda el truco histórico de inet_aton() que
+        # interpreta un token puramente numérico como un entero empaquetado — '50' resuelve a
+        # '0.0.0.50', '172.50' a '172.0.0.50', nunca lo que nadie quiso escribir. Nada que
+        # parezca esta notación (solo dígitos, con o sin puntos, u hex/octal con prefijo 0x/0)
+        # es un hostname real → se descarta ANTES de resolverlo, igual que un fallo de DNS de
+        # verdad, en vez de colarse como un objetivo fantasma que gasta un escaneo entero.
+        if re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+(\.\d+){0,3}", s):
+            warn(f"'{s}' no es un objetivo válido (¿falta una coma o un punto?), lo ignoro.")
             continue
         try:                                       # hostname → resolver
             rip = socket.gethostbyname(s)

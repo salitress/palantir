@@ -56,6 +56,17 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A comma-separated target list like `172.16.6.3,50` silently scanned a bogus second target
+  instead of failing clearly — found live, mid-run, against a real target. `172.16.6.3,50`
+  splits into two specs (`172.16.6.3` and `50`); the bare `50` isn't a valid IP/CIDR/range, so
+  it fell through to the hostname-resolution fallback, and `socket.gethostbyname()` inherits
+  the old BSD `inet_aton()` shorthand that treats a purely numeric token as a packed 32-bit
+  integer — `50` resolved straight to `0.0.0.50` (same for `172.50` -> `172.0.0.50`, or a
+  `0x`/octal-looking token) instead of failing to resolve. The result: a second, nonsense
+  target scanned for the full run time, with its own junk output folder, and no indication of
+  what went wrong beyond a "2 objetivos" count that didn't match what was actually typed.
+  `expand_targets` now rejects anything shaped like this numeric-shorthand notation before
+  trying to resolve it, with a clear warning instead of silently fabricating a target.
 - A finding/next-step line containing a real embedded newline (or tab/carriage return) broke
   the terminal "Quick wins" box border — found from the same real target as the two
   redundant-suggestion bugs above: a katana-discovered HTML comment was multi-line in the raw
