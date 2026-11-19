@@ -7305,6 +7305,23 @@ def _pool_add(pool, user, secret, is_hash):
     pool.append({"user": user, "secret": secret, "is_hash": bool(is_hash)})
 
 
+def _stash_valid_cred(res, user, secret, is_hash, admin=False):
+    """Guarda en `res` (footprint-dict) la credencial que ACABA de confirmarse válida de
+    verdad (login real, no solo volcada/sugerida) — metadata interna que _fill_cred_placeholder
+    recoge más tarde para rellenar los next-steps con placeholder 'USER'/'PASS' de TODOS los
+    footprints del objetivo (bug real: con una credencial YA admin por WinRM en el mismo
+    informe, 'evil-winrm -i ip -u USER -p PASS' seguía con el placeholder sin tocar — ver
+    _fill_cred_placeholder). Solo contraseñas (is_hash=False): ninguno de esos next-steps
+    admite -H, y rellenar un hash ahí produciría un comando que no funciona. `admin=True`
+    cuando la credencial dio Pwn3d!/admin — gana sobre una simplemente 'válida' si hay varias
+    (ver _fill_cred_placeholder); no se sobrescribe una ya-admin con una que no lo es."""
+    if is_hash or not user:
+        return
+    if admin or not res.get("_valid_cred_admin"):
+        res["_valid_cred"] = (user, secret)
+        res["_valid_cred_admin"] = admin
+
+
 def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
     """Un ÚNICO intento de una credencial por un protocolo nxc (reutilización entre servicios).
     Contraseña por fichero 0600 (nunca en el argv); hash por -H. Devuelve (ok, pwn3d,
@@ -7370,6 +7387,7 @@ def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enrich
                 if not (ok or pwn):
                     continue
                 progressed = True
+                _stash_valid_cred(res, u, secret, ch, admin=pwn)
                 if pwn:
                     _psev, _pcl = _pwn_clause(np)
                     res["findings"].append((_psev, f"{np.upper()}: credencial reutilizada {_pcl} — «{cred_disp}»"))
@@ -7531,6 +7549,7 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                 if hit["user"] and hit["password"]:   # alimenta la retroalimentación con la credencial ganadora
                     tried.add((hit["user"], hit["password"], is_hash, np))
                     _pool_add(cred_pool, hit["user"], hit["password"], is_hash)
+                    _stash_valid_cred(res, hit["user"], hit["password"], is_hash, admin=hit["pwn3d"])
                 if hit["pwn3d"]:
                     _psev, _pcl = _pwn_clause(np)
                     res["findings"].append((_psev, f"{np.upper()}: credencial del spray {_pcl} — «{label}»"))
@@ -7613,6 +7632,7 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             tried.add((u, p, is_hash, np))
             if ok or pwn:   # credencial válida → al pool de retroalimentación
                 _pool_add(cred_pool, u, p, is_hash)
+                _stash_valid_cred(res, u, p, is_hash, admin=pwn)
             if pwn:
                 _psev, _pcl = _pwn_clause(np)
                 res["findings"].append((_psev, f"{np.upper()}: credencial aportada «{masked}» {_pcl}"))
@@ -10242,6 +10262,58 @@ def selftest():
     _pool_add(_ppnul, "usuario_sano", "secreto_normal", False)
     assert len(_ppnul) == 1
 
+    # _stash_valid_cred: solo contraseñas (is_hash=False descarta un hash — ninguno de los
+    # next-steps con placeholder USER/PASS admite -H), y una credencial admin NO se deja
+    # pisar por una simplemente válida llegada después (pero si no hay admin, la última gana).
+    _svc_res = _fp("reuse-smb", "x", [445])
+    _stash_valid_cred(_svc_res, "bob", "hunter2", False)              # válida normal
+    assert _svc_res["_valid_cred"] == ("bob", "hunter2") and _svc_res["_valid_cred_admin"] is False
+    _stash_valid_cred(_svc_res, "hashuser", "aad3b435b51404ee", True)  # hash → NO pisa (is_hash)
+    assert _svc_res["_valid_cred"] == ("bob", "hunter2")
+    _stash_valid_cred(_svc_res, "alice", "Sup3rS3cur3", False, admin=False)  # no-admin → SÍ pisa (no hay admin aún)
+    assert _svc_res["_valid_cred"] == ("alice", "Sup3rS3cur3")
+    _stash_valid_cred(_svc_res, "root_admin", "Adm1nPass", False, admin=True)  # admin → gana
+    assert _svc_res["_valid_cred"] == ("root_admin", "Adm1nPass") and _svc_res["_valid_cred_admin"] is True
+    _stash_valid_cred(_svc_res, "mallory", "otra", False, admin=False)  # no-admin NO pisa ya-admin
+    assert _svc_res["_valid_cred"] == ("root_admin", "Adm1nPass")
+
+    # _fill_cred_placeholder: caso real exacto (screenshot del operador) — AB920:weasal dio
+    # Pwn3d! por WinRM en el footprint 'reuse-winrm' (dict APARTE del anónimo 'winrm', que ya
+    # llevaba next-steps con el placeholder sin rellenar desde ANTES de que esa credencial
+    # existiera). Cubre las 4 formas de placeholder que aparecen en next-steps reales:
+    # '-u USER -p PASS' (evil-winrm/nxc), 'USER:PASS' (wmiexec/GetUserSPNs), '/u:USER /p:PASS'
+    # (xfreerdp) y "USER:'PASS'" (soapy). Prioriza la credencial ADMIN sobre una simplemente
+    # válida de otro protocolo, y nunca deja la metadata '_valid_cred*' filtrarse al informe.
+    _fc_anon = _fp("winrm", "WinRM", [5985])
+    _fc_anon["next"] = [
+        "evil-winrm -i 172.16.7.50 -u USER -p PASS   # shell cuando tengas credenciales válidas",
+        "impacket-wmiexec DOMINIO/USER:PASS@172.16.7.50   # RCE por WMI",
+        "xfreerdp /v:172.16.7.50 /u:USER /p:PASS +clipboard /cert:ignore   # conectar con credenciales",
+        "soapy inlanefreight.local/USER:'PASS'@172.16.7.50 --users   # recolección ADWS",
+        "nxc winrm 172.16.7.50 -u users.txt -p pass.txt --continue-on-success   # validar LISTA (no debe tocarse)",
+    ]
+    _fc_lowpriv = _fp("reuse-smb", "x", [445])
+    _stash_valid_cred(_fc_lowpriv, "svc_sql", "lucky7", False, admin=False)
+    _fc_admin = _fp("reuse-winrm", "x", [5985])
+    _fc_admin["findings"].append(("critica", "WINRM: credencial aportada «AB920:weasal» da acceso de ADMINISTRADOR (Pwn3d!)"))
+    _stash_valid_cred(_fc_admin, "AB920", "weasal", False, admin=True)
+    _fc_fps = [_fc_anon, _fc_lowpriv, _fc_admin]
+    _fill_cred_placeholder(_fc_fps)
+    assert _fc_anon["next"][0] == "evil-winrm -i 172.16.7.50 -u AB920 -p weasal   # shell cuando tengas credenciales válidas", _fc_anon["next"][0]
+    assert "AB920:weasal" in _fc_anon["next"][1], _fc_anon["next"][1]
+    assert "/u:AB920 /p:weasal" in _fc_anon["next"][2], _fc_anon["next"][2]
+    assert "AB920:'weasal'" in _fc_anon["next"][3], _fc_anon["next"][3]
+    assert "USER" not in _fc_anon["next"][4] and "users.txt" in _fc_anon["next"][4]  # placeholder de LISTA intacto
+    assert not any("svc_sql" in n for n in _fc_anon["next"])     # gana AB920 (admin), no svc_sql (no-admin)
+    for _fpr in _fc_fps:                                          # metadata interna NUNCA filtra al informe
+        assert "_valid_cred" not in _fpr and "_valid_cred_admin" not in _fpr
+
+    # Sin ninguna credencial confirmada en todo el run: no toca nada (deja los placeholders tal cual).
+    _fc_noop = _fp("winrm", "WinRM", [5985])
+    _fc_noop["next"] = ["evil-winrm -i 10.0.0.1 -u USER -p PASS"]
+    _fill_cred_placeholder([_fc_noop])
+    assert _fc_noop["next"] == ["evil-winrm -i 10.0.0.1 -u USER -p PASS"]
+
     # _reuse_chain: una credencial hallada en un servicio se reprueba en los demás; si abre uno
     # nuevo (smb/ldap) se enumera con ella (la retroalimentación). robin (ya hallado por ssh) →
     # válido por smb → hallazgo de reutilización + _creds_enum por smb.
@@ -10268,6 +10340,10 @@ def selftest():
     assert any(s == "alta" and "reutilizada" in t.lower() for s, t in _rz_smb["findings"])
     assert "smb" in _rz_enriched                                  # y se enumeró smb con la credencial reutilizada
     assert any("--shares" in " ".join(c) for c in _rz_cmds)       # _creds_enum corrió de verdad
+    # _reuse_chain también deja la credencial confirmada en _valid_cred (para _fill_cred_placeholder,
+    # más abajo) — "robin:pw" validó por SMB sin Pwn3d!, así que _valid_cred_admin debe ser False.
+    assert _rz_smb.get("_valid_cred") == ("robin", "pw"), _rz_smb.get("_valid_cred")
+    assert _rz_smb.get("_valid_cred_admin") is False
 
     # provided_creds_check no debe perder lo que YA encontró (login válido, SAM/LSA…) si
     # _reuse_chain revienta a mitad (el bug real: un NUL en una credencial dumpeada abortaba toda
@@ -13062,6 +13138,54 @@ def _fill_netbios_placeholder(footprints, name):
         fpr["next"] = [n.replace("NETBIOS-DEL-DC", name) for n in fpr["next"]]
 
 
+def _fill_cred_placeholder(footprints):
+    """Varios next-steps ('evil-winrm -i ip -u USER -p PASS', 'impacket-wmiexec
+    DOMINIO/USER:PASS@ip', 'nxc smb ip -u USER -p PASS -x whoami', 'xfreerdp ... /u:USER
+    /p:PASS', 'soapy DOMINIO/USER:\\'PASS\\'@ip'…) se generan con el placeholder literal
+    USER/PASS porque la función que los genera (fp_winrm/fp_msrpc/fp_rdp/fp_adws/…) corre en
+    el footprint ANÓNIMO, mucho antes de que exista ninguna credencial — la Fase 5d
+    (credenciales aportadas/retroalimentación, ver provided_creds_check) que SÍ las confirma
+    vive en un footprint-dict APARTE (el informe los agrupa visualmente bajo el mismo
+    protocolo, pero son dicts distintos). Bug real visto en vivo: con una credencial YA
+    confirmada ADMIN por WinRM (Pwn3d!) en el MISMO informe, 'evil-winrm -i ip -u USER -p
+    PASS' seguía con el placeholder sin tocar, aunque copiar y pegar la credencial de la línea
+    de arriba era trivial para el operador — lo que ya hace _fill_domain_placeholder para
+    'DOMINIO' se le había quedado corto al propio usuario/contraseña.
+
+    Si durante el run se confirmó una credencial de VERDAD con login real (no una simplemente
+    volcada/recuperada sin probar, ni un hash: ver _stash_valid_cred — ninguno de estos
+    placeholders admite -H ni pass-the-hash), se rellena aquí en TODOS los next-steps de
+    TODOS los footprints de este objetivo — igual que _fill_domain_placeholder, y por la
+    misma razón: palantir YA reprueba automáticamente cada credencial válida contra el resto
+    de servicios (retroalimentación, ver _reuse_chain), así que una credencial confirmada en
+    CUALQUIER protocolo es exactamente la que el operador probaría a mano en el resto. Si hay
+    varias credenciales válidas distintas, gana la que diera Pwn3d!/admin en algún sitio sobre
+    una simplemente 'válida' (ver _stash_valid_cred). Rellenar NO implica que esa credencial
+    sea TAMBIÉN admin en el protocolo del next-step rellenado — sigue siendo responsabilidad
+    del operador comprobarlo al lanzar el comando, igual que con cualquier sugerencia de
+    reutilización de credenciales.
+
+    Cada footprint-dict solo lleva la credencial como metadata mientras dura este relleno —
+    se le hace pop() aquí (nunca llega al HTML/findings.json, mismo patrón que
+    _signing_disabled/_coerce de _combine_relay_opportunity)."""
+    best, best_admin = None, False
+    for fpr in footprints:
+        cred = fpr.pop("_valid_cred", None)
+        admin = fpr.pop("_valid_cred_admin", False)
+        if cred and (best is None or (admin and not best_admin)):
+            best, best_admin = cred, admin
+    if not best:
+        return
+    user, secret = best
+    uq, pq = shlex.quote(user), (shlex.quote(secret) if secret else "''")
+    for fpr in footprints:
+        fpr["next"] = [n.replace("-u USER -p PASS", f"-u {uq} -p {pq}")
+                         .replace("/u:USER /p:PASS", f"/u:{user} /p:{secret}")
+                         .replace("USER:'PASS'", f"{user}:'{secret}'")
+                         .replace("USER:PASS", f"{user}:{secret}")
+                        for n in fpr["next"]]
+
+
 def _combine_relay_opportunity(footprints, ip):
     """Combina SMB signing no requerido (fp_smb, metadata interna '_signing_disabled') con un
     primitivo de coacción NTLM confirmado por MSRPC (fp_msrpc, '_coerce'/'_coerce_via') del
@@ -13568,6 +13692,11 @@ def run_one(ip, name, args, folder=None):
     # (Fase 2, bastante antes) casi siempre YA lo capturaron. Fuera del "if domains:": no
     # depende de haber resuelto un dominio AD, solo del nombre NetBIOS del equipo.
     _fill_netbios_placeholder(footprints, netbios_computer_name(services, host))
+    # Igual que los dos de arriba, pero para el placeholder "USER"/"PASS": si la Fase 5d (justo
+    # antes, ver provided_creds_check/brutespray_extra_creds_check más arriba) confirmó una
+    # credencial de verdad, se rellena en los next-steps genéricos (evil-winrm, wmiexec, nxc
+    # ... -x whoami…) que se generaron ANTES de que esa credencial existiera.
+    _fill_cred_placeholder(footprints)
     # Relay reflexivo: combina SMB signing no requerido + coacción NTLM (MSRPC) del MISMO host,
     # si ambos aparecen — ver _combine_relay_opportunity. Mismo sitio que los dos rellenos de
     # arriba (y por la misma razón: funciona igual en fresco que tras --resume).
