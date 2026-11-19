@@ -120,6 +120,18 @@ this project follows [Semantic Versioning](https://semver.org/).
   SMB-specific info LDAP doesn't have). If LDAP comes back with 0 users (e.g. LDAP access is
   restricted while SMB/SAMR isn't), SMB still runs its own enumeration as a fallback, same as
   before — the skip only fires when LDAP already produced a non-empty list.
+- That same skip now also works **across `--resume` runs**, not just within one. Prompted by a
+  direct question: if a previous run already got the complete domain user list with credential
+  A, does testing a brand-new credential B later need to re-run `--users`/`--rid-brute` all over
+  again? With AD's default ACLs, no — any authenticated domain bind sees the identical set of
+  user objects (there's no per-querying-account "row-level" scoping unless the domain has
+  non-standard deny ACEs or List Object Mode, which a normal lab doesn't), so re-enumerating for
+  every new credential tested is wasted time, not new information. `provided_creds_check` takes
+  a new `known_ad_users` flag that pre-seeds `ad_seen` with the `"usuarios del dominio"` marker;
+  `run_one` sets it from `prev_creds_provided` (the --resume history already loaded for Fase 5d)
+  whenever ANY earlier credential/run already produced that finding. Both skip messages (LDAP's
+  own `--users`, SMB's `--users`/`--rid-brute`) now also spell out the assumption and give the
+  manual command to force a recheck, in case a specific credential genuinely does see more.
 - "No account lockout" (`AD: sin bloqueo de cuentas`, lockout None/0) is now an `alta`
   finding instead of `media`, so it surfaces in Quick Wins — flagged by the operator as more
   important than its old severity implied. On a DC, no lockout policy combined with the user

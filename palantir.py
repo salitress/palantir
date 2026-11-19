@@ -6485,19 +6485,23 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # saca usuarios aunque --users esté capado). (--groups NO: nxc 1.5.1 lo movió al protocolo
             # ldap, '[-] [REMOVED]'; va por LDAP más abajo.)
             # LDAP (_CREDS_PROTO_PRIORITY lo prueba ANTES que SMB) ya puede haber sacado la lista
-            # COMPLETA de usuarios del dominio con esta o con otra credencial aportada — y por
-            # LDAP tarda segundos, mientras que por SMB/SAMR (--users y sobre todo --rid-brute,
-            # que cicla RID a RID por IPC$) puede tardar varios minutos contra un AD con miles de
-            # cuentas (confirmado en vivo). Si ya la tenemos, SMB se la salta — mismo dominio,
-            # misma lista — y solo deja la política de contraseñas (--pass-pol: SMB-específico,
-            # no lo sustituye LDAP). Si LDAP no la consiguió (p. ej. 0 resultados, acceso LDAP
-            # restringido) SMB sigue intentándolo igual: es el fallback, no al revés.
+            # COMPLETA de usuarios del dominio con esta o con otra credencial/ejecución (este run,
+            # o un --resume anterior — ver el seed de `seen` en provided_creds_check) — y por LDAP
+            # tarda segundos, mientras que por SMB/SAMR (--users y sobre todo --rid-brute, que
+            # cicla RID a RID por IPC$) puede tardar varios minutos contra un AD con miles de
+            # cuentas (confirmado en vivo). Si ya la tenemos, SMB se la salta — con ACLs estándar
+            # de AD cualquier cuenta de dominio ve la misma lista — y solo deja la política de
+            # contraseñas (--pass-pol: SMB-específico, no lo sustituye LDAP). Es una asunción, no
+            # una certeza: si LDAP no la consiguió (0 resultados, acceso LDAP restringido) SMB
+            # sigue intentándolo igual de fallback, y si sospechas que ESTA cuenta ve más por SMB
+            # que lo ya visto, el aviso deja el comando manual para forzarlo.
             _skip_smb_userenum = is_dc and seen is not None and "usuarios del dominio" in seen
             if _skip_smb_userenum:
                 res["findings"].append(("info",
-                    f"SMB (cred {u}): me salto --users/--rid-brute — LDAP ya sacó la lista completa "
-                    "de usuarios del dominio (mismo dominio, misma lista) y por LDAP es mucho más "
-                    "rápido; ver el hallazgo 'AD: … usuarios del dominio' / ad_users.txt."))
+                    f"SMB (cred {u}): me salto --users/--rid-brute — la lista completa de usuarios "
+                    "del dominio ya se conoce (LDAP, de esta u otra credencial/ejecución) y, con "
+                    "ACLs estándar de AD, cualquier cuenta ve la misma; si sospechas que ESTA cuenta "
+                    f"ve MÁS por SMB, fuerza el comando a mano: nxc smb {ip} {shown_auth} --users"))
             for mod, note in (("--users", f"usuarios ({_scope}) — con credencial, lista completa; base para spraying/roasting"),
                               ("--pass-pol", "política de contraseñas (longitud, bloqueo)"),
                               ("--rid-brute", "RID cycling por IPC$ (saca usuarios aunque --users esté capado) — en un "
@@ -6576,6 +6580,21 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
         elif np == "ldap":
             maq_f = None   # se rellena más abajo solo si is_dc (MachineAccountQuota es por dominio,
                             # no por host) — queda en None si no, para el cruce con ESC1 de más abajo
+            # Al revés que el salto de SMB (más abajo): si una ejecución ANTERIOR ya dejó la lista
+            # COMPLETA de usuarios del dominio (este mismo run por SMB, o un --resume previo — ver
+            # el seed de `seen` en provided_creds_check), LDAP tampoco necesita repetirla. Con las
+            # ACLs por defecto de AD, CUALQUIER bind autenticado ve el MISMO conjunto de objetos
+            # usuario (no hay "row-level security" por quién consulta) — solo cambiaría con ACLs
+            # deny/List-Object-Mode no estándar en objetos concretos, algo que un AD de lab normal
+            # no tiene. Es una asunción, no una certeza: por eso se deja dicho y con el comando
+            # manual para forzar la comprobación si se sospecha lo contrario.
+            _skip_ldap_userenum = is_dc and seen is not None and "usuarios del dominio" in seen
+            if _skip_ldap_userenum:
+                res["findings"].append(("info",
+                    f"LDAP (cred {u}): me salto --users — la lista completa de usuarios del dominio "
+                    "ya se conoce (de esta u otra credencial/ejecución) y, con ACLs estándar de AD, "
+                    "cualquier cuenta de dominio ve la misma; si sospechas que ESTA cuenta ve MÁS "
+                    f"(ACLs no estándar), fuerza el comando a mano: nxc ldap {ip} {shown_auth} --users"))
             for mod, note in (("--users", "usuarios del dominio por LDAP (con credencial: lista completa)"),
                               ("--groups", "grupos del dominio (Domain Admins, delegaciones)"),
                               ("--pass-pol", "política de contraseñas del dominio"),
@@ -6586,6 +6605,8 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 # (ver más arriba) — un timeout fijo de 120s corta la enumeración a mitad en un AD
                 # grande sin avisar (reportado en vivo: faltaba un usuario). Progresivo: sigue
                 # esperando mientras la salida crezca, corta a los 5 min SIN línea nueva.
+                if _skip_ldap_userenum and mod == "--users":
+                    continue
                 rc, out = _run_capture_progressive([nxc, "ldap", ip] + A() + [mod],
                                                    timeout=1800, stall_timeout=300, quiet=True)
                 _step(res, f"{nxc} ldap {ip} {shown_auth} {mod}", rc == 0, mask(out), note=note)
@@ -7616,7 +7637,8 @@ def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enrich
             break
 
 
-def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_hash=False, base=None, domain=None):
+def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_hash=False, base=None, domain=None,
+                          known_ad_users=False):
     """Fase 5d: prueba las credenciales aportadas contra cada servicio detectado con nxc
     (reutilización entre protocolos). Devuelve UN footprint-dict POR PROTOCOLO REAL usado
     (proto="reuse-smb"/"reuse-ldap"/…, no un único bloque "reuse" mezclando todos como antes)
@@ -7655,7 +7677,12 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
     sin el coste de un proceso nuevo por combinación. `creds` (pares explícitos de
     --creds-file, que NUNCA se cruzan) se siguen probando 1 a 1 como siempre, aparte;
     el llamante (run_one) ya quita de `creds` los pares que `bulk` cubre, para no
-    probarlos dos veces."""
+    probarlos dos veces.
+
+    `known_ad_users`: True si un --resume ANTERIOR (ver run_one) ya dejó constancia de la
+    lista COMPLETA de usuarios del dominio (de cualquier credencial/protocolo de esa ejecución
+    previa) — siembra `ad_seen` con el marcador para que ni LDAP ni SMB la vuelvan a lanzar
+    tampoco para la credencial NUEVA de este run (ver el salto en _creds_enum)."""
     import tempfile
     if not creds and not bulk:
         return []
@@ -7689,9 +7716,15 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
           "una credencial válida en un servicio suele valer en otros: se prueba cada par aportado contra cada servicio detectado (1 intento por par y protocolo, no es fuerza bruta)")
     is_dc = is_domain_controller(services)
     enriched = set()   # protocolos (smb/ldap) ya enumerados con credencial válida (1 vez basta)
-    ad_seen = set()    # markers de _surface_ad_enum ya añadidos — compartido entre SMB y LDAP
-                       # (que ahora tienen cada uno su propio footprint-dict) para no duplicar
-                       # el mismo hallazgo de AD (usuarios del dominio, lockout) en los dos
+    # markers de _surface_ad_enum ya añadidos — compartido entre SMB y LDAP (que ahora tienen
+    # cada uno su propio footprint-dict) para no duplicar el mismo hallazgo de AD (usuarios del
+    # dominio, lockout) en los dos. `known_ad_users` lo siembra YA con "usuarios del dominio" si
+    # un --resume ANTERIOR (ver run_one, prev_creds_provided) ya dejó la lista COMPLETA con otra
+    # credencial/ejecución — así ni LDAP ni SMB la vuelven a lanzar para la credencial NUEVA de
+    # este run tampoco (ver el salto en _creds_enum, ambas ramas): con ACLs estándar de AD
+    # cualquier cuenta de dominio ve el mismo conjunto de objetos usuario, así que repetirlo por
+    # cada credencial nueva que se aporte es trabajo perdido, no una comprobación distinta.
+    ad_seen = {"usuarios del dominio"} if known_ad_users else set()
     cred_pool = []     # credenciales descubiertas (login válido o volcadas de SAM/LSA) → retroalimentación
     tried = set()      # (user, secret, is_hash, proto) ya intentados — no repetir en la cadena de reutilización
     res_by_proto = {}  # proto → su footprint-dict (para que _reuse_chain escriba en el sitio correcto)
@@ -10953,6 +10986,38 @@ def selftest():
     assert _ord.index("reuse-ldap") < _ord.index("reuse-wmi")
     assert _ord.index("reuse-ldap") < _ord.index("reuse-smb")   # LDAP antes que SMB: --users es mucho más rápido ahí
     globals()["hydra_bin"] = _real_hydra_bin_b   # fin de la tanda que forzaba el fallback a nxc
+
+    # known_ad_users=True (lo que pasa run_one cuando un --resume ANTERIOR ya dejó la lista
+    # completa de usuarios del dominio con OTRA credencial/ejecución, ver prev_creds_provided):
+    # ni LDAP ni SMB deberían relanzar --users/--rid-brute para la credencial NUEVA de este run.
+    _known_cmds = {"ldap": [], "smb": []}
+
+    def _fake_known_rc(cmd, timeout=None, stall_timeout=None, quiet=False, **kw):
+        proto = cmd[1] if len(cmd) > 1 else ""
+        if proto in _known_cmds:
+            _known_cmds[proto].append(cmd)
+        if len(cmd) == 7 and cmd[3:5] == ["-u", "frank"]:   # el login check 1-a-1, sin ningún flag de enum
+            return 0, f"{proto.upper()} 10.0.0.1 445 DC01 [+] inlanefreight\\frank:Secret123"
+        return 0, f"{proto.upper()} 10.0.0.1 445 DC01 [*] ok"
+    _real_rcp_known, _real_certipy_known = globals().get("_run_capture_progressive"), globals().get("certipy_bin")
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_known_rc
+    globals()["_run_capture_progressive"] = _fake_known_rc
+    globals()["certipy_bin"] = lambda: None
+    try:
+        _kres = provided_creds_check("10.0.0.1",
+            [{"port": 389, "name": "ldap"}, {"port": 445, "name": "microsoft-ds"}],
+            [("frank", "Secret123")], known_ad_users=True)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
+        globals()["_run_capture_progressive"], globals()["certipy_bin"] = _real_rcp_known, _real_certipy_known
+    assert not any("--users" in c for c in _known_cmds["ldap"]), _known_cmds["ldap"]
+    assert not any("--users" in c or "--rid-brute" in c for c in _known_cmds["smb"]), _known_cmds["smb"]
+    assert any("--pass-pol" in c for c in _known_cmds["ldap"])
+    assert any("--pass-pol" in c for c in _known_cmds["smb"])
+    _kldap = next(r for r in _kres if r["proto"] == "reuse-ldap")
+    _ksmb = next(r for r in _kres if r["proto"] == "reuse-smb")
+    assert any(s == "info" and "me salto --users" in t for s, t in _kldap["findings"]), _kldap["findings"]
+    assert any(s == "info" and "me salto --users/--rid-brute" in t for s, t in _ksmb["findings"]), _ksmb["findings"]
 
     # ── Fase 5d con HYDRA (nuevo): brute de listas ssh/ftp/smb por hydra ──
     # _parse_hydra_hits: formato real de hydra ('[PORT][service] host: IP login: U password: P')
@@ -14254,6 +14319,13 @@ def run_one(ip, name, args, folder=None):
     # (sin credenciales, o con un servicio que ya no está) se conserva tal cual.
     prev_creds_provided = {f["proto"]: _norm_fp(f) for f in (prev.get("footprints", []) if prev else [])
                            if f.get("_phase") == "creds_provided"}
+    # ¿Algún --resume ANTERIOR ya dejó la lista COMPLETA de usuarios del dominio (con cualquier
+    # credencial de esa ejecución, por LDAP o por SMB)? Si es así, ni hace falta volver a
+    # lanzarla con la credencial NUEVA que este run esté probando — ver `known_ad_users` en
+    # provided_creds_check: en AD con ACLs estándar cualquier cuenta de dominio ve la misma
+    # lista, así que repetirla por cada credencial aportada es coste sin información nueva.
+    _known_ad_users = any("usuarios del dominio" in t for f in prev_creds_provided.values()
+                          for _s, t in f.get("findings", []))
     fresh_creds_provided = []
     _win = _target_is_windows(services, host)   # Windows: usuarios case-insensitive → no dupliques Fiona/fiona
     pcreds = parse_provided_creds(args, windows=_win)
@@ -14286,7 +14358,8 @@ def run_one(ip, name, args, folder=None):
                     _early_domains = sorted(set(_early_domains) | {name})
                 _early_ad_domain = next((d for d in _early_domains if base_domain(d) == d), None)
                 newcreds = provided_creds_check(ip, services, pcreds, bulk=bulk, local_auth=args.local_auth,
-                                                is_hash=bool(args.hash), base=base, domain=_early_ad_domain)
+                                                is_hash=bool(args.hash), base=base, domain=_early_ad_domain,
+                                                known_ad_users=_known_ad_users)
                 for f in newcreds:
                     f["_phase"] = "creds_provided"
                 fresh_creds_provided += newcreds
