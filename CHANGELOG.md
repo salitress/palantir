@@ -56,6 +56,15 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The Kerberos "Siguientes pasos" (next-steps) list suggested the exact same AS-REP roast
+  command twice, with only the trailing comment differing — found live, against a real DC.
+  Whenever the AD domain is already known and `kerbrute userenum` finds valid users,
+  `_kerbrute_userenum` queues an `impacket-GetNPUsers … -usersfile ad_users.txt -no-pass`
+  suggestion itself ("AS-REP roast de los usuarios hallados"); `fp_kerberos` then
+  unconditionally appended its own generic version of the same command ("AS-REP roast: 1
+  intento por usuario YA conocido") regardless of whether one had already been queued.
+  `_kerbrute_userenum` now reports back whether it already suggested the AS-REP roast, and
+  `fp_kerberos` skips its own copy when it did.
 - A single corrupted credential harvested from an `--lsa` dump could silently wipe out the
   *entire* "credenciales aportadas" phase for a target — found live, against a real DC/box
   pair, mid-`--resume` run. After a valid credential gets admin on SMB, palantir auto-chains

@@ -4284,21 +4284,24 @@ def _kerbrute_userenum(res, ip, domain, base):
     minutos) si está instalada, si no cae a una shortlist genérica (segundos) — ver
     _userenum_wordlist. Con --userenum-wordlist se le pasa una grande a conciencia. Los
     usuarios hallados se vuelcan a <base>/ad_users.txt (listos para AS-REP roast / spray) y los
-    '(sin pre-auth)' se marcan como AS-REP roastables (hash crackeable sin credenciales)."""
+    '(sin pre-auth)' se marcan como AS-REP roastables (hash crackeable sin credenciales).
+    Devuelve True si ya encoló la sugerencia de AS-REP roast (hubo usuarios) — el llamante
+    (fp_kerberos) la usa para NO repetirla en su propio bloque de next-steps genérico (antes
+    salía DOS VECES, con distinta coletilla, cuando SÍ había usuarios: visto en vivo)."""
     import tempfile
     kb = _kerbrute_bin()
     if not kb:
         res["missing"].append("kerbrute")
-        return
+        return False
     if NO_USERENUM:
         res["next"].append(f"kerbrute userenum -d {domain} --dc {ip} <wordlist>   # (--no-userenum: no lo lancé) enum de usuarios por Kerberos, no bloquea cuentas")
-        return
+        return False
     wl = _userenum_wordlist(USERENUM_WORDLIST)
     if not wl:
         res["next"].append(f"kerbrute userenum -d {domain} --dc {ip} jsmith.txt   # enum de usuarios por Kerberos con nombres de empleado realistas: "
                             "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/jsmith.txt "
                             "— guárdala en /usr/share/wordlists/statistically-likely-usernames/jsmith.txt y la próxima vez la uso solo, sin --userenum-wordlist")
-        return
+        return False
     info(f"Kerberos: enum de usuarios con kerbrute ({Path(wl).name}) — no bloquea cuentas, puede tardar según la lista")
     kb_timeout = _kerbrute_timeout(wl)   # depende de CUÁL lista se use, no solo de si es --userenum-wordlist (ver _kerbrute_timeout)
     outf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".kerb"); outf.close()
@@ -4326,6 +4329,7 @@ def _kerbrute_userenum(res, ip, domain, base):
     if noauth:
         res["findings"].append(("alta", f"Kerberos: {len(noauth)} cuenta(s) SIN pre-auth (AS-REP roastables, hash crackeable sin credenciales): "
                                 + ", ".join(noauth[:10])))
+    return bool(users)
 
 
 def _parse_kerbrute_spray(out):
@@ -4425,13 +4429,18 @@ def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None):
     nada. El AS-REP roasting prueba 1 vez por usuario YA conocido, no es fuerza bruta."""
     res = _fp("kerberos", "Kerberos", [p["port"] for p in ports])
     res["findings"].append(("info", "Kerberos (88) abierto — corrobora que es un Domain Controller"))
+    asrep_ya_sugerido = False
     if domain:
-        _kerbrute_userenum(res, ip, domain, base)
+        asrep_ya_sugerido = _kerbrute_userenum(res, ip, domain, base)
     else:
         res["next"].append(f"kerbrute userenum -d DOMINIO --dc {ip} /usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt   # enum de usuarios por Kerberos (NO bloquea cuentas) — dominio aún no resuelto en este punto")
     res["next"] += [
         f"kerbrute passwordspray -d {domain or 'DOMINIO'} --dc {ip} ad_users.txt 'Welcome1' --safe   # spray 1 pass contra los usuarios hallados (OJO: pre-auth fallida SÍ cuenta como login fallido → lockout; --safe aborta si detecta una cuenta bloqueada)",
-        f"{_impacket_suggest_bin('GetNPUsers')} {domain or 'DOMINIO'}/ -usersfile ad_users.txt -no-pass -dc-ip {ip}   # AS-REP roast: 1 intento por usuario YA conocido (sácalos de SMB/LDAP/kerbrute primero)",
+    ]
+    if not asrep_ya_sugerido:   # _kerbrute_userenum YA la puso arriba si encontró usuarios — no repetirla
+        res["next"].append(
+            f"{_impacket_suggest_bin('GetNPUsers')} {domain or 'DOMINIO'}/ -usersfile ad_users.txt -no-pass -dc-ip {ip}   # AS-REP roast: 1 intento por usuario YA conocido (sácalos de SMB/LDAP/kerbrute primero)")
+    res["next"] += [
         f"{_impacket_suggest_bin('GetUserSPNs')} {domain or 'DOMINIO'}/USER:PASS -dc-ip {ip} -request   # Kerberoasting (con credenciales válidas)",
         # Timeroasting (MS-SNTP, Secura/@Disgame): pide por UDP/123 el hash de CUALQUIER cuenta de
         # equipo/trust por su RID, sin autenticar — pero el módulo de nxc exige un login SMB previo
@@ -12138,6 +12147,11 @@ def selftest():
         ["administrator", "jon", "svc_sql", "backup_user"])
     assert any("impacket-GetNPUsers " in n for n in _kbres["next"]), _kbres["next"]
     assert not any("GetNPUsers.py" in n for n in _kbres["next"]), _kbres["next"]
+    # Regresión: con dominio conocido + kerbrute encontrando usuarios, el AS-REP roast con
+    # '-usersfile ad_users.txt -no-pass' salía DOS VECES en next-steps (una de
+    # _kerbrute_userenum, "de los usuarios hallados", y otra fija de fp_kerberos, "1 intento
+    # por usuario YA conocido") — visto en vivo, mismo informe real que el de arriba.
+    assert sum("-usersfile ad_users.txt -no-pass" in n for n in _kbres["next"]) == 1, _kbres["next"]
     # timeroast: sugerencia MANUAL con rango de RIDs acotado (NO el 1-2^31 por defecto del
     # módulo, que puede tardar mucho/ser muy ruidoso) — nunca ejecutado por palantir.
     assert any("-M timeroast" in n and "rids=500-2000" in n for n in _kbres["next"]), _kbres["next"]
