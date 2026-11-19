@@ -54,6 +54,23 @@ this project follows [Semantic Versioning](https://semver.org/).
   `-checkpoint` pointing inside its own temp dir, so a brutespray run never leaves stray
   files in the directory palantir itself was launched from.
 
+- Adaptive, progress-aware timeout (`_run_capture_progressive`) for the nxc enumeration
+  commands whose runtime scales with the size of the AD domain (`--users` by SMB and LDAP,
+  `--rid-brute` anonymous and credentialed) — reported live: an operator suspected a user got
+  missed because the enumeration looked like it had been cut off mid-run against a large
+  domain. These used to run under a plain fixed timeout (e.g. 120s for LDAP `--users`), which
+  on a domain with hundreds/thousands of accounts can legitimately still be mid-enumeration
+  when it fires, silently truncating the result with no indication anything was cut short.
+  Instead of a fixed deadline, the new wrapper runs the command via `Popen` (with
+  `PYTHONUNBUFFERED=1`, since nxc is Python and block-buffers its stdout once it isn't a
+  TTY — without this nothing would appear to "grow" until the process exits) and tracks
+  whether new output keeps arriving: as long as it does, it keeps waiting; once output stalls
+  for 5 minutes straight, it's cut there (most likely finished responding or hung); if the
+  process exits on its own, it returns immediately without waiting out any timer. A generous
+  absolute ceiling (30 min) still protects against a truly runaway process. Verified with real
+  (non-mocked) subprocesses exercising growth-then-stall, early natural exit, and the safety
+  ceiling under continuous growth.
+
 ### Changed
 
 - "No account lockout" (`AD: sin bloqueo de cuentas`, lockout None/0) is now an `alta`

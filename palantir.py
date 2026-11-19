@@ -150,6 +150,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -750,6 +751,76 @@ def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1):
                "conexión contra el objetivo, NO necesariamente que no haya nada que ver aquí; "
                "repite este comando a mano)")
     return rc, out
+
+
+def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval=2, quiet=False):
+    """Como run_capture, pero para comandos que en un AD GRANDE pueden tardar mucho de verdad
+    (--users/--rid-brute contra cientos o miles de cuentas) y donde un timeout FIJO corta la
+    enumeración a mitad sin avisar — reportado en vivo: el operador notó que le faltaba un
+    usuario y sospechó que se había cortado por timeout antes de terminar. En vez de esperar un
+    número fijo de segundos y rendirse, sigue el PROGRESO de verdad: mientras la salida siga
+    CRECIENDO (nxc va imprimiendo resultados nuevos), sigue esperando sin límite salvo el techo
+    de seguridad `timeout`; si la salida se ESTANCA (ninguna línea nueva) durante `stall_timeout`
+    segundos seguidos, lo corta ahí — probablemente terminó de responder o se colgó, y seguir
+    esperando no cambiaría nada; si el proceso termina SOLO antes de cualquiera de los dos
+    límites, se devuelve al instante, sin esperar ni un segundo de más. `timeout` es un techo de
+    seguridad ABSOLUTO (nunca debería alcanzarse en un caso normal — solo protege contra un
+    proceso de verdad colgado en bucle imprimiendo basura sin parar).
+
+    Fija PYTHONUNBUFFERED=1: nxc es Python, y Python bufferiza stdout POR BLOQUES (no por línea)
+    en cuanto detecta que la salida no es un terminal (como aquí, que va a un pipe) — sin esto no
+    veríamos crecer NADA hasta que el proceso termine del todo, y el seguimiento de progreso
+    sería inútil (toda la salida llegaría de golpe al final, indistinguible de un timeout fijo).
+
+    Devuelve (rc, texto) igual que run_capture — rc=None si no se encontró el binario."""
+    line = shlex.join(cmd)
+    if not quiet:
+        print(f"{C_GREY}    $ {line}{C_RESET}", flush=True)
+    _log(line)
+    full_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", bufsize=1, env=full_env)
+    except FileNotFoundError:
+        return None, ""
+    lines = []
+
+    def _reader():
+        try:
+            for ln in proc.stdout:
+                lines.append(ln)
+        except (OSError, ValueError):
+            pass
+
+    th = threading.Thread(target=_reader, daemon=True)
+    th.start()
+    start = last_growth = time.monotonic()
+    last_len = 0
+    stalled = False
+    while proc.poll() is None:
+        now = time.monotonic()
+        if len(lines) > last_len:
+            last_len = len(lines)
+            last_growth = now
+        elif now - last_growth > stall_timeout:
+            stalled = True
+            break
+        if now - start > timeout:
+            break
+        time.sleep(poll_interval)
+    if proc.poll() is None:   # seguía vivo: lo paramos (estancado, o tocó el techo de seguridad)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if not stalled:
+            warn(f"'{cmd[0]}' superó el techo de seguridad de {timeout}s (seguía progresando) — "
+                 "uso la salida parcial; si hace falta más margen, repite este comando a mano.")
+    th.join(timeout=5)
+    out = _ANSI_RE.sub("", "".join(lines)).strip()
+    return proc.returncode, out
 
 
 def have(tool):
@@ -2240,7 +2311,10 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
     user = auth_user if auth_user is not None else ""
     ident = {"": "sesión nula", "guest": "invitado", "Administrator": "Administrator"}.get(user, user)
     res["findings"].append(("info", f"Domain Controller detectado → enum AD de solo lectura (identidad: {ident})"))
-    rc, out = run_capture([nxc, "smb", ip, "-u", user, "-p", "", "--rid-brute"], timeout=180)
+    # --rid-brute escala con el tamaño del dominio (más cuentas = más RIDs que probar) — mismo
+    # motivo que en _creds_enum: progresivo en vez de timeout fijo.
+    rc, out = _run_capture_progressive([nxc, "smb", ip, "-u", user, "-p", "", "--rid-brute"],
+                                       timeout=1800, stall_timeout=300)
     _step(res, f"{nxc} smb {ip} -u '{user}' -p '' --rid-brute", rc == 0, out,
           note="RID cycling por IPC$: recorre los RIDs para sacar nombres de usuario aunque --users esté capado (no es fuerza bruta de contraseñas)")
     users = re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeUser\)", out)
@@ -2258,7 +2332,10 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
         for mod, note in (("--users", "lista los usuarios del dominio (base para kerberoasting/spraying posterior, manual)"),
                           ("--computers", "lista los equipos del dominio (mapa de la red interna de Windows)"),
                           ("--pass-pol", "política de contraseñas: longitud mínima y, sobre todo, si hay bloqueo de cuentas")):
-            rc, out = run_capture([nxc, "smb", ip, "-u", user, "-p", "", mod], timeout=60)
+            # --users/--computers escalan con el tamaño del dominio — ver la misma nota en
+            # _creds_enum (donde se encontró el fallo en vivo): progresivo en vez de timeout fijo.
+            rc, out = _run_capture_progressive([nxc, "smb", ip, "-u", user, "-p", "", mod],
+                                               timeout=1800, stall_timeout=300)
             _step(res, f"{nxc} smb {ip} -u '{user}' -p '' {mod}", rc == 0, out, note=note)
             if mod == "--pass-pol":
                 pol = _parse_pass_pol(out)
@@ -3170,7 +3247,11 @@ def fp_ldap(ip, ports, services, host, deep):
             # usuarios está autenticado, no autorizado (el DC deniega la lectura anónima).
             # Si --users no trae datos, --groups/--pass-pol/get-desc-users con la MISMA
             # identidad devolverán lo mismo (nada) → no los lanzamos (era ruido/tiempo).
-            rc, users_out = run_capture([nxc, "ldap", ip, "-u", user, "-p", "", "--users"], timeout=60)
+            # --users escala con el tamaño del dominio — progresivo en vez de timeout fijo (ver la
+            # misma nota en _creds_enum, donde se encontró el fallo en vivo: un AD grande cortado
+            # a mitad con un timeout fijo, sin avisar).
+            rc, users_out = _run_capture_progressive([nxc, "ldap", ip, "-u", user, "-p", "", "--users"],
+                                                      timeout=1800, stall_timeout=300)
             _step(res, f"{nxc} ldap {ip} -u '{user}' -p '' --users", rc == 0, users_out,
                   note="vuelca los usuarios del dominio por LDAP (nombres, descripciones, último login)")
             if _nxc_has_data(users_out):
@@ -6343,11 +6424,14 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                               ("--pass-pol", "política de contraseñas (longitud, bloqueo)"),
                               ("--rid-brute", "RID cycling por IPC$ (saca usuarios aunque --users esté capado) — en un "
                                               "dominio con muchas cuentas puede tardar bastante más que en un lab pequeño")):
-                # --rid-brute en concreto escala con el tamaño del dominio (más cuentas = más RIDs
-                # que probar) — contra un AD con varios cientos de cuentas, 120s se queda corto
-                # de forma CONSISTENTE (no es un timeout transitorio, _run_capture_retry no ayuda
-                # si el fallo se repite siempre con el mismo límite corto).
-                rc, out = _run_capture_retry([nxc, "smb", ip] + A() + [mod], timeout=240, quiet=True)
+                # --users/--rid-brute escalan con el tamaño del dominio (más cuentas = más que
+                # listar/probar) — contra un AD con varios cientos/miles de cuentas, un timeout
+                # FIJO corta la enumeración a mitad sin avisar (reportado en vivo: faltaba un
+                # usuario, cortado por timeout). _run_capture_progressive sigue el progreso real
+                # (mientras la salida siga creciendo, sigue esperando) y solo corta tras 5 min
+                # SIN ninguna línea nueva — no por un número de segundos arbitrario.
+                rc, out = _run_capture_progressive([nxc, "smb", ip] + A() + [mod],
+                                                   timeout=1800, stall_timeout=300, quiet=True)
                 _step(res, f"{nxc} smb {ip} {shown_auth} {mod}", rc == 0, mask(out), note=note)
                 _surface_ad_enum(res, u, mod, out, base, seen)
             # --loggedon-users: ¿quién tiene sesión abierta AHORA en el objetivo? Necesita admin
@@ -6418,7 +6502,12 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                               ("--admin-count", "cuentas protegidas (adminCount=1): objetivos de alto valor"),
                               ("--trusted-for-delegation", "cuentas/equipos con delegación sin restricción (ruta a Domain Admin)"),
                               ("--password-not-required", "cuentas con PASSWD_NOTREQD (login sin contraseña)")):
-                rc, out = _run_capture_retry([nxc, "ldap", ip] + A() + [mod], timeout=120, quiet=True)
+                # --users por LDAP escala con el tamaño del dominio igual que --rid-brute por SMB
+                # (ver más arriba) — un timeout fijo de 120s corta la enumeración a mitad en un AD
+                # grande sin avisar (reportado en vivo: faltaba un usuario). Progresivo: sigue
+                # esperando mientras la salida crezca, corta a los 5 min SIN línea nueva.
+                rc, out = _run_capture_progressive([nxc, "ldap", ip] + A() + [mod],
+                                                   timeout=1800, stall_timeout=300, quiet=True)
                 _step(res, f"{nxc} ldap {ip} {shown_auth} {mod}", rc == 0, mask(out), note=note)
                 _surface_ad_enum(res, u, mod, out, base, seen)
             # Membresía de los grupos que dan el dominio: '--groups "Domain Admins"' imprime SUS
@@ -9717,11 +9806,14 @@ def selftest():
             return 0, "ok"
         return 0, "LDAP 10.0.0.1 389 DC [+] dom\\: (null auth)"   # nxc_auth: bind anónimo entra
     globals()["run_capture"] = _fake_ldap_rc
+    _real_rcp5 = globals().get("_run_capture_progressive")
+    globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: _fake_ldap_rc(cmd, timeout=timeout)
     try:
         _lsvc = [{"port": 389, "name": "ldap", "scripts": {}}]
         _lres = fp_ldap("10.0.0.1", _lsvc, _lsvc, {}, False)
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin5, _real_rc5
+        globals()["_run_capture_progressive"] = _real_rcp5
     assert any("get-desc-users" in s["cmd"] for s in _lres["steps"])        # se ejecutó de verdad, no solo se sugirió
     assert any(s == "alta" and "get-desc-users" in t for s, t in _lres["findings"])
     # --pass-pol por LDAP (bind anónimo): el mismo resumen 'info' que por SMB, aunque el lockout
@@ -10138,11 +10230,14 @@ def selftest():
     def _fake_smbad_rc(cmd, timeout=None, **kw):
         return (0, _ppol_out) if cmd[-1] == "--pass-pol" else (0, "SMB x 445 DC  [*] ok")
     globals()["run_capture"] = _fake_smbad_rc
+    _real_rcp_smbad = globals().get("_run_capture_progressive")
+    globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: _fake_smbad_rc(cmd, timeout=timeout)
     try:
         _smbad_res = _fp("reuse", "x", [445])
         _smb_ad_enum(_smbad_res, "FAKE_NXC", "10.0.0.1", auth_user="", anon_readable=True)
     finally:
         globals()["run_capture"] = _real_rc_smbad
+        globals()["_run_capture_progressive"] = _real_rcp_smbad
     assert any(s == "info" and "política de contraseñas" in t and "longitud mínima 8" in t
                for s, t in _smbad_res["findings"])
     assert not any("sin bloqueo" in t for _, t in _smbad_res["findings"])   # lockout=5: no es el caso débil (ninguna severidad)
@@ -10460,12 +10555,16 @@ def selftest():
         return _fake_run_capture
 
     _seen_cmds = []
-    globals()["nxc_bin"], globals()["run_capture"] = _fake_nxc_bin, _make_fake_run_capture(_seen_cmds)
+    _fake_rc_bulk = _make_fake_run_capture(_seen_cmds)
+    globals()["nxc_bin"], globals()["run_capture"] = _fake_nxc_bin, _fake_rc_bulk
+    _real_rcp_bulk = globals().get("_run_capture_progressive")
+    globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: _fake_rc_bulk(cmd, timeout=timeout, quiet=quiet)
     try:
         _bres = provided_creds_check("10.0.0.1", [{"port": 445, "name": "microsoft-ds"}], [],
                                      bulk=(["alice", "bob"], ["Summer2024", "Winter2024"], False))
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
+        globals()["_run_capture_progressive"] = _real_rcp_bulk
     assert len(_seen_cmds) == 8   # 1 spray + 2 del volcado SAM/LSA + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) — todo por el Pwn3d! de alice
     _cmd, _timeout, _quiet = _seen_cmds[0]
     assert _quiet is True and "--continue-on-success" in _cmd and "--no-bruteforce" not in _cmd
@@ -10795,6 +10894,8 @@ def selftest():
         return 0, "SMB 10.0.0.1 445 DC01 [+] inlanefreight\\wwhite:Secret123"   # login válido, sin Pwn3d
 
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_enrich_rc
+    _real_rcp_enr = globals().get("_run_capture_progressive")
+    globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: _fake_enrich_rc(cmd, timeout=timeout, quiet=quiet)
     try:
         _eres = provided_creds_check(
             "10.0.0.1",
@@ -10803,6 +10904,7 @@ def selftest():
             [("wwhite", "Secret123")])
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
+        globals()["_run_capture_progressive"] = _real_rcp_enr
     assert any("smb" in c and "--users" in c for c in _enr_cmds)          # enum SMB CON la credencial
     assert all("Secret123" not in " ".join(c) for c in _enr_cmds)          # el secreto NUNCA va en el argv
     _usr = next(c for c in _enr_cmds if "smb" in c and "--users" in c)
@@ -11243,6 +11345,47 @@ def selftest():
     finally:
         globals()["run_capture"] = _real_run_capture
     assert len(_retry_calls3) == 1   # con salida real desde el 1er intento, NO reintenta
+
+    # _run_capture_progressive: procesos REALES (python3 -c, sin red) para probar el timing de
+    # verdad, no un mock — es lo que hace falta pedir "¿esto sigue corriendo con sentido o se
+    # quedó colgado?", que un run_capture() simple no puede contestar. Caso real que lo motivó:
+    # --users contra un AD con muchos usuarios cortado por un timeout FIJO antes de terminar
+    # (reportado en vivo: "no he pillado un user, creo que se cortó").
+    import time as _time_rcp
+    _t0 = _time_rcp.monotonic()
+    # Crece (5 líneas con pausas) y luego se "cuelga" — debe cortar poco después de que el
+    # crecimiento se PARE (stall_timeout), sin esperar ni el techo de seguridad ni el colgado.
+    _rc_p, _out_p = _run_capture_progressive(
+        ["python3", "-c", "import sys,time\n"
+         "for i in range(5):\n print(f'user{i}'); sys.stdout.flush(); time.sleep(0.3)\n"
+         "time.sleep(100)"],
+        timeout=30, stall_timeout=2, poll_interval=0.3, quiet=True)
+    _elapsed_p = _time_rcp.monotonic() - _t0
+    assert _out_p.splitlines() == ["user0", "user1", "user2", "user3", "user4"], _out_p
+    assert _elapsed_p < 10, _elapsed_p          # cortado por el estancamiento, NO esperó el colgado de 100s
+    assert _rc_p is not None and _rc_p < 0      # terminado con señal (SIGTERM), no "acabó solo"
+
+    # Termina SOLO antes de cualquier límite → vuelve casi al instante, sin esperar nada de más.
+    _t1 = _time_rcp.monotonic()
+    _rc_p2, _out_p2 = _run_capture_progressive(
+        ["python3", "-c", "print('a'); print('b'); print('c')"],
+        timeout=30, stall_timeout=300, poll_interval=0.3, quiet=True)
+    assert _time_rcp.monotonic() - _t1 < 5
+    assert _rc_p2 == 0 and _out_p2.splitlines() == ["a", "b", "c"]
+
+    # Sigue creciendo SIN PARAR hasta el techo de seguridad absoluto `timeout` → se corta ahí
+    # igualmente (protección contra un proceso de verdad en bucle, no solo contra uno colgado).
+    _t2 = _time_rcp.monotonic()
+    _rc_p3, _out_p3 = _run_capture_progressive(
+        ["python3", "-c", "import sys,time\n"
+         "while True:\n print('x'); sys.stdout.flush(); time.sleep(0.2)"],
+        timeout=1, stall_timeout=300, poll_interval=0.2, quiet=True)
+    _elapsed_p3 = _time_rcp.monotonic() - _t2
+    assert 0.8 < _elapsed_p3 < 5, _elapsed_p3   # cortado por el techo (~1s), no por el stall (300s)
+    assert len(_out_p3.splitlines()) >= 2        # SÍ capturó progreso real antes de cortar
+
+    # Binario inexistente → (None, ""), igual que run_capture.
+    assert _run_capture_progressive(["/no/existe/binario_xyz"], timeout=5, stall_timeout=2, quiet=True) == (None, "")
 
     # _nxc_try_cred (reuse chain): una credencial VÁLIDA que sale vacía a la primera (fallo
     # transitorio SMB) NO debe darse por inválida — bug real confirmado en vivo con AB920:weasal,
