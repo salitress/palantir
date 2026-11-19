@@ -73,6 +73,33 @@ this project follows [Semantic Versioning](https://semver.org/).
   before being replayed automatically) now rejects any user/secret containing a NUL byte
   instead of pooling it, and `provided_creds_check` no longer lets a failure inside the
   reuse-chain step discard results gathered earlier in the same phase.
+- `--lsa` dump parsing was mislabelling almost every secret, losing the one that mattered.
+  A real LSA dump mixes several distinct secret types on lines that all share the shape
+  `a:b` — MSCache/DCC2 cached hashes (`DOMAIN/user:$DCC2$…`, crackable offline, *not* a
+  password), machine-account secrets (`DOMAIN\HOST$:` Kerberos keys / `plain_password_hex` /
+  SAM-format NTLM), and the genuinely valuable one: a cleartext user credential
+  (`DOMAIN\user:password`, e.g. an autologon DefaultPassword or a service account). The old
+  parser ran a single generic `user:secret` regex and dumped all of them into "credencial en
+  texto claro" findings *and* the reuse pool — so DCC2 hash strings got replayed as if they
+  were passwords (which is also what dragged the NUL-poisoned username into `subprocess`),
+  while the actual cleartext credential was buried in the same undifferentiated pile. The
+  parser now returns each secret type separately: DCC2 → reported as crackable (`hashcat -m
+  2100`), machine-account secrets → reported as such (silver-ticket / machine PtH material),
+  and only a real cleartext credential is pooled for automatic reuse — with its `DOMAIN\`
+  prefix stripped so nxc actually accepts it on replay (nxc infers the domain from the
+  target; the literal prefix makes the login fail). Verified against the exact real dump that
+  surfaced this.
+- SAM dump auto-replay was spamming disabled built-in accounts and crying wolf over empty
+  passwords. After a Pwn3d!, palantir auto-dumps SAM and fed every non-machine account's NT
+  hash into the reuse pool — including `Guest`/`DefaultAccount` (whose hash is the empty-
+  password constant) and `WDAGUtilityAccount`, all disabled by default — so a single box
+  produced a burst of pointless pass-the-hash attempts across winrm/wmi/smb/rdp (seen live in
+  `commands.log`). It also emitted a `critica` "login directo sin contraseña" for every
+  built-in that dumped with a blank hash, i.e. two false criticals on essentially every
+  modern Windows host. Now the empty-password hash and the well-known disabled built-in RIDs
+  (501/503/504) are kept in the report (still visible for manual use) but excluded from the
+  automatic reuse chain, and a blank hash on those built-ins is reported as `info`
+  ("integrada, normalmente deshabilitada") rather than a false `critica`.
 - The shared `index.html` (`<outdir>/index.html`, listing every target scanned into that
   output directory) could end up permanently un-writable after mixing a `sudo` run with a
   later non-`sudo` run — found live: `no pude escribir el índice: [Errno 13] Permission
