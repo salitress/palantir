@@ -10,6 +10,21 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Live progress heartbeat for the **silent** credentialed-enumeration queries in Fase 5d.
+  `_run_capture_progressive` already heartbeat the long `--users`/`--rid-brute` calls, but the
+  dozen-plus `_run_capture_retry` queries that follow (`--groups "Domain Admins"`, `-M
+  gpp_password`, `-M nopac`, `maq`, `--pso`, `-M obsolete`, Kerberoast/AS-REP via impacket…)
+  ran completely mute — each opens its own connection and, over a tunnel, can sit silent for up
+  to its 90s timeout, so the screen froze for minutes and looked hung. Diagnosed live by
+  snapshotting the running nxc process twice seconds apart: it had advanced from `nxc ldap …
+  --groups "Domain Admins"` to `nxc smb … -M gpp_password`, proving it was progressing, not
+  stuck — just invisibly. `_run_capture_retry` now prints a `… <query> en curso (Ns por el
+  túnel)…` line every 20s for any call that outlasts the interval (fast calls stay silent). The
+  label comes from a new `_cmd_label`, which shows the binary + protocol + action flags
+  (`--groups`, `-M <mod>`) but **never** positional args or auth values — so an
+  `impacket-GetUserSPNs dominio/user:pass …` (password in the positional argv) can't leak into
+  the progress line. Regression-tested for exactly that no-leak property.
+
 - `--resume` now **accumulates** Fase 5d (provided-credentials) findings across runs instead
   of silently losing them. Found via a direct question before it ever caused real damage:
   running `--resume -u user1 -p pass1`, then later `--resume -u user2 -p pass2` (or even
@@ -109,6 +124,19 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Fase 4 (manual banner grabbing) no longer re-opens live sockets under `--resume`. It was the
+  only phase still doing real network work on a resume — Fases 1-3 already reuse the cached nmap
+  XML, but banner grabbing fired fresh socket connects to every port (4-parallel, 8s timeout
+  each over a tunnel, some ports burning the full timeout) right before Fase 5d, just to
+  re-learn banners already saved in the previous run's `findings.json`. When the ports/services
+  match the previous run (same `_resume_reuse_ok` criterion as the rest of resume), it now
+  reuses the stored `banner` field per `(port, proto)` and prints a `[--resume] reutilizo los
+  banners…` line instead of re-probing. A port not present in the previous run keeps whatever it
+  already had.
+- Fase 5d's LDAP preview line now reads `AS-REP/Kerberoast (impacket GetNPUsers/GetUserSPNs)`
+  instead of `--asreproast/--kerberoasting`. The actual execution already uses impacket (per the
+  operator's explicit request), but the on-screen preview still named nxc's flags, which was
+  misleading — it looked like palantir ran roasting through nxc when it doesn't.
 - Fase 5d (provided credentials) now tries **LDAP before SMB** (`_CREDS_PROTO_PRIORITY`
   reordered). Prompted by a live comparison: `nxc ldap IP --users` against a DC with ~2900
   domain accounts finished in under 30s, while the equivalent `nxc smb IP --users`/

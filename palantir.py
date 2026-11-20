@@ -728,7 +728,39 @@ def run_capture(cmd, timeout=None, input_text=None, env=None, quiet=False):
         return None, ""
 
 
-def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1):
+_CMD_LABEL_PROTOS = ("ldap", "smb", "winrm", "rdp", "mssql", "wmi", "ssh", "ftp")
+# flags cuyo VALOR siguiente NO se muestra nunca en una etiqueta de progreso: o es auth
+# (puede llevar la credencial), o una ruta de fichero/host sin interés para el operador.
+_CMD_LABEL_SKIP_VAL = {"-u", "-p", "-H", "--port", "-hashes", "-outputfile", "-dc-ip",
+                       "-y", "-b", "-D", "-o", "-k"}
+
+
+def _cmd_label(cmd):
+    """Etiqueta corta y SIN secretos de un comando, para los latidos de progreso. Muestra
+    el binario, el protocolo (ldap/smb/…) y los flags de ACCIÓN (--users, -M gpp_password,
+    --groups "Domain Admins"…) — NUNCA argumentos posicionales ni valores de auth: un
+    'GetUserSPNs dominio/user:pass …' lleva la contraseña en el argv posicional, así que
+    todo lo que no empiece por '-' (salvo el protocolo nxc) se descarta, y el valor de los
+    flags de auth/ruta tampoco se imprime. Puro → testeable sin red."""
+    if not cmd:
+        return "?"
+    out = [os.path.basename(cmd[0])]
+    i = 1
+    if len(cmd) > 1 and cmd[1] in _CMD_LABEL_PROTOS:   # protocolo de nxc
+        out.append(cmd[1]); i = 2
+    while i < len(cmd):
+        t = cmd[i]
+        if t in _CMD_LABEL_SKIP_VAL:   # flag + su valor: fuera (auth/ruta/secreto)
+            i += 2; continue
+        if t.startswith("-"):
+            out.append(t)
+            if t in ("-M", "--groups") and i + 1 < len(cmd):   # el valor SÍ es acción, sin secreto
+                out.append(cmd[i + 1]); i += 2; continue
+        i += 1
+    return " ".join(out)
+
+
+def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1, heartbeat_interval=20):
     """Como run_capture, pero reintenta si la salida viene COMPLETAMENTE vacía (ni stdout
     ni stderr) — contra un objetivo real, un comando (nxc, ldapsearch…) puede fallar de forma
     TRANSITORIA (timing/latencia de la conexión SMB/LDAP, sobre todo si acaban de correr varias
@@ -740,12 +772,37 @@ def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1):
     (credencial mala, host caído) no se confunda con uno transitorio: si el fallo fuera real,
     reintentar no cambiaría nada. Si sigue vacío tras los reintentos, lo dice explícitamente en
     el texto devuelto — para que el informe no lo confunda con "comprobado, sin hallazgos"
-    cuando en realidad el comando no llegó a correr de verdad."""
-    rc, out = run_capture(cmd, timeout=timeout, quiet=quiet)
-    tries = 0
-    while not (out or "").strip() and tries < retries:
-        tries += 1
+    cuando en realidad el comando no llegó a correr de verdad.
+
+    Late de vida cada `heartbeat_interval` s (SIEMPRE, ignora `quiet`): run_capture es
+    BLOQUEANTE, así que una consulta lenta por un túnel (--groups "Domain Admins", -M
+    gpp_password, maq, pso, obsolete… — toda la cola de enum con credencial) deja la pantalla
+    muda hasta 90s y parece un cuelgue desde fuera, aunque esté avanzando (confirmado en vivo:
+    el proceso nxc cambiaba de una consulta a la siguiente entre captura y captura). El latido
+    dice QUÉ consulta está en curso (etiqueta sin secretos, ver _cmd_label) para que siempre
+    haya señal de que sigue vivo. Solo salta si la llamada supera `heartbeat_interval` s: las
+    rápidas terminan antes y no imprimen nada."""
+    stop = threading.Event()
+    label = _cmd_label(cmd)
+
+    def _beat():
+        waited = 0
+        while not stop.wait(heartbeat_interval):
+            waited += heartbeat_interval
+            print(f"{C_GREY}      … {label} en curso ({waited}s por el túnel; se corta solo "
+                  f"si tarda de más)…{C_RESET}", flush=True)
+
+    th = threading.Thread(target=_beat, daemon=True)
+    th.start()
+    try:
         rc, out = run_capture(cmd, timeout=timeout, quiet=quiet)
+        tries = 0
+        while not (out or "").strip() and tries < retries:
+            tries += 1
+            rc, out = run_capture(cmd, timeout=timeout, quiet=quiet)
+    finally:
+        stop.set()
+        th.join(timeout=1)
     if not (out or "").strip():
         out = ("(sin salida, ni siquiera tras reintentar — probable fallo transitorio de la "
                "conexión contra el objetivo, NO necesariamente que no haya nada que ver aquí; "
@@ -1190,6 +1247,26 @@ def grab_all_banners(ports, source_port=None):
                 futs[f]["banner"] = f.result()
         except KeyboardInterrupt:
             ex.shutdown(cancel_futures=True); raise
+
+
+def reuse_banners_from_prev(services, prev):
+    """--resume con los MISMOS puertos que el run anterior: reutiliza los banners que ya
+    están en su findings.json (campo 'banner' por puerto) en vez de volver a abrir un
+    socket en vivo a cada uno. El banner grabbing (Fase 4) es la ÚNICA fase que, en un
+    --resume, seguía haciendo trabajo de red real aunque las Fases 1-3 ya reutilizaran el
+    XML de nmap — por un túnel son varios sockets en paralelo con timeout de 8s (algunos
+    puertos tcpwrapped/filtered agotan el timeout entero), justo antes de la Fase 5d, y para
+    nada: el dato ya se conocía. El emparejamiento es por (puerto, proto); un puerto que no
+    estuviera en el run anterior conserva lo que ya trajera (normalmente ''). Mismo criterio
+    de reutilización que el resto de --resume (_resume_reuse_ok): solo se llega aquí si los
+    puertos/servicios son idénticos y ningún nmap tuvo que re-escanear."""
+    phase("Fase 4 — banner grabbing manual",
+          "abrir un socket a cada puerto y leer el saludo descubre servicios que nmap dejó como 'unknown'")
+    prev_banners = {(p["port"], p["proto"]): p.get("banner", "") for p in prev.get("ports", [])}
+    for p in services:
+        p["banner"] = prev_banners.get((p["port"], p["proto"]), p.get("banner", ""))
+    print(f"{C_GREY}    $ [--resume] reutilizo los banners del run anterior (findings.json) — "
+          f"no re-sondeo sockets{C_RESET}", flush=True)
 
 
 # ───────────────────────── Detección web / extensiones ─────────────────────────
@@ -6438,7 +6515,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
     _scope = "dominio" if is_dc else "locales"
     _steps_preview = {
         "smb": f"--shares + --users/--pass-pol/--rid-brute (cuentas {_scope})",
-        "ldap": "--users/--groups/--pass-pol/--admin-count/delegación + --asreproast/--kerberoasting",
+        "ldap": "--users/--groups/--pass-pol/--admin-count/delegación + AS-REP/Kerberoast (impacket GetNPUsers/GetUserSPNs)",
     }.get(np, np)
     info(f"Credencial de «{u}» válida por {np.upper()}: enumero el dominio con ella ({_steps_preview})")
     why("cada paso puede tardar 1-2 min contra un DC real y NO se imprime nada hasta que termina "
@@ -11743,6 +11820,54 @@ def selftest():
     assert "31d6cfe0d16ae931b73c59d7e0c089c0" not in _hcmds_shown         # pero el comando GUARDADO (lo que ve el informe) lo enmascara
     assert "'***'" in _hcmds_shown
 
+    # _cmd_label: etiqueta de los latidos de progreso — lo CRÍTICO es que NUNCA filtre la
+    # credencial (un 'GetUserSPNs dominio/user:pass' la lleva en el argv posicional).
+    assert _cmd_label(["nxc", "ldap", "10.0.0.1", "-u", "BR086", "-p", "/tmp/x.pw", "--groups", "Domain Admins"]) \
+        == "nxc ldap --groups Domain Admins"
+    assert _cmd_label(["nxc", "smb", "10.0.0.1", "-u", "BR086", "-p", "/tmp/x.pw", "-M", "gpp_password"]) \
+        == "nxc smb -M gpp_password"
+    # impacket: la contraseña va en el argv posicional (dominio/user:pass) → NO debe aparecer
+    _lbl_imp = _cmd_label(["GetUserSPNs", "inlanefreight.local/BR086:Welcome1", "-request", "-dc-ip", "10.0.0.1",
+                           "-outputfile", "/tmp/k.txt"])
+    assert "Welcome1" not in _lbl_imp and "BR086" not in _lbl_imp, _lbl_imp
+    assert _lbl_imp == "GetUserSPNs -request"   # solo binario + flag de acción, sin el posicional con la cred
+    # pass-the-hash: el hash tampoco (va tras -H, y -hashes es auth)
+    _lbl_h = _cmd_label(["nxc", "smb", "10.0.0.1", "-u", "u", "-H", "31d6cfe0d16ae931b73c59d7e0c089c0", "--shares"])
+    assert "31d6cfe0d16ae931b73c59d7e0c089c0" not in _lbl_h and _lbl_h == "nxc smb --shares"
+
+    # _run_capture_retry: late de vida cuando la llamada BLOQUEANTE tarda más que el intervalo
+    # (consulta lenta por un túnel) — sin esto la pantalla se queda muda y parece un cuelgue.
+    import builtins as _bi
+    import time as _t_hb
+    _orig_print = _bi.print
+    _beats = []
+
+    def _fake_slow_rc(cmd, timeout=None, quiet=False, **kw):
+        _t_hb.sleep(0.25)   # más que el heartbeat_interval de abajo → debe latir ≥1 vez
+        return 0, "ok"
+    globals()["run_capture"] = _fake_slow_rc
+    _bi.print = lambda *a, **k: (_beats.append(a[0] if a else ""), None)[1]
+    try:
+        _rc_hb, _out_hb = _run_capture_retry(["nxc", "ldap", "10.0.0.1", "-u", "u", "-p", "/tmp/x.pw", "--groups", "Domain Admins"],
+                                             timeout=10, heartbeat_interval=0.1)
+    finally:
+        _bi.print = _orig_print
+        globals()["run_capture"] = _real_run_capture
+    assert _out_hb == "ok"
+    assert any("Domain Admins" in str(b) and "en curso" in str(b) for b in _beats), _beats   # latió, con la etiqueta correcta
+
+    # rápida (termina antes del intervalo) → NO late, sin ruido
+    _beats2 = []
+    globals()["run_capture"] = lambda cmd, timeout=None, quiet=False, **kw: (0, "rápido")
+    _bi.print = lambda *a, **k: (_beats2.append(a[0] if a else ""), None)[1]
+    try:
+        _run_capture_retry(["nxc", "smb", "10.0.0.1", "-u", "u", "-p", "/tmp/x.pw", "--shares"],
+                           timeout=10, heartbeat_interval=5)
+    finally:
+        _bi.print = _orig_print
+        globals()["run_capture"] = _real_run_capture
+    assert not any("en curso" in str(b) for b in _beats2)   # terminó antes del intervalo: ni un latido
+
     # _run_capture_retry: reintenta SOLO si la salida viene completamente vacía (síntoma de
     # fallo transitorio de conexión, no de "no hay nada que reportar") — el caso real que
     # motivó esto: --shares/--pass-pol/--rid-brute con una credencial YA válida salieron
@@ -12639,6 +12764,22 @@ def selftest():
     assert _resume_reuse_ok(True, None, False, _svcs_b) is False             # sin findings.json anterior
     assert _resume_reuse_ok(True, _prev_findings, True, _svcs_b) is False    # algún nmap SÍ re-escaneó de verdad
     assert _resume_reuse_ok(True, _prev_findings, False, _svcs_c) is False   # puertos distintos: no reutilizable
+
+    # reuse_banners_from_prev: en --resume con los mismos puertos, Fase 4 reutiliza los banners
+    # del findings.json anterior en vez de re-abrir sockets en vivo (la única fase que seguía
+    # haciendo red de verdad en un --resume). Empareja por (puerto, proto); un puerto nuevo
+    # conserva lo que ya trajera.
+    _rb_prev = {"ports": [{"port": 22, "proto": "tcp", "banner": "SSH-2.0-OpenSSH_8.9"},
+                          {"port": 80, "proto": "tcp", "banner": "HTTP/1.1 200 OK"}]}
+    _rb_svcs = [{"port": 22, "proto": "tcp", "banner": ""},
+                {"port": 80, "proto": "tcp", "banner": ""},
+                {"port": 445, "proto": "tcp", "banner": "YA-TENGO"}]   # no estaba antes: no se toca
+    import contextlib as _ctx_rb, io as _io_rb
+    with _ctx_rb.redirect_stdout(_io_rb.StringIO()):
+        reuse_banners_from_prev(_rb_svcs, _rb_prev)
+    assert _rb_svcs[0]["banner"] == "SSH-2.0-OpenSSH_8.9"   # reutilizado del run anterior
+    assert _rb_svcs[1]["banner"] == "HTTP/1.1 200 OK"
+    assert _rb_svcs[2]["banner"] == "YA-TENGO"              # puerto nuevo: conserva lo suyo, sin red
 
     # _load_prev_findings: None si no hay fichero o está corrupto (fallback seguro: todo de cero)
     _lpf_dir = Path(tempfile.mkdtemp())
@@ -14197,7 +14338,13 @@ def run_one(ip, name, args, folder=None):
             services.append(u)
 
     if not args.no_banner:
-        grab_all_banners(services, source_port=args.source_port)
+        # En --resume con los mismos puertos (y sin re-escaneo de nmap), los banners ya están
+        # en el findings.json anterior: reutilízalos en vez de re-sondear sockets en vivo (la
+        # única fase que seguía haciendo red de verdad en un --resume — ver reuse_banners_from_prev).
+        if _resume_reuse_ok(args.resume, prev, _TLS.nmap_fresh_scan, services):
+            reuse_banners_from_prev(services, prev)
+        else:
+            grab_all_banners(services, source_port=args.source_port)
 
     render(ip, services, host)
 
