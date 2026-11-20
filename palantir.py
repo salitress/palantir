@@ -14570,16 +14570,26 @@ def run_one(ip, name, args, folder=None):
         info(f"MSSQL anunciado por el SQL Browser (1434/udp) en {ip}:{_mssql_extra['port']} — lo "
              "añado al footprint/credenciales aunque el escaneo TCP no lo viera abierto (común por un túnel).")
 
+    _reuse_scan = _resume_reuse_ok(args.resume, prev, _TLS.nmap_fresh_scan, services)
     if not args.no_banner:
         # En --resume con los mismos puertos (y sin re-escaneo de nmap), los banners ya están
         # en el findings.json anterior: reutilízalos en vez de re-sondear sockets en vivo (la
         # única fase que seguía haciendo red de verdad en un --resume — ver reuse_banners_from_prev).
-        if _resume_reuse_ok(args.resume, prev, _TLS.nmap_fresh_scan, services):
+        if _reuse_scan:
             reuse_banners_from_prev(services, prev)
         else:
             grab_all_banners(services, source_port=args.source_port)
 
-    render(ip, services, host)
+    # En --resume con el footprint reutilizado tal cual, la tabla de puertos completa (con todos
+    # los scripts NSE) es un volcado idéntico al del run anterior y estorba en pantalla — los
+    # puertos ya salieron en la Fase 1 y el detalle está en el report.html. Se omite y se deja
+    # solo una línea; en un escaneo fresco (o si algo cambió) se pinta entera como siempre.
+    if _reuse_scan:
+        _tcp = sorted(p["port"] for p in services if p.get("proto") == "tcp")
+        info(f"[--resume] footprint reutilizado del run anterior ({len(_tcp)} puerto(s) TCP: "
+             f"{', '.join(map(str, _tcp))}) — no re-vuelco la tabla (detalle en el report.html).")
+    else:
+        render(ip, services, host)
 
     extra_dom = args.vhost or (name or None)
 
@@ -14669,7 +14679,11 @@ def run_one(ip, name, args, folder=None):
     vulns = None
     if "searchsploit" in prev_phases and not args.no_searchsploit:
         vulns = prev.get("vulns") or []
-        render_vulns(vulns)
+        # Reutilizado del run anterior: NO re-vuelco la tabla entera de exploits (idéntica a la de
+        # antes, estorba en --resume) — una línea y el detalle en el report.html.
+        if vulns:
+            info(f"[--resume] searchsploit reutilizado del run anterior ({len(vulns)} producto(s) "
+                 "con exploits conocidos) — detalle en el report.html.")
         searchsploit_ok = True
     elif not args.no_searchsploit:
         try:

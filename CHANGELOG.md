@@ -8,6 +8,15 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `--resume` is much quieter on screen when it reuses a previous run as-is. It no longer re-dumps
+  the full port table (every NSE script included) nor the whole searchsploit exploit table — both
+  are byte-for-byte repeats of the previous run and only added noise before getting to the actual
+  new work (Fase 5d). Each is replaced by a one-line summary, with the full detail still in
+  `report.html`. A fresh scan, or a resume where anything changed (different ports, a re-scan),
+  still prints both in full as before.
+
 ### Added
 
 - MSSQL is now footprinted and credential-tested even when the TCP port scan didn't see 1433
