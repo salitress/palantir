@@ -8,6 +8,8 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-20
+
 ### Added
 
 - Host identity (NetBIOS name + AD domain) is now also recovered from the **nxc banner** saved in
