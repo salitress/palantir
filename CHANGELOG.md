@@ -8,6 +8,30 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Domain/DC-level findings no longer appear once **per credential**. noPac, "no account lockout",
+  Domain/Enterprise Admins membership, MachineAccountQuota and the domain user count are
+  properties of the domain, not of the credential that confirmed them — but with 2+ provided
+  credentials (common after a `--resume` that adds a new one) they showed up two or three times,
+  once tagged `(cred mssqlsvc)`, once `(cred BR086)`, etc. (flagged live, "error users ad"). noPac
+  was the worst case: unlike the others it wasn't deduplicated at all within a single run; it now
+  goes through the same `_add_once` marker. And the `--resume` accumulation merge
+  (`_merge_creds_provided_footprint`) now dedups findings by a key that collapses `(cred <X>)` →
+  `(cred)`, so the same domain-level finding from an older run and this one counts as one.
+  Genuinely per-credential findings (`credencial válida — «user:secret»`, `Pwn3d!`) don't carry a
+  `(cred X)` tag, so they're untouched and still listed per credential.
+- A **provided hash** is now shown in its finding, like a provided password. `nxc … -H <hash>`
+  produced `credencial aportada válida — «mssqlsvc:***»`, masking the operator's own input and
+  making it impossible to tell which pass-the-hash credential worked (flagged live, "se esconde el
+  hash"). The finding now shows the hash; the step's raw output still masks it for dump hygiene,
+  and the displayed command still uses `-H '***'` to keep it out of `commands.log`.
+- `maybe_add_hosts` (`/etc/hosts` prompt) now matches an existing entry by **exact hostname
+  token**, case-insensitively, instead of a `\b`-bounded substring regex that treated
+  `inlanefreight.local` as already present whenever `dc01.inlanefreight.local` was in the file
+  (the `.` counts as a word boundary). It also says so — "(/etc/hosts) ya está: … — no hace falta
+  añadir nada" — instead of silently skipping, and when only some names are missing it names which.
+
 ### Changed
 
 - `--resume` is much quieter on screen when it reuses a previous run as-is. It no longer re-dumps

