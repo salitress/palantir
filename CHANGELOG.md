@@ -8,6 +8,8 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-20
+
 ### Fixed
 
 - Domain/DC-level findings no longer appear once **per credential**. noPac, "no account lockout",
