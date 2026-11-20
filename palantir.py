@@ -1547,6 +1547,32 @@ def netbios_computer_name(ports, host):
     return next(g for g in m.groups() if g).rstrip("\x00").strip()
 
 
+_NXC_NAME_RE = re.compile(r"\(name:([^)]+)\)")
+_NXC_DOMAIN_RE = re.compile(r"\(domain:([^)]+)\)")
+
+
+def _nxc_identity_from_footprints(footprints):
+    """(netbios_name, dominio_AD) sacados de la salida de nxc ya guardada en los pasos del
+    footprint. El banner de nxc (SMB/LDAP/WMI) SIEMPRE imprime '(name:HOST) (domain:DOM)' al
+    conectar, antes incluso de autenticar. Para un host como SQL01 (p. ej. solo 139 abierto, sin
+    445/LDAP/DNS) esa es la ÚNICA fuente de su identidad: ni los NSE nbstat/smb-os-discovery (que
+    necesitan 445/3389) ni discover_domains (scripts nmap/banners) la ven, pero nxc sí — y antes
+    salía resaltada por todo el informe sin ponerse en ningún sitio como hostname del objetivo
+    (reportado en vivo con SQL01/172.16.7.60). El dominio solo se acepta si es FQDN (con punto):
+    un host en WORKGROUP muestra '(domain:HOSTNAME)' igual al name, que NO es un dominio. Puro →
+    testeable sin red."""
+    blob = "\n".join(st.get("output", "") for f in footprints for st in f.get("steps", []))
+    nm = _NXC_NAME_RE.search(blob)
+    name = nm.group(1).strip().rstrip("\x00") if nm else None
+    dom = None
+    for m in _NXC_DOMAIN_RE.finditer(blob):
+        cand = m.group(1).strip().rstrip("\x00")
+        if "." in cand and not cand.replace(".", "").isdigit():   # FQDN de verdad, no una IP ni un workgroup
+            dom = cand.lower()
+            break
+    return (name or None), dom
+
+
 # ccTLDs con 2º nivel (p. ej. "hostgator.com.br": el dominio registrable NO son las
 # últimas 2 etiquetas, "com.br", sino las últimas 3). Lista corta de los más comunes
 # en recon/bug bounty, no la Public Suffix List completa — amplíala si topas con uno
@@ -1598,6 +1624,37 @@ def highlight(ports, host):
 # salta (el núcleo FTP/SMTP no necesita binarios externos: usa ftplib/smtplib).
 
 SEV_ORDER = {"critica": 0, "alta": 1, "media": 2, "info": 3}
+
+# Credencial a la que pertenece un hallazgo, para agruparlos por usuario al pintarlos. Dos
+# formas: "(cred USER)" (hallazgos de enum) y "«USER:pass»" (credencial validada/spray/reuse).
+# El «» SOLO cuenta como credencial si lleva ':' (user:pass) — así un «Share» suelto no se
+# confunde con un usuario.
+_FINDING_CRED_RE = re.compile(r"\(cred ([^)]+?)\)|«([^:»]+):")
+
+
+def _finding_cred(text):
+    """Nombre de la credencial a la que se refiere un hallazgo, o None si es general (no ligado
+    a ninguna credencial aportada). Puro → testeable sin red."""
+    m = _FINDING_CRED_RE.search(text or "")
+    if not m:
+        return None
+    return (m.group(1) or m.group(2) or "").strip() or None
+
+
+def _findings_grouped(findings):
+    """Reordena hallazgos para pintarlos: primero los GENERALES (sin credencial), luego
+    agrupados por credencial EN ORDEN DE PRIMERA APARICIÓN, y dentro de cada grupo por
+    severidad. Antes se ordenaban SOLO por severidad, así que los hallazgos de dos credenciales
+    (BR086, AB920) salían intercalados — veías un usuario, luego otro, y el primero otra vez más
+    abajo (pedido del operador: agrupar por usuario). Estable: a igual (grupo, severidad)
+    respeta el orden original. Puro → testeable sin red."""
+    order = []   # primera aparición de cada credencial
+    for _s, t in findings:
+        c = _finding_cred(t)
+        if c is not None and c not in order:
+            order.append(c)
+    rank = {c: i + 1 for i, c in enumerate(order)}
+    return sorted(findings, key=lambda f: (rank.get(_finding_cred(f[1]), 0), SEV_ORDER.get(f[0], 9)))
 
 
 def _fp(proto, title, ports):
@@ -2437,7 +2494,10 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
         res["findings"].append(("info",
             f"SMB: {ident} aceptada pero sin lectura anónima (RID cycling y shares denegados) → "
             "--users/--computers/--pass-pol por SAMR necesitan credenciales (saltados: devolverían lo mismo)"))
-    res["next"].append(f"nxc ldap {ip} -u USER -p PASS --asreproast / --kerberoasting   # con credenciales válidas")
+    # Roasting con impacket (no flags de nxc), pedido explícito del operador — ver el bloque
+    # equivalente en fp_ldap. Placeholders DOMINIO/USER:PASS: se rellenan solos si se confirman.
+    res["next"].append(f"{_impacket_suggest_bin('GetNPUsers')} DOMINIO/USER:PASS -request -dc-ip {ip} -outputfile asrep.txt   # AS-REP roast (con credenciales válidas)")
+    res["next"].append(f"{_impacket_suggest_bin('GetUserSPNs')} DOMINIO/USER:PASS -request -dc-ip {ip} -outputfile kerb.txt   # Kerberoast (con credenciales válidas)")
 
 
 # Spidering de shares SMB legibles (solo lectura): localiza ficheros jugosos que el
@@ -2449,19 +2509,35 @@ _SMB_LOOT_RE = re.compile(
     r"root\.txt|local\.txt|\.git|\.env\b|\.ini\b)")
 
 
+# Línea de `nxc smb --shares`: tras el prefijo 'SMB ip puerto host', nxc imprime
+# '{name:<15} {perms:<22} {remark}' (confirmado en nxc/protocols/smb.py, método shares()).
+# El NOMBRE del share puede llevar ESPACIOS ('Department Shares') y NO se trunca, así que el
+# nombre es TODO lo que hay entre el prefijo y la columna de permisos (READ/WRITE, unidos por
+# comas sin espacios). perms = ",".join(access) → "READ" | "WRITE" | "READ,WRITE".
+_NXC_SHARE_RE = re.compile(
+    r"^SMB\s+\S+\s+\d+\s+\S+\s+(?P<name>.+?)\s+(?P<perm>(?:READ|WRITE)(?:,(?:READ|WRITE))*)(?:\s|$)")
+
+
 def _smb_readable_shares(out):
-    """De la salida de `nxc smb --shares`, nombres de shares con permiso READ,
-    saltando los administrativos/IPC que no sirven para botín."""
-    skip = {"ADMIN$", "C$", "IPC$", "print$", "Permissions", "Share"}
+    """De la salida de `nxc smb --shares`, nombres de shares con permiso READ, saltando los
+    administrativos/IPC que no sirven para botín.
+
+    BUG real arreglado (visto contra INLANEFREIGHT): antes se hacía line.split() y se tomaba el
+    token ANTERIOR a 'READ', pero el nombre del share puede llevar espacios — 'Department Shares
+    READ' daba 'Shares', no 'Department Shares'. El spider acababa apuntando a un share
+    INEXISTENTE ('Shares') y se perdía el botín (p. ej. un web.config con una connectionString en
+    claro en 'Department Shares\\IT\\...'). Ahora se captura el nombre ENTERO entre el prefijo
+    'SMB ip puerto host' y la columna de permisos (ver _NXC_SHARE_RE, formato confirmado en el
+    código fuente de nxc)."""
+    skip = {"ADMIN$", "C$", "IPC$", "print$"}
     shares = []
     for line in out.splitlines():
-        toks = line.split()
-        for i, t in enumerate(toks):
-            if t in ("READ", "READ,WRITE") and i >= 1:
-                share = toks[i - 1]
-                if share not in skip and not share.startswith("-"):
-                    shares.append(share)
-                break
+        m = _NXC_SHARE_RE.match(line)
+        if not m:
+            continue
+        name = m.group("name").strip()
+        if "READ" in m.group("perm") and name not in skip and not name.startswith("-"):
+            shares.append(name)
     return list(dict.fromkeys(shares))
 
 
@@ -2544,9 +2620,15 @@ def _nxc_spider(res, nxc, ip, auth_args, shown_auth, shares, pattern=None):
         else f"--regex {shlex.quote(_SPIDER_SECRET_REGEX)}"
     for share in shares[:5]:
         cmd = [nxc, "smb", ip] + auth_args + ["--spider", share, "--content", "--depth", "5"] + search
-        rc, out = run_capture(cmd, timeout=180, quiet=True)
+        # Progresivo (no run_capture con timeout fijo de 180s): spiderar el CONTENIDO de un share
+        # grande por un túnel puede tardar de sobra más de 180s y antes se cortaba a media (visto
+        # en vivo: la salida quedaba en '[*] Spidering .'), perdiéndose ficheros jugosos en
+        # subdirectorios profundos. Sigue el progreso real y solo corta tras 5 min SIN novedad.
+        rc, out = _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, quiet=True)
         hits = _parse_spider_hits(out)
-        _step(res, f"{nxc} smb {ip} {shown_auth} --spider {share} --content {search_shown}",
+        # shlex.quote(share): un nombre con espacios ('Department Shares') tiene que ir
+        # entrecomillado en el comando que el operador copia/pega, o se interpreta como 2 args.
+        _step(res, f"{nxc} smb {ip} {shown_auth} --spider {shlex.quote(share)} --content {search_shown}",
               bool(hits), out,
               note=f"spidering de CONTENIDO del share '{share}': busca secretos DENTRO de los ficheros (no solo por nombre)")
         for h in hits:
@@ -3438,9 +3520,13 @@ def fp_ldap(ip, ports, services, host, deep):
                     "--groups/--pass-pol/get-desc-users necesitan credenciales (saltados: devolverían lo mismo)"))
         else:
             res["findings"].append(("info", "LDAP sin bind anónimo (null/guest no entran) → la enum LDAP necesita credenciales"))
+        # Roasting con impacket (GetNPUsers/GetUserSPNs), NO con los flags de nxc: pedido
+        # explícito del operador (la herramienta de referencia de cada ataque). Placeholders
+        # DOMINIO/USER:PASS → se rellenan solos si luego se confirma dominio+credencial (ver
+        # _fill_domain_placeholder/_fill_cred_placeholder). Mismo formato que el camino autenticado.
         res["next"] += [
-            f"nxc ldap {ip} -u USER -p PASS --asreproast asrep.txt   # (con creds) cuentas sin preauth → hash crackeable",
-            f"nxc ldap {ip} -u USER -p PASS --kerberoasting kerb.txt   # (con creds) cuentas con SPN → hash crackeable",
+            f"{_impacket_suggest_bin('GetNPUsers')} DOMINIO/USER:PASS -request -dc-ip {ip} -outputfile asrep.txt   # AS-REP roast (con creds): cuentas sin preauth → hash crackeable",
+            f"{_impacket_suggest_bin('GetUserSPNs')} DOMINIO/USER:PASS -request -dc-ip {ip} -outputfile kerb.txt   # Kerberoast (con creds): cuentas con SPN → hash crackeable",
         ]
     else:
         res["missing"].append("nxc/netexec")
@@ -6415,12 +6501,19 @@ def _parse_loggedon_users(out):
     return seen
 
 
-def _surface_ad_enum(res, u, mod, out, base=None, seen=None):
-    """Saca como HALLAZGO lo accionable de la enum AD con credencial (lista de usuarios del
-    dominio, ausencia de bloqueo de cuentas) — no solo enterrado en el output crudo, igual
-    que ya hace el enum anónimo. Deduplicado por marcador (en un DC, SMB y LDAP enumeran lo
-    mismo) — ver `_add_once` para qué hace `seen`. Si hay usuarios, los guarda en
-    <base>/ad_users.txt, listos para spraying/AS-REP roast (GetNPUsers -usersfile)."""
+def _surface_ad_enum(res, u, mod, out, base=None, seen=None, is_dc=True):
+    """Saca como HALLAZGO lo accionable de la enum con credencial (lista de cuentas, ausencia
+    de bloqueo) — no solo enterrado en el output crudo, igual que ya hace el enum anónimo.
+    Deduplicado por marcador (en un DC, SMB y LDAP enumeran lo mismo) — ver `_add_once` para
+    qué hace `seen`. Si hay cuentas, las guarda en <base>/ad_users.txt (spraying/AS-REP roast).
+
+    `is_dc`: en un Domain Controller, `--users`/`--rid-brute` dan los usuarios del DOMINIO; en un
+    member server SUELTO (no-DC) esos mismos flags van contra el SAM LOCAL y devuelven las cuentas
+    LOCALES (Administrator/Guest/DefaultAccount/WDAGUtilityAccount + las propias), NO del dominio.
+    Visto en vivo en MS01/SQL01 (172.16.7.50/.60): salía "4 usuarios del dominio: Administrator,
+    Guest, DefaultAccount, WDAGUtilityAccount" cuando son 4 cuentas locales. Por eso la etiqueta y
+    el marcador cambian con is_dc — y el marcador distinto evita además que el salto DC-only de
+    _creds_enum (que busca "usuarios del dominio" en `seen`) se dispare por una lista local."""
     users = []
     if mod == "--users":
         users = _parse_nxc_userlist(out)
@@ -6429,23 +6522,26 @@ def _surface_ad_enum(res, u, mod, out, base=None, seen=None):
             x for x in re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeUser\)", out)
             if not x.endswith("$")))
     if users:
+        where = "usuarios del dominio" if is_dc else "cuentas locales (SAM)"
+        prefix = "AD" if is_dc else "SAM"
         tip = f" (→ {base / 'ad_users.txt'})" if base else ""
         if _add_once(res, "alta",
-                     f"AD (cred {u}): {len(users)} usuarios del dominio{tip}: "
+                     f"{prefix} (cred {u}): {len(users)} {where}{tip}: "
                      + ", ".join(users[:20]) + (" …" if len(users) > 20 else ""),
-                     "usuarios del dominio", seen) and base:
+                     where, seen) and base:
             try:
                 _merge_write_ad_users(base, users)
             except OSError:
                 pass
     if mod == "--pass-pol":
+        prefix = "AD" if is_dc else "SAM"
         pol = _parse_pass_pol(out)
-        pp = _format_pass_pol_finding(pol, prefix=f"AD (cred {u})")
+        pp = _format_pass_pol_finding(pol, prefix=f"{prefix} (cred {u})")
         if pp:
             _add_once(res, "info", pp, "política de contraseñas", seen)
         if pol.get("lockout_threshold") in ("None", "0"):
             _add_once(res, "alta",
-                      f"AD (cred {u}): sin bloqueo de cuentas (lockout None/0) → el password spraying no bloquea cuentas",
+                      f"{prefix} (cred {u}): sin bloqueo de cuentas (lockout None/0) → el password spraying no bloquea cuentas",
                       "sin bloqueo de cuentas", seen)
 
 
@@ -6594,7 +6690,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 rc, out = _run_capture_progressive([nxc, "smb", ip] + A() + [mod],
                                                    timeout=1800, stall_timeout=300, quiet=True)
                 _step(res, f"{nxc} smb {ip} {shown_auth} {mod}", rc == 0, mask(out), note=note)
-                _surface_ad_enum(res, u, mod, out, base, seen)
+                _surface_ad_enum(res, u, mod, out, base, seen, is_dc=is_dc)
             # --loggedon-users: ¿quién tiene sesión abierta AHORA en el objetivo? Necesita admin
             # LOCAL en la máquina (consulta wkssvc) — si la credencial es de bajo privilegio
             # devuelve 'Error enumerating logged on users' y el paso solo lo registra. Cuando SÍ
@@ -6687,7 +6783,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 rc, out = _run_capture_progressive([nxc, "ldap", ip] + A() + [mod],
                                                    timeout=1800, stall_timeout=300, quiet=True)
                 _step(res, f"{nxc} ldap {ip} {shown_auth} {mod}", rc == 0, mask(out), note=note)
-                _surface_ad_enum(res, u, mod, out, base, seen)
+                _surface_ad_enum(res, u, mod, out, base, seen, is_dc=is_dc)
             # Membresía de los grupos que dan el dominio: '--groups "Domain Admins"' imprime SUS
             # MIEMBROS (el '--groups' de arriba, sin argumento, solo lista grupos con su recuento).
             # Saber QUIÉN es Domain/Enterprise Admin con una credencial ya validada enfoca el resto
@@ -8357,7 +8453,7 @@ def render_footprint(footprints):
             print(f"    {mark} {C_GREY}$ {st['cmd']}{C_RESET}")
             if st.get("note"):                        # modo educativo: el porqué de cada comando
                 print(f"      {C_GREY}↳ por qué: {st['note']}{C_RESET}")
-        for sev, txt in sorted(fpr["findings"], key=lambda f: SEV_ORDER.get(f[0], 9)):
+        for sev, txt in _findings_grouped(fpr["findings"]):
             col = {"critica": C_RED + C_BOLD, "alta": C_RED, "media": C_YELLOW, "info": C_BLUE}.get(sev, C_GREY)
             print(f"      {col}★ [{sev}]{C_RESET} {txt}")
         if fpr["missing"]:
@@ -8520,8 +8616,11 @@ def _cmds_for(finding_text, next_steps, n=3):
     if kws:
         matched = [c for c in next_steps if any(k in c.lower() for k in kws)]
         if matched:
-            rest = [c for c in next_steps if c not in matched]
-            return (matched + rest)[:n]
+            # SOLO lo que casa con el CVE/nombre de ataque del hallazgo — NO rellenar con el
+            # resto de next-steps del protocolo. Bug real (reportado en vivo): el quick win de
+            # Zerologon enseñaba su exploit y, debajo, un 'GetNPUsers … AS-REP roast' sin ninguna
+            # relación, solo porque estaba en el mismo footprint — confundía más que ayudaba.
+            return matched[:n]
     return list(next_steps[:n])
 
 
@@ -8890,11 +8989,15 @@ def _copy_btn(cmd):
     return f'<button class="copy" type="button" data-cmd="{_h(cmd)}" title="copiar comando">⧉</button>'
 
 
-def _html_findings_block(findings):
+def _html_findings_block(findings, group=False):
     if not findings:
         return ""
+    # group=True: agrupa por credencial (generales, luego user por user), para los bloques
+    # POR PROTOCOLO donde dos credenciales (BR086/AB920) salían intercaladas. El resumen
+    # "actionable" de arriba se queda por severidad pura (group=False por defecto).
+    ordered = _findings_grouped(findings) if group else sorted(findings, key=lambda f: SEV_ORDER.get(f[0], 9))
     rows = []
-    for sev, txt in sorted(findings, key=lambda f: SEV_ORDER.get(f[0], 9)):
+    for sev, txt in ordered:
         rows.append(f'<div class="f"><span class="badge {sev}">{sev.upper()}</span>'
                     f'<span>{_h(txt)}</span></div>')
     return '<div class="findings">' + "".join(rows) + "</div>"
@@ -9066,7 +9169,8 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
             nf += len(fpr["findings"])
             # Lo que más ruido da cuando no encuentra nada (sesión nula/creds por defecto que
             # no abrieron ninguna puerta) se pliega — lo aportado SIEMPRE se muestra entero.
-            inner = _html_findings_block(fpr["findings"])
+            # group=True: agrupa por credencial (generales, luego user por user).
+            inner = _html_findings_block(fpr["findings"], group=True)
             inner += _html_steps(fpr["steps"], collapsible=(kind != "provided"))
             if fpr["next"]:
                 inner += "<h3>Siguientes pasos</h3><ul class='next'>" + \
@@ -9330,7 +9434,7 @@ def build_markdown(ip, services, host, footprints, vulns, domains, web_hits, vho
         for label, fpr in active:
             if multi and label:
                 L.append(f"### {label}")
-            for s, t in sorted(fpr["findings"], key=lambda f: SEV_ORDER.get(f[0], 9)):
+            for s, t in _findings_grouped(fpr["findings"]):
                 L.append(f"- **[{s}]** {t}")
             if fpr["next"]:
                 L += ["", "**Siguientes pasos:**"]
@@ -10110,6 +10214,26 @@ def selftest():
     # enumerada es password spraying directo, el operador pidió que fuera más visible. Y lleva tip.
     assert any(s == "alta" and "sin bloqueo de cuentas" in t for s, t in _ad["findings"])
     assert _tip_for("AD (cred x): sin bloqueo de cuentas (lockout None/0) → el password spraying no bloquea cuentas") is not None
+
+    # _surface_ad_enum en un MEMBER SERVER (is_dc=False): --users va contra el SAM LOCAL, no el
+    # dominio → las 4 cuentas (Administrator/Guest/DefaultAccount/WDAGUtilityAccount) son LOCALES,
+    # no "usuarios del dominio" (bug real visto en MS01/SQL01). Etiqueta y prefijo cambian.
+    _ad_local = _fp("reuse", "x", [445])
+    _local_out = ("SMB 10.0.0.1 445 MS01 [*] Windows 10\n"
+                  "SMB 10.0.0.1 445 MS01 [+] WORKGROUP\\br086:*** \n"
+                  "SMB 10.0.0.1 445 MS01 -Username- -Last PW Set- -BadPW- -Description-\n"
+                  "SMB 10.0.0.1 445 MS01 Administrator 2025-01-01 0 Built-in\n"
+                  "SMB 10.0.0.1 445 MS01 Guest 2025-01-01 0\n"
+                  "SMB 10.0.0.1 445 MS01 DefaultAccount 2025-01-01 0\n"
+                  "SMB 10.0.0.1 445 MS01 WDAGUtilityAccount 2025-01-01 0")
+    _surface_ad_enum(_ad_local, "br086", "--users", _local_out, is_dc=False)
+    assert any("cuentas locales (SAM)" in t and t.startswith("SAM (cred br086)") for _s, t in _ad_local["findings"]), _ad_local["findings"]
+    assert not any("usuarios del dominio" in t for _s, t in _ad_local["findings"])   # NO los llama del dominio
+    # la lista local NO siembra el marcador DC-only "usuarios del dominio" (si no, el salto de SMB
+    # en un DC podría dispararse por una lista local de otro host que comparta el `seen`)
+    _seen_local = set()
+    _surface_ad_enum(_fp("reuse", "x", [445]), "br086", "--users", _local_out, seen=_seen_local, is_dc=False)
+    assert "usuarios del dominio" not in _seen_local and "cuentas locales (SAM)" in _seen_local
 
     # _parse_pass_pol / _format_pass_pol_finding: salida REAL de `nxc --pass-pol` contra un DC
     # con política NORMAL (lockout=5, no None/0) — pedido explícito: antes esto se leía (quedaba
@@ -12309,12 +12433,51 @@ def selftest():
 
     # Orden de severidad (crítica primero) y utilidades nuevas, sin tocar la red
     assert SEV_ORDER["critica"] < SEV_ORDER["alta"] < SEV_ORDER["media"] < SEV_ORDER["info"]
+
+    # _finding_cred: extrae la credencial de un hallazgo (para agrupar), None si es general
+    assert _finding_cred("AD (cred BR086): 2901 usuarios del dominio") == "BR086"
+    assert _finding_cred("LDAP: credencial aportada válida — «AB920:weasal»") == "AB920"
+    assert _finding_cred("SMB: Zerologon (CVE-2020-1472) — el DC es VULNERABLE") is None   # general
+    assert _finding_cred("SMB (cred BR086): share(s) legible(s) — Shares, NETLOGON") == "BR086"
+    assert _finding_cred("SMB (cred AB920): share(s) legible(s) — «Department Shares»") == "AB920"   # «» sin ':' no confunde
+
+    # _findings_grouped: generales primero, luego cada credencial junta (orden de 1ª aparición),
+    # dentro de cada grupo por severidad. Antes se intercalaban BR086 y AB920 (bug de UX reportado).
+    _fg_in = [
+        ("alta", "LDAP: credencial aportada válida — «BR086:Welcome1»"),
+        ("info", "AD (cred BR086): política de contraseñas"),
+        ("alta", "LDAP: credencial aportada válida — «AB920:weasal»"),
+        ("critica", "SMB: Zerologon — el DC es VULNERABLE"),          # general, crítica
+        ("alta", "AD (cred AB920): 'Domain Admins' — 1 miembro"),
+        ("info", "SMB: autenticación nula aceptada"),                 # general, info
+        ("alta", "AD (cred BR086): 'Domain Admins' — 1 miembro"),
+    ]
+    _fg = _findings_grouped(_fg_in)
+    _fg_txt = [t for _s, t in _fg]
+    # 1º los generales (Zerologon crítica antes que 'nula' info), 2º TODO BR086 junto, 3º TODO AB920
+    assert _fg_txt[0].startswith("SMB: Zerologon") and _fg_txt[1].startswith("SMB: autenticación nula")
+    _i_br = [i for i, t in enumerate(_fg_txt) if "BR086" in t]
+    _i_ab = [i for i, t in enumerate(_fg_txt) if "AB920" in t]
+    assert max(_i_br) < min(_i_ab), _fg_txt   # TODO BR086 antes que CUALQUIER AB920 (no intercalado)
+    assert _fg_txt[_i_br[0]].startswith("LDAP")   # dentro de BR086, la 'alta' antes que la 'info'
     shares_out = ("SMB 10.10.10.10 445 HOST Share     Permissions  Remark\n"
                   "SMB 10.10.10.10 445 HOST ADMIN$                 Remote Admin\n"
                   "SMB 10.10.10.10 445 HOST IPC$      READ         Remote IPC\n"
                   "SMB 10.10.10.10 445 HOST Users     READ\n"
                   "SMB 10.10.10.10 445 HOST Backups   READ,WRITE")
     assert _smb_readable_shares(shares_out) == ["Users", "Backups"]
+    # BUG real: share con ESPACIO en el nombre ('Department Shares'). El formato de nxc es
+    # '{name:<15} {perms:<22} {remark}' (confirmado en su código fuente), así que el nombre
+    # puede llevar espacios y NO se trunca — partir por espacios daba 'Shares' y el spider
+    # apuntaba a un share inexistente, perdiéndose el botín. Ahora se captura entero.
+    _shares_sp = ("SMB 172.16.7.3 445 DC01 Share           Permissions     Remark\n"
+                  "SMB 172.16.7.3 445 DC01 -----           -----------     ------\n"
+                  "SMB 172.16.7.3 445 DC01 ADMIN$                          Remote Admin\n"
+                  "SMB 172.16.7.3 445 DC01 Department Shares READ            \n"
+                  "SMB 172.16.7.3 445 DC01 IPC$            READ            Remote IPC\n"
+                  "SMB 172.16.7.3 445 DC01 NETLOGON        READ            Logon server share\n"
+                  "SMB 172.16.7.3 445 DC01 SYSVOL          READ            Logon server share")
+    assert _smb_readable_shares(_shares_sp) == ["Department Shares", "NETLOGON", "SYSVOL"], _smb_readable_shares(_shares_sp)
     spider_out = (
         "  id_rsa               A  1500  Tue Feb 25 13:03:22 2020\n"
         "  readme.md            A    10  Tue Feb 25 13:03:22 2020\n"
@@ -12342,9 +12505,10 @@ def selftest():
                                     "git clone https://github.com/SecuraBV/CVE-2020-1472 && "
                                     "python3 CVE-2020-1472/zerologon_tester.py NETBIOS-DEL-DC 10.0.0.1"],
                            "missing": []}])
-    assert "CVE-2020-1472" in qw_zero[0]["cmds"][0]   # el exploit de Zerologon primero…
-    assert "queryuser" in qw_zero[0]["cmds"][1]        # …el RID cycling (sin relación) después, no se pierde
-    # sin ningún next-step que casara, sigue cayendo al orden original (hallazgo genérico)
+    assert "CVE-2020-1472" in qw_zero[0]["cmds"][0]   # el exploit de Zerologon…
+    assert len(qw_zero[0]["cmds"]) == 1                # …y SOLO ese: el RID cycling sin relación NO se cuela
+    assert not any("queryuser" in c for c in qw_zero[0]["cmds"])
+    # sin ningún next-step que casara, cae al orden original (hallazgo genérico, sin CVE/ataque fuerte)
     assert _cmds_for("Puerto 80 abierto", ["a", "b", "c", "d"]) == ["a", "b", "c"]
 
     # quick_wins() busca next-steps en TODO el protocolo (anon+default+provided), no solo en el
@@ -12482,6 +12646,19 @@ def selftest():
                   "NetBIOS computer name: ACADEMY-EA-DC01\\x00\nDomain name: INLANEFREIGHT.LOCAL"}}]
     assert netbios_computer_name(_smbos_svc, {}) == "ACADEMY-EA-DC01"         # sin el '\x00' colgando
     assert netbios_computer_name([{"port": 80, "scripts": {}}], {}) is None   # ninguno de los 3 corrió
+
+    # _nxc_identity_from_footprints: identidad (name/domain) desde la salida de nxc del footprint,
+    # única fuente para un host sin 445/LDAP/DNS (SQL01). Dominio solo si es FQDN (workgroup no).
+    _nxc_fp = [{"steps": [
+        {"cmd": "nxc wmi ...", "ok": True,
+         "output": "RPC  172.16.7.60  135  SQL01  [*] Windows 10 / Server 2019 Build 17763 (name:SQL01) (domain:INLANEFREIGHT.LOCAL)"}]}]
+    assert _nxc_identity_from_footprints(_nxc_fp) == ("SQL01", "inlanefreight.local")
+    # WORKGROUP: domain == name (sin punto) → NO es un dominio, se descarta
+    _nxc_wg = [{"steps": [{"cmd": "x", "ok": True,
+                "output": "SMB 10.0.0.9 445 FRONTDESK01 [*] Windows 10 (name:FRONTDESK01) (domain:FrontDesk01) (signing:False)"}]}]
+    assert _nxc_identity_from_footprints(_nxc_wg) == ("FRONTDESK01", None)
+    # sin salida de nxc con name/domain → (None, None)
+    assert _nxc_identity_from_footprints([{"steps": [{"cmd": "x", "ok": True, "output": "nada"}]}]) == (None, None)
 
     # _fill_netbios_placeholder: mismo patrón que _fill_domain_placeholder, pero para
     # "NETBIOS-DEL-DC" — toca 'next', nunca 'steps', y nada si el nombre no se conoce.
@@ -14562,6 +14739,17 @@ def run_one(ip, name, args, folder=None):
     domains = discover_domains(services, host)
     if name and name not in domains:
         domains = sorted(set(domains) | {name})
+    # Identidad sacada de la salida de nxc del footprint (name:HOST / domain:DOM) — para hosts
+    # sin 445/LDAP/DNS (p. ej. SQL01, solo 139) es la ÚNICA fuente de su hostname/dominio, que
+    # si no sale resaltada por todo el informe pero nunca como identidad del objetivo. Se añade
+    # el dominio AD y, con el netbios, el FQDN 'host.dominio' (como lo tienen los demás objetivos
+    # vía DNS/LDAP), para que el informe lo muestre y el placeholder DOMINIO se rellene.
+    _nxc_name, _nxc_dom = _nxc_identity_from_footprints(footprints)
+    if _nxc_dom:
+        add = {_nxc_dom}
+        if _nxc_name:
+            add.add(f"{_nxc_name.lower()}.{_nxc_dom}")
+        domains = sorted(set(domains) | add)
     passive_subs = sorted({s for f in footprints for s in f.get("ctlog_subdomains", [])} |
                            {s for f in footprints for s in f.get("passive_subdomains", [])})
     if passive_subs:
@@ -14585,7 +14773,7 @@ def run_one(ip, name, args, folder=None):
     # está garantizado el nombre NetBIOS del DC — pero nbstat/rdp-ntlm-info/smb-os-discovery
     # (Fase 2, bastante antes) casi siempre YA lo capturaron. Fuera del "if domains:": no
     # depende de haber resuelto un dominio AD, solo del nombre NetBIOS del equipo.
-    _fill_netbios_placeholder(footprints, netbios_computer_name(services, host))
+    _fill_netbios_placeholder(footprints, netbios_computer_name(services, host) or _nxc_name)
     # Igual que los dos de arriba, pero para el placeholder "USER"/"PASS": si la Fase 5d (justo
     # antes, ver provided_creds_check/brutespray_extra_creds_check más arriba) confirmó una
     # credencial de verdad, se rellena en los next-steps genéricos (evil-winrm, wmiexec, nxc

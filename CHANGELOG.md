@@ -10,6 +10,16 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Host identity (NetBIOS name + AD domain) is now also recovered from the **nxc banner** saved in
+  the footprint steps (`(name:HOST) (domain:DOM)`), not just from nmap NSE / DNS. Found live with
+  SQL01 (172.16.7.60): a host with only 139 open (no 445/LDAP/DNS) had its name "SQL01" and domain
+  "inlanefreight.local" highlighted all over the report, yet the target was labelled only by IP
+  because nbstat/smb-os-discovery (need 445/3389) and `discover_domains` (nmap scripts/banners)
+  never saw them — but every nxc line did. `_nxc_identity_from_footprints` extracts them (domain
+  only when it's a real FQDN, so a workgroup's `(domain:HOSTNAME)` is ignored), and run_one folds
+  the domain and the derived `host.domain` FQDN into the target's domain list, so the report shows
+  the hostname like every other target and the `DOMINIO` placeholder fills itself.
+
 - Live progress heartbeat for the **silent** credentialed-enumeration queries in Fase 5d.
   `_run_capture_progressive` already heartbeat the long `--users`/`--rid-brute` calls, but the
   dozen-plus `_run_capture_retry` queries that follow (`--groups "Domain Admins"`, `-M
@@ -124,6 +134,17 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Per-protocol findings are now grouped **general-first, then credential by credential** (each
+  group in severity order) instead of pure severity order. With two provided credentials (e.g.
+  BR086 and AB920) their findings used to interleave — you'd read one user's results, then the
+  other's, then the first user's again further down. `_findings_grouped` keeps each credential's
+  findings together; applied to the terminal, HTML and Markdown per-protocol blocks (Quick Wins
+  and the global summary stay severity-only). Credential detection is tolerant: `«Department
+  Shares»` without a `user:pass` colon is not mistaken for a credential.
+- The content spider (`nxc --spider … --content`) now uses the progressive capture (adaptive,
+  with heartbeat) instead of a fixed 180s timeout. Over a tunnel a deep share could take longer
+  and was cut mid-traversal (seen live stuck at `[*] Spidering .`), missing loot in deep
+  subdirectories; it now follows real progress and only stops after 5 min with no new output.
 - Fase 4 (manual banner grabbing) no longer re-opens live sockets under `--resume`. It was the
   only phase still doing real network work on a resume — Fases 1-3 already reuse the cached nmap
   XML, but banner grabbing fired fresh socket connects to every port (4-parallel, 8s timeout
@@ -172,6 +193,32 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **SMB share names with spaces were truncated**, so the content spider targeted a share that
+  doesn't exist and missed its loot. `_smb_readable_shares` split each `nxc --shares` line on
+  whitespace and took the token before `READ`, so `Department Shares READ` became `Shares`. nxc's
+  real format is `{name:<15} {perms:<22} {remark}` (confirmed in nxc/protocols/smb.py), i.e. the
+  name can contain spaces and isn't truncated — so the parser now captures the whole name between
+  the `SMB ip port host` prefix and the permissions column. Found live against INLANEFREIGHT: a
+  `web.config` with a cleartext DB connection string lived in `Department Shares\IT\Private\…` and
+  the spider never reached it because it was pointed at the non-existent `Shares`. The displayed
+  spider command now also `shlex.quote`s the share name so a name with spaces is copy-pasteable.
+- `--users`/`--rid-brute` results on a **member server (non-DC)** were mislabelled "N usuarios del
+  dominio". On a non-DC those flags hit the local SAM and return LOCAL accounts (Administrator,
+  Guest, DefaultAccount, WDAGUtilityAccount), not domain users — seen live on MS01/SQL01 as
+  "4 usuarios del dominio" for what are 4 local accounts. `_surface_ad_enum` now takes `is_dc` and
+  labels them "N cuentas locales (SAM)" with a `SAM` prefix on a non-DC (and the distinct marker
+  keeps the DC-only SMB user-enum skip from firing on a local list). The DC path is unchanged.
+- A finding's Quick Win padded its matched command with **unrelated** next-steps from the same
+  footprint. `_cmds_for`, after matching a next-step by the finding's CVE/attack keyword, appended
+  the rest of the protocol's next-steps up to n — so the Zerologon Quick Win showed its exploit
+  and then, beneath it, an unrelated AS-REP roast command just because it sat in the same footprint
+  (flagged live as confusing). It now returns only the keyword-matched commands; generic findings
+  with no strong-keyword match still fall back to the first-N as before.
+- The AS-REP/Kerberoast suggestions in the **anonymous** footprint next-steps still used nxc's
+  `--asreproast`/`--kerberoasting` flags, while the authenticated path already uses impacket
+  (`GetNPUsers`/`GetUserSPNs`) per the operator's explicit choice. Both anonymous sites now emit
+  the impacket form with `DOMINIO/USER:PASS` placeholders (filled later once domain/credential are
+  known), so roasting is consistently impacket everywhere, not nxc in one place and impacket in another.
 - The explicit `-u/-p`/`--creds-file` loop's retry for **completely empty** nxc output (added
   in the entry below) reused the same short `timeout=40` as the first attempt (so ~80s total
   margin), while its sibling retry — for a timeout that cut `nxc` off mid-run but left *partial*
