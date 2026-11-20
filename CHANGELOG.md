@@ -8,6 +8,18 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- MSSQL is now footprinted and credential-tested even when the TCP port scan didn't see 1433
+  open, as long as the **SQL Server Browser** (1434/udp) advertised the instance's TCP port
+  (`… TCPPort: 1433`). Over a tunnel 1433 often comes back filtered in the `-sT` while the
+  instance still accepts connections — seen live on SQL01 (172.16.7.60): `impacket-mssqlclient`
+  logged in with the `netdb` credential recovered from a share's `web.config`, but palantir never
+  tried MSSQL because 1433 wasn't in the scan. `_mssql_from_sql_browser` reads the Browser's
+  advertised port (format confirmed against real nmap output) and adds a synthetic MSSQL service
+  on it, so fp_mssql and the provided-credential check run against it. Needs the UDP scan (root)
+  for the Browser to be seen; with no UDP there's no signal and nothing is assumed.
+
 ## [1.1.0] - 2026-11-20
 
 ### Added

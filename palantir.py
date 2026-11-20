@@ -1657,6 +1657,37 @@ def _findings_grouped(findings):
     return sorted(findings, key=lambda f: (rank.get(_finding_cred(f[1]), 0), SEV_ORDER.get(f[0], 9)))
 
 
+_SQL_BROWSER_TCPPORT_RE = re.compile(r"TCPPort:\s*(\d+)")
+
+
+def _mssql_from_sql_browser(services):
+    """Entrada de servicio MSSQL sintética si el SQL Server Browser (1434/udp, 'ms-sql-m')
+    anunció el puerto TCP de la instancia ('… TCPPort: 1433') y ese puerto TCP NO está ya entre
+    los detectados. Por un túnel, 1433 puede salir filtrado en el -sT mientras la instancia SÍ
+    acepta conexiones — confirmado en vivo con SQL01 (172.16.7.60): impacket-mssqlclient entraba
+    con la credencial del web.config, pero palantir no probaba MSSQL porque 1433 no salió en el
+    escaneo. El Browser por UDP sí lo delata. Formato confirmado contra una salida REAL de nmap
+    (ms-sql-m, extrainfo 'ServerName: SQL01; TCPPort: 1433'). None si no hay Browser, no trae
+    TCPPort, o ya hay un servicio TCP en ese puerto. Puro → testeable sin red."""
+    tcp_ports = {p["port"] for p in services if p.get("proto") == "tcp"}
+    for p in services:
+        if p.get("proto") != "udp":
+            continue
+        if p.get("name") != "ms-sql-m" and "sql server" not in (p.get("product", "")).lower():
+            continue
+        m = _SQL_BROWSER_TCPPORT_RE.search(f"{p.get('extrainfo', '')} {p.get('version', '')}")
+        if not m:
+            continue
+        tp = int(m.group(1))
+        if tp in tcp_ports or not (1 <= tp <= 65535):
+            return None
+        return {"port": tp, "proto": "tcp", "name": "ms-sql-s",
+                "product": p.get("product", "Microsoft SQL Server"), "version": p.get("version", ""),
+                "extrainfo": "anunciado por el SQL Browser (1434/udp); 1433/tcp no visto en el escaneo",
+                "banner": "", "scripts": {}}
+    return None
+
+
 def _fp(proto, title, ports):
     return {"proto": proto, "title": title, "ports": sorted(ports),
             "steps": [], "findings": [], "next": [], "missing": []}
@@ -12460,6 +12491,19 @@ def selftest():
     _i_ab = [i for i, t in enumerate(_fg_txt) if "AB920" in t]
     assert max(_i_br) < min(_i_ab), _fg_txt   # TODO BR086 antes que CUALQUIER AB920 (no intercalado)
     assert _fg_txt[_i_br[0]].startswith("LDAP")   # dentro de BR086, la 'alta' antes que la 'info'
+
+    # _mssql_from_sql_browser: el SQL Browser (1434/udp) anuncia 'TCPPort: 1433' aunque 1433/tcp
+    # no salga en el escaneo (túnel) → se añade MSSQL para probar credenciales. Formato real de nmap.
+    _svc_brw = [{"port": 139, "proto": "tcp", "name": "netbios-ssn"},
+                {"port": 1434, "proto": "udp", "name": "ms-sql-m", "product": "Microsoft SQL Server",
+                 "version": "15.0.2000.5", "extrainfo": "ServerName: SQL01; TCPPort: 1433"}]
+    _m = _mssql_from_sql_browser(_svc_brw)
+    assert _m and _m["port"] == 1433 and _m["proto"] == "tcp" and classify(_m) == "mssql", _m
+    # si 1433/tcp YA está entre los puertos vistos, no se duplica
+    assert _mssql_from_sql_browser(_svc_brw + [{"port": 1433, "proto": "tcp", "name": "ms-sql-s"}]) is None
+    # sin SQL Browser → nada
+    assert _mssql_from_sql_browser([{"port": 139, "proto": "tcp", "name": "netbios-ssn"}]) is None
+
     shares_out = ("SMB 10.10.10.10 445 HOST Share     Permissions  Remark\n"
                   "SMB 10.10.10.10 445 HOST ADMIN$                 Remote Admin\n"
                   "SMB 10.10.10.10 445 HOST IPC$      READ         Remote IPC\n"
@@ -14513,6 +14557,18 @@ def run_one(ip, name, args, folder=None):
         for u in udp_scan(ip, nmapdir, stealth=args.stealth, source_port=args.source_port, tunnel=args.tunnel):
             u["ip"] = ip
             services.append(u)
+
+    # MSSQL anunciado por el SQL Server Browser (1434/udp) pero con 1433/tcp NO visto abierto por
+    # el escaneo (típico por un túnel: 1433 sale filtrado mientras la instancia sí acepta
+    # conexiones) — se añade como objetivo MSSQL para footprintear/probar credenciales. Confirmado
+    # en vivo con SQL01: impacket-mssqlclient entraba con la credencial del web.config, pero
+    # palantir no probaba MSSQL porque 1433 no salía en el -sT.
+    _mssql_extra = _mssql_from_sql_browser(services)
+    if _mssql_extra:
+        _mssql_extra["ip"] = ip
+        services.append(_mssql_extra)
+        info(f"MSSQL anunciado por el SQL Browser (1434/udp) en {ip}:{_mssql_extra['port']} — lo "
+             "añado al footprint/credenciales aunque el escaneo TCP no lo viera abierto (común por un túnel).")
 
     if not args.no_banner:
         # En --resume con los mismos puertos (y sin re-escaneo de nmap), los banners ya están
