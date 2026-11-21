@@ -1317,11 +1317,15 @@ def web_scheme(p):
     return "http"
 
 
-def guess_extensions(p):
+def guess_extensions(p, whatweb=""):
+    # whatweb (#8): cuando el banner de nmap es genérico/vacío pero whatweb SÍ fingerprinteó el stack
+    # (cookie ASPXAUTH/PHPSESSID, firma HTML del framework), su salida mete 'asp.net'/'php'/'tomcat'…
+    # en el blob → se añaden .aspx/.php/.jsp que antes se perdían (el fuzzer solo probaba .html/.txt).
     blob = " ".join([p["product"], p["version"], p["extrainfo"], p["name"],
                      p["scripts"].get("http-server-header", ""),
                      p["scripts"].get("http-headers", ""),
-                     p["scripts"].get("http-generator", "")]).lower()
+                     p["scripts"].get("http-generator", ""),
+                     whatweb or ""]).lower()
     exts = ["html", "txt"]
     if "iis" in blob or "asp.net" in blob or "aspnet" in blob:
         exts += ["asp", "aspx", "ashx", "asmx"]
@@ -4426,24 +4430,30 @@ def fp_web_fast(ip, p, services, host, deep, hostname=None):
     # Automatizado (SOLO LECTURA): métodos realmente permitidos + ficheros sensibles.
     status, hdrs, _body = _http_get(url, method="OPTIONS")
     allow = hdrs.get("allow", "")
-    if allow:
-        extra = f"\nDAV: {hdrs['dav']}" if hdrs.get("dav") else ""
-        _step(res, f"OPTIONS {url}", True, f"Allow: {allow}{extra}",
-              note="métodos HTTP que el servidor permite DE VERDAD (confirma PUT/DELETE/WebDAV, no solo lo anunciado)")
-        dang = _dangerous_methods(allow)
-        if hdrs.get("dav"):
-            # Comando de explotación VINCULADO al hallazgo (_attach_cmd): sin esto quick_wins caía a
-            # los primeros next-steps del pool ('palantir --nuclei/--crawl --resume', re-escaneos
-            # genéricos), no al paso que explota ESTE hallazgo (#6).
-            _wdav = f"Web {port}: WebDAV activo (cabecera DAV: {hdrs['dav']}) → posible subida de webshell"
-            res["findings"].append(("alta", _wdav))
-            _attach_cmd(res, _wdav, [f"davtest -url {url}   # qué extensiones permite subir WebDAV (→ webshell)"])
-        if "PUT" in dang:
-            _wput = f"Web {port}: método PUT permitido (OPTIONS) → posible subida de ficheros"
-            res["findings"].append(("alta", _wput))
-            _attach_cmd(res, _wput, [f"curl -s -X PUT '{url}shell.txt' --data 'palantir-put-test' && curl -s '{url}shell.txt'   # confirma subida por PUT (ajusta la extensión al stack para webshell)"])
-        elif dang:
-            res["findings"].append(("info", f"Web {port}: métodos potencialmente peligrosos: {', '.join(dang)}"))
+    _dav = hdrs.get("dav")
+    # El paso se registra SIEMPRE (antes solo si había 'Allow'): un OPTIONS que expira sobre el túnel
+    # (status None) o un servidor que no emite 'Allow' (muchos 200/405 sin él) se confundía con
+    # 'comprobado, métodos seguros' — el operador no sabía si WebDAV/PUT se llegó a comprobar (#9).
+    _opt_body = (f"Allow: {allow}" if allow else (f"HTTP {status} (sin cabecera Allow)" if status else "(sin respuesta / timeout)"))
+    if _dav:
+        _opt_body += f"\nDAV: {_dav}"
+    _step(res, f"OPTIONS {url}", bool(status and status < 500), _opt_body,
+          note="métodos HTTP que el servidor permite DE VERDAD (confirma PUT/DELETE/WebDAV, no solo lo anunciado)")
+    dang = _dangerous_methods(allow)
+    # WebDAV se marca por la cabecera 'DAV:' AUNQUE 'Allow' venga vacío (antes todo esto estaba
+    # dentro de 'if allow:' y un servidor WebDAV sin Allow se saltaba por completo) (#9).
+    if _dav:
+        # Comando de explotación VINCULADO al hallazgo (_attach_cmd): sin esto quick_wins caía a los
+        # primeros next-steps del pool ('--nuclei/--crawl'), no al paso que lo explota (#6).
+        _wdav = f"Web {port}: WebDAV activo (cabecera DAV: {_dav}) → posible subida de webshell"
+        res["findings"].append(("alta", _wdav))
+        _attach_cmd(res, _wdav, [f"davtest -url {url}   # qué extensiones permite subir WebDAV (→ webshell)"])
+    if "PUT" in dang:
+        _wput = f"Web {port}: método PUT permitido (OPTIONS) → posible subida de ficheros"
+        res["findings"].append(("alta", _wput))
+        _attach_cmd(res, _wput, [f"curl -s -X PUT '{url}shell.txt' --data 'palantir-put-test' && curl -s '{url}shell.txt'   # confirma subida por PUT (ajusta la extensión al stack para webshell)"])
+    elif dang:
+        res["findings"].append(("info", f"Web {port}: métodos potencialmente peligrosos: {', '.join(dang)}"))
 
     # Cabeceras de seguridad (solo lectura, 1 GET a la raíz): nmap/whatweb no lo convierten en
     # hallazgo por su cuenta y es de lo más común en un pentest real. GET aparte del OPTIONS de
@@ -10457,6 +10467,11 @@ def selftest():
     assert ".php" in lamp and ".cgi" in lamp and ".aspx" not in lamp
     assert ".jsp" in guess_extensions(fake(product="Apache Tomcat"))
     assert guess_extensions(fake()).startswith(".html,.txt")
+    # #8: con banner de nmap genérico/vacío pero whatweb que SÍ fingerprinteó el stack, se añaden
+    # las extensiones correctas (antes el fuzzer solo probaba .html/.txt).
+    assert ".aspx" in guess_extensions(fake(), "ASP.NET MVC, Microsoft-IIS/10.0, Cookies[ASPXAUTH]")
+    assert ".php" in guess_extensions(fake(), "PHP/8.1.2, WordPress")
+    assert guess_extensions(fake(), "") == guess_extensions(fake())   # sin whatweb: igual que antes
     assert norm_ext("php,txt") == ".php,.txt" and norm_ext(".asp,aspx") == ".asp,.aspx"
     assert discover_domains(ports, host) == ["dc01.inlanefreight.htb"]
     assert base_domain("dc01.inlanefreight.htb") == "inlanefreight.htb"
@@ -16380,7 +16395,7 @@ def run_one(ip, name, args, folder=None):
                 fuzz_lock = threading.Lock()
 
                 def _fuzz_one_port(p):
-                    e = ext if ext is not None else guess_extensions(p)
+                    e = ext if ext is not None else guess_extensions(p, whatweb_cache.get(p["port"], ""))
                     tag = f"{web_scheme(p)}://{ip}:{p['port']}"
                     hits = fuzz_dirs(ip, p, wls, e, webdir, stealth=args.stealth, proxy=args.proxy,
                                       hostname=extra_dom)
@@ -16475,7 +16490,7 @@ def run_one(ip, name, args, folder=None):
                       "cada vhost puede servir un árbol de directorios distinto; la Fase 6 solo vio el vhost por defecto del servidor")
                 for fqdn in vh_fqdns:
                     for p in webs_fuzz:
-                        e = ext if ext is not None else guess_extensions(p)
+                        e = ext if ext is not None else guess_extensions(p, whatweb_cache.get(p["port"], ""))
                         tag = f"{web_scheme(p)}://{fqdn}:{p['port']} (Host:)"
                         hits = fuzz_dirs(ip, p, wls, e, webdir, stealth=args.stealth,
                                          proxy=args.proxy, host_header=fqdn)
