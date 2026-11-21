@@ -1681,10 +1681,14 @@ def _mssql_from_sql_browser(services):
         tp = int(m.group(1))
         if tp in tcp_ports or not (1 <= tp <= 65535):
             return None
-        return {"port": tp, "proto": "tcp", "name": "ms-sql-s",
+        # Esquema COMPLETO de puerto (el mismo que produce parse_nmap_xml): debe traer 'state' y
+        # 'tunnel', o is_web() peta con KeyError('tunnel') y render con KeyError('state') — y como
+        # ese crash ocurre FUERA del try/finally de run_one, abortaba el objetivo ENTERO sin
+        # report.html/findings.json. Justo el host (SQL01) que esta función existe para ayudar.
+        return {"port": tp, "proto": "tcp", "state": "open", "name": "ms-sql-s",
                 "product": p.get("product", "Microsoft SQL Server"), "version": p.get("version", ""),
                 "extrainfo": "anunciado por el SQL Browser (1434/udp); 1433/tcp no visto en el escaneo",
-                "banner": "", "scripts": {}}
+                "tunnel": "", "banner": "", "scripts": {}}
     return None
 
 
@@ -8221,6 +8225,13 @@ def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enrich
         for cred in list(cred_pool)[:_REUSE_MAX_CREDS]:   # snapshot: el pool puede crecer dentro
             u, secret, ch = cred["user"], cred["secret"], cred["is_hash"]
             for np in buckets:
+                # mysql/postgres están en `buckets` (para la Fase 5d por cliente CLI) pero NO en
+                # proto_meta/res_by_proto (no usan nxc: el bucle de arriba hace 'continue' antes de
+                # registrarlos). Sin este guard, proto_meta[np] lanzaba KeyError y _phase_fail
+                # abortaba TODA la retroalimentación (se perdían reutilizaciones cruzadas que aún no
+                # habían corrido, p. ej. una credencial de SAM/LSA que abriría WinRM/WMI).
+                if np not in proto_meta:
+                    continue
                 key = (u, secret, ch, np)
                 if key in tried:
                     continue
@@ -11724,6 +11735,22 @@ def selftest():
     assert _rz_smb.get("_valid_cred") == ("robin", "pw"), _rz_smb.get("_valid_cred")
     assert _rz_smb.get("_valid_cred_admin") is False
 
+    # #2: _reuse_chain SALTA protocolos presentes en `buckets` pero ausentes de proto_meta
+    # (mysql/postgres entran en la Fase 5d por cliente CLI, no por nxc, así que provided_creds_check
+    # no los registra en proto_meta). Antes proto_meta[np] lanzaba KeyError y _phase_fail abortaba
+    # TODA la retroalimentación (se perdían reutilizaciones cruzadas aún no corridas).
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), (lambda *a, **kw: (1, "x [-] STATUS_LOGON_FAILURE"))
+    try:
+        _k2_smb, _k2_tried = _fp("reuse-smb", "x", [445]), set()
+        _reuse_chain("10.0.0.1", {"smb": [{"port": 445}], "mysql": [{"port": 3306}]},
+                     {"smb": (445, 445)}, {"smb": _k2_smb},   # proto_meta/res_by_proto SIN mysql
+                     [{"user": "admin", "secret": "pw", "is_hash": False}], _k2_tried, set(),
+                     "FAKE_NXC", False, False, None, set(), None)   # NO debe lanzar KeyError('mysql')
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert ("admin", "pw", False, "smb") in _k2_tried                 # smb SÍ se probó
+    assert not any(np == "mysql" for *_r, np in _k2_tried)            # mysql se saltó (sin KeyError)
+
     # provided_creds_check no debe perder lo que YA encontró (login válido, SAM/LSA…) si
     # _reuse_chain revienta a mitad (el bug real: un NUL en una credencial dumpeada abortaba toda
     # la fase y el host se quedaba sin NADA de "credenciales aportadas" en el informe, no solo sin
@@ -13161,6 +13188,13 @@ def selftest():
                  "version": "15.0.2000.5", "extrainfo": "ServerName: SQL01; TCPPort: 1433"}]
     _m = _mssql_from_sql_browser(_svc_brw)
     assert _m and _m["port"] == 1433 and _m["proto"] == "tcp" and classify(_m) == "mssql", _m
+    # #0: el puerto sintético trae el esquema COMPLETO (state/tunnel) que produce parse_nmap_xml,
+    # o is_web(p) peta con KeyError('tunnel') y render con KeyError('state') FUERA del try de
+    # run_one → abortaba el objetivo entero sin report.html/findings.json (justo el host que esta
+    # función existe para ayudar). is_web/version_str deben poder consumirlo sin lanzar.
+    assert _m["state"] == "open" and _m["tunnel"] == "" and "banner" in _m and "scripts" in _m, _m
+    assert set(_m) == {"port", "proto", "state", "name", "product", "version", "extrainfo", "tunnel", "banner", "scripts"}, set(_m)
+    assert is_web(_m) is False and isinstance(version_str(_m), str)   # no KeyError
     # si 1433/tcp YA está entre los puertos vistos, no se duplica
     assert _mssql_from_sql_browser(_svc_brw + [{"port": 1433, "proto": "tcp", "name": "ms-sql-s"}]) is None
     # sin SQL Browser → nada
@@ -15285,6 +15319,12 @@ def run_one(ip, name, args, folder=None):
     # completo — lo que fallaba era el --max-retries 3 de la 1ª versión, menos que el default).
     # Va más lento por el túnel (varios min), pero pilla TODO, incluidos los RPC dinámicos
     # altos de un DC (49xxx). Para la versión rápida (top-1000) el usuario tiene --top.
+    # ¿El escaneo inicial de ESTE objetivo fue connect (-sT)? Se captura POR OBJETIVO antes del
+    # barrido: el fallback de abajo debe decidirse con esto, no con el global CONNECT — bajo
+    # --jobs N, otro objetivo puede poner CONNECT=True entre medias, y entonces un objetivo cuyo
+    # -sS inicial salió a 0 se SALTABA su propio reintento -sT (el guard `not CONNECT` ya era
+    # falso) → los objetivos no-web quedaban en 0 puertos y se descartaban en silencio.
+    _initial_connect = (scan_type() == "-sT")
     ports = fast_ports(ip, nmapdir, args.min_rate, args.top, stealth=args.stealth,
                        source_port=args.source_port, ports=forced_ports, tunnel=args.tunnel)
     if ports is None:
@@ -15293,10 +15333,11 @@ def run_one(ip, name, args, folder=None):
     # + VPN de HTB los SYN raw se pierden en el túnel → nmap dice "host up" con 0 puertos
     # (falso negativo). Si el SYN no encontró NADA y no estamos ya en connect/stealth,
     # reintentamos UNA vez con -sT (deep_scan/udp lo heredan vía scan_type). --tcp-connect lo
-    # fuerza desde el principio y salta esto. Afecta a todos los objetivos (si el túnel
-    # descarta SYN, lo hace para todos) — idempotente, sin problema bajo --jobs.
+    # fuerza desde el principio y salta esto. Cada objetivo decide con SU propio _initial_connect
+    # (ver arriba): poner CONNECT=True global sigue valiendo como optimización entre objetivos,
+    # pero ya no impide que un hermano haga su propio reintento.
     global CONNECT
-    if not ports and is_root() and not CONNECT and not args.stealth:
+    if not ports and is_root() and not _initial_connect and not args.stealth:
         warn("SYN scan (-sS) sin resultados con root — posible túnel que descarta SYN raw "
              "(p. ej. WSL2 mirrored + VPN). Reintento con connect scan (-sT)…")
         CONNECT = True
@@ -15595,8 +15636,14 @@ def run_one(ip, name, args, folder=None):
         if proto not in fresh_by_proto:
             footprints.append(old)
     # Fase 5d YA terminada: si fp_kerberos difirió kerbrute por tener credenciales aportadas
-    # (has_creds=True), ahora se decide de verdad — ver _run_deferred_kerbrute_fallback.
-    _run_deferred_kerbrute_fallback(footprints)
+    # (has_creds=True), ahora se decide de verdad — ver _run_deferred_kerbrute_fallback. Va
+    # envuelto en _phase_fail como el resto de fases: es lo ÚLTIMO antes de render/write_reports,
+    # así que una excepción aquí (p. ej. NamedTemporaryFile en un TMPDIR lleno/solo-lectura)
+    # tiraba el informe ENTERO (terminal + HTML + MD + JSON) tras un run credencializado largo.
+    try:
+        _run_deferred_kerbrute_fallback(footprints)
+    except Exception as e:
+        _phase_fail("kerbrute diferido (fallback)", e, base)
     render_footprint(footprints)
 
     # Se guarda en findings.json (ver write_reports) para que un futuro --resume sepa qué
