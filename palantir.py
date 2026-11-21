@@ -2489,7 +2489,7 @@ def looks_domain_joined(services, host):
     return any(_DOMAIN_RE.search(t or "") for t in blobs)
 
 
-def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
+def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False, base=None):
     """Enumeración AD de SOLO LECTURA contra un DC con nxc, usando la identidad que
     haya abierto sesión (null → guest → Administrator; por defecto null, que basta
     para el RID cycling por IPC$). NO hace fuerza bruta de credenciales — solo lee
@@ -2499,7 +2499,12 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
     (algún share READ/WRITE o Null Auth). Sirve de compuerta: si NI el RID cycling NI
     los shares devolvieron nada, la sesión está aceptada pero no autorizada (DC moderno
     con RestrictAnonymous) → --users/--computers/--pass-pol por SAMR con esa misma
-    identidad tampoco devolverán nada, así que no se lanzan (era puro ruido/tiempo)."""
+    identidad tampoco devolverán nada, así que no se lanzan (era puro ruido/tiempo).
+
+    `base`: si el RID cycling saca usuarios, se vuelcan a <base>/ad_users.txt (igual que
+    ya hacen kerbrute y la enum con credencial de Fase 5d — ver _merge_write_ad_users) —
+    así fp_kerberos (procesado DESPUÉS de smb/ldap en footprint_services, a propósito) los
+    ve y se ahorra kerbrute userenum si la sesión anónima ya dio la lista."""
     user = auth_user if auth_user is not None else ""
     ident = {"": "sesión nula", "guest": "invitado", "Administrator": "Administrator"}.get(user, user)
     res["findings"].append(("info", f"Domain Controller detectado → enum AD de solo lectura (identidad: {ident})"))
@@ -2514,6 +2519,11 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False):
         uniq = sorted(set(users))
         res["findings"].append(("alta", f"AD: {len(uniq)} usuarios por RID cycling: "
                                         f"{', '.join(uniq[:15])}" + (" …" if len(uniq) > 15 else "")))
+        if base:
+            try:
+                _merge_write_ad_users(base, uniq)
+            except OSError:
+                pass
     # ¿Esta identidad anónima/invitado puede LEER algo de verdad? El RID cycling (arriba) o el
     # listado de shares (anon_readable) son la prueba. Si NINGUNO devolvió nada, el DC acepta la
     # sesión pero deniega la lectura anónima (RestrictAnonymous): --users/--computers/--pass-pol
@@ -2681,7 +2691,7 @@ def _nxc_spider(res, nxc, ip, auth_args, shown_auth, shares, pattern=None):
             res["findings"].append(("alta", f"SMB spider '{share}': coincidencia de secreto en {h}"))
 
 
-def fp_smb(ip, ports, services, host, deep):
+def fp_smb(ip, ports, services, host, deep, base=None):
     res = _fp("smb", "SMB / RPC", [p["port"] for p in ports])
     nxc = nxc_bin()   # se necesita ya aquí: decide si el fallback de rpcclient (abajo) hace falta
     if have("smbclient"):
@@ -2882,7 +2892,7 @@ def fp_smb(ip, ports, services, host, deep):
             # no los lanzamos (ruido) y dejamos indicado que hacen falta credenciales. La Fase 5d
             # SÍ las usa de verdad: -u/-p/-H enumeran CON la credencial, no como null/guest.
             if working is not None:
-                _smb_ad_enum(res, nxc, ip, working, anon_readable=anon_readable)
+                _smb_ad_enum(res, nxc, ip, working, anon_readable=anon_readable, base=base)
             else:
                 res["findings"].append(("info", "DC detectado pero SIN sesión anónima (null/guest no entran) → la enum AD necesita credenciales"))
                 res["next"].append(f"nxc smb {ip} -u USER -p PASS --users --groups --pass-pol --rid-brute   # enum AD con credenciales (o pásaselas a palantir con -u/-p para la Fase 5d)")
@@ -3498,11 +3508,15 @@ def fp_oracle(ip, ports, services, host, deep):
     return res
 
 
-def fp_ldap(ip, ports, services, host, deep):
+def fp_ldap(ip, ports, services, host, deep, base=None):
     """LDAP: prueba bind con credenciales por defecto (null → guest → Administrator,
     sin contraseña). Un bind que entre suele volcar usuarios, grupos y política del
     dominio sin credenciales reales. AS-REP roasting y kerberoasting necesitan
-    credenciales → quedan como siguientes pasos, no se ejecutan."""
+    credenciales → quedan como siguientes pasos, no se ejecutan.
+
+    `base`: si el bind anónimo SÍ lista usuarios (--users), se vuelcan a
+    <base>/ad_users.txt — mismo motivo que en _smb_ad_enum: fp_kerberos se procesa
+    DESPUÉS en footprint_services y se ahorra kerbrute si esto ya dio la lista."""
     res = _fp("ldap", "LDAP", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
@@ -3524,6 +3538,12 @@ def fp_ldap(ip, ports, services, host, deep):
             _step(res, f"{nxc} ldap {ip} -u '{user}' -p '' --users", rc == 0, users_out,
                   note="vuelca los usuarios del dominio por LDAP (nombres, descripciones, último login)")
             if _nxc_has_data(users_out):
+                ldap_users = _parse_nxc_userlist(users_out)
+                if ldap_users and base:
+                    try:
+                        _merge_write_ad_users(base, ldap_users)
+                    except OSError:
+                        pass
                 for mod, note in (("--groups", "vuelca los grupos del dominio (quién es Domain Admin)"),
                                   ("--pass-pol", "política de contraseñas del dominio (longitud, bloqueo)")):
                     rc, out = run_capture([nxc, "ldap", ip, "-u", user, "-p", "", mod], timeout=60)
@@ -4775,17 +4795,42 @@ def _spray_phase(ip, domain, base, services):
     return res
 
 
-def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None):
+def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None, has_creds=False):
     """Kerberos (88/tcp-udp): en casi toda máquina AD de HTB/CPTS es la pista más clara
     de Domain Controller. Solo lectura. Si se conoce el dominio AD y hay kerbrute, enumera
     usuarios de verdad por Kerberos pre-auth (`_kerbrute_userenum`, no bloquea cuentas) —
     el fallback que saca usuarios en un DC endurecido donde SMB null / LDAP anónimo no dan
-    nada. El AS-REP roasting prueba 1 vez por usuario YA conocido, no es fuerza bruta."""
+    nada. El AS-REP roasting prueba 1 vez por usuario YA conocido, no es fuerza bruta.
+
+    kerbrute es SIEMPRE el último recurso, nunca el primero — adivina cuentas por wordlist
+    contra Kerberos pre-auth, y hay dos caminos más rápidos/autoritativos que ya podrían
+    haber dado la lista ANTES de llegar aquí (footprint_services procesa smb/ldap antes que
+    kerberos a propósito, ver ahí):
+      1. SMB/LDAP con sesión anónima (null/guest), en esta MISMA Fase 5 — si encontró algo,
+         `base` ya lo tiene en ad_users.txt (ver _smb_ad_enum/fp_ldap).
+      2. `has_creds`: credenciales aportadas (-u/-p/-H/--creds-file/-U/-P) — la Fase 5d, justo
+         después de esta, las prueba por SMB --rid-brute / LDAP --users: AUTORITATIVO (la lista
+         real del dominio), no una adivinanza. Si esa credencial no da usuarios (inválida, ACL
+         restrictiva…), kerbrute se lanza igualmente, pero COMO FALLBACK tras la Fase 5d (ver
+         _run_deferred_kerbrute_fallback, llamado desde run_one) — nunca antes, sería tiempo
+         tirado en el caso común de que la Fase 5d sí funcione."""
     res = _fp("kerberos", "Kerberos", [p["port"] for p in ports])
     res["findings"].append(("info", "Kerberos (88) abierto — corrobora que es un Domain Controller"))
     asrep_ya_sugerido = False
     if domain:
-        asrep_ya_sugerido = _kerbrute_userenum(res, ip, domain, base)
+        _known_users = _read_ad_users(base) if base else []
+        if _known_users:
+            res["findings"].append(("info",
+                f"Kerberos: ya hay {len(_known_users)} usuario(s) AD conocidos (SMB/LDAP con sesión "
+                "anónima, o de un --resume anterior) → no lanzo kerbrute userenum, sería redundante."))
+        elif has_creds:
+            res["findings"].append(("info",
+                "Kerberos: credenciales aportadas → dejo que la Fase 5d (SMB --rid-brute / LDAP "
+                "--users, autoritativo) saque los usuarios del dominio primero; si no encuentra "
+                "ninguno, kerbrute se lanza automáticamente después como fallback."))
+            res["_pending_kerbrute"] = {"ip": ip, "domain": domain, "base": base}
+        else:
+            asrep_ya_sugerido = _kerbrute_userenum(res, ip, domain, base)
     else:
         res["next"].append(f"kerbrute userenum -d DOMINIO --dc {ip} /usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt   # enum de usuarios por Kerberos (NO bloquea cuentas) — dominio aún no resuelto en este punto")
     res["next"] += [
@@ -4808,6 +4853,39 @@ def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None):
     for lbl, txt in _nse_for(services, host, ("krb5", "kerberos")):
         _step(res, f"nmap {lbl}", True, txt, note="lo que ya sacó nmap para Kerberos")
     return res
+
+
+def _run_deferred_kerbrute_fallback(footprints):
+    """Tras la Fase 5d (credenciales aportadas): fp_kerberos (Fase 5) difiere kerbrute userenum
+    cuando hay credenciales aportadas (has_creds=True) y deja un marcador '_pending_kerbrute'
+    en su propio footprint-dict (ip/domain/base) en vez de ejecutarlo — ver fp_kerberos. Aquí,
+    ya con la Fase 5d terminada, se decide de verdad:
+      - si esa credencial SÍ sacó usuarios del dominio (ad_users.txt ya no está vacío) → nada
+        más que hacer, kerbrute habría sido redundante.
+      - si NO (credencial inválida, cuenta sin permisos de lectura, ACL restrictiva…) → se
+        lanza kerbrute AHORA, exactamente el mismo papel de fallback que ya tenía antes de
+        aportar credenciales, solo que después de dejar correr primero el camino autoritativo.
+    Muta el footprint-dict de Kerberos EN SITIO (misma posición en el informe, en vez de una
+    sección aparte) y SIEMPRE quita el marcador — nunca debe llegar a write_reports/findings.json
+    (no tiene sentido en un futuro --resume: la Fase 5d de ESE run decidirá de nuevo)."""
+    for f in footprints:
+        pending = f.pop("_pending_kerbrute", None)
+        if not pending:
+            continue
+        if _read_ad_users(pending["base"]):
+            f["findings"].append(("info",
+                "Kerberos: la Fase 5d ya sacó usuarios del dominio con la credencial aportada → "
+                "no hizo falta kerbrute userenum."))
+            continue
+        asrep_ya = _kerbrute_userenum(f, pending["ip"], pending["domain"], pending["base"])
+        if asrep_ya:
+            # Mismo de-dup que ya hace fp_kerberos con asrep_ya_sugerido: si kerbrute SÍ
+            # encuentra usuarios ahora, su propio next-step de AS-REP roast ("de los usuarios
+            # hallados") ya cubre lo que el next-step genérico de Fase 5 ("1 intento por
+            # usuario YA conocido", añadido sin saber aún si kerbrute iba a correr) deja
+            # puesto — quitarlo evita el MISMO comando por duplicado.
+            f["next"] = [n for n in f["next"]
+                         if not ("-usersfile ad_users.txt -no-pass" in n and "YA conocido" in n)]
 
 
 def fp_adws(ip, ports, services, host, deep, domain=None):
@@ -4998,13 +5076,18 @@ def fp_gitdaemon(ip, ports, services, host, deep):
     return res
 
 
-def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=None):
+def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=None, has_creds=False):
     """Agrupa los puertos abiertos por protocolo y lanza su footprint una sola vez.
 
     `webs_fp`: puertos web ya deduplicados por espejo (80→443, 8080→8443…; ver
     primary_web_ports(), calculado UNA vez en run_one y compartido con el fuzzing de
     más abajo) — sin esto, un sitio servido en varios puertos a la vez se footprintea
     (y, peor, le lanzamos nikto/nuclei/wpscan/katana) 2-4 veces por el mismo sitio.
+
+    `has_creds`: ¿se aportaron credenciales por CLI (-u/-p/-H/--creds-file/-U/-P)?
+    Se le pasa a fp_kerberos para que deje que la Fase 5d (SMB/LDAP con esa credencial,
+    autoritativo) saque los usuarios del dominio antes de molestarse en lanzar kerbrute
+    userenum — ver fp_kerberos y _run_deferred_kerbrute_fallback.
 
     Devuelve (footprints, whatweb_cache): whatweb_cache es {puerto: salida de
     whatweb} para que footprint_web_slow() (nikto/nuclei/cms-scan/crawl, que corre
@@ -5039,12 +5122,19 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
         out.append(fp_subdomains(domains, extra_domain))
         out.append(fp_wayback(domains, extra_domain))
         out.append(fp_dns_nameservers(domains, extra_domain))
-    for proto, ports in buckets.items():
+    # kerberos se procesa EL ÚLTIMO a propósito (no por número de puerto, que lo pondría
+    # antes que smb/ldap): kerbrute userenum es SIEMPRE el último recurso (ver fp_kerberos),
+    # así que primero se les da su turno a smb/ldap en esta MISMA Fase 5 — si la sesión
+    # anónima (null/guest) ya saca usuarios por RID cycling o LDAP --users, ad_users.txt
+    # queda escrito y fp_kerberos se ahorra kerbrute por completo.
+    _proto_order = [p for p in buckets if p != "kerberos"] + (["kerberos"] if "kerberos" in buckets else [])
+    for proto in _proto_order:
+        ports = buckets[proto]
         try:
             if proto == "ftp":
                 out.append(fp_ftp(ip, ports, services, host, deep))
             elif proto == "smb":
-                out.append(fp_smb(ip, ports, services, host, deep))
+                out.append(fp_smb(ip, ports, services, host, deep, base=base))
             elif proto == "nfs":
                 out.append(fp_nfs(ip, ports, services, host, deep))
             elif proto == "dns":
@@ -5058,7 +5148,7 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
             elif proto == "redis":
                 out.append(fp_redis(ip, ports, services, host, deep))
             elif proto == "ldap":
-                out.append(fp_ldap(ip, ports, services, host, deep))
+                out.append(fp_ldap(ip, ports, services, host, deep, base=base))
             elif proto == "winrm":
                 out.append(fp_winrm(ip, ports, services, host, deep))
             elif proto == "ssh":
@@ -5132,7 +5222,7 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
             elif proto == "rmi":
                 out.append(fp_rmi(ip, ports, services, host, deep))
             elif proto == "kerberos":
-                out.append(fp_kerberos(ip, ports, services, host, deep, domain=ad_domain, base=base))
+                out.append(fp_kerberos(ip, ports, services, host, deep, domain=ad_domain, base=base, has_creds=has_creds))
             elif proto == "adws":
                 out.append(fp_adws(ip, ports, services, host, deep, domain=ad_domain))
             elif proto == "docker":
@@ -15156,6 +15246,14 @@ def run_one(ip, name, args, folder=None):
     # en _phase_fail (con footprints vacíos/parciales) se guardaba igual como "footprint": hecho
     # en findings.json — un futuro --resume se la saltaría ENTERA dando por bueno ese resultado
     # vacío/parcial de un fallo transitorio, en vez de reintentarla.
+    #
+    # _win/pcreds se calculan YA aquí (antes solo más abajo, justo antes de la Fase 5d):
+    # footprint_services (Fase 5, justo debajo) necesita saber YA si se aportaron credenciales
+    # por CLI para decidir si merece la pena lanzar kerbrute userenum antes de la Fase 5d, o
+    # dejar que la enum AUTORITATIVA por SMB/LDAP con esa credencial (Fase 5d, justo después en
+    # este mismo run) saque la lista de usuarios primero — ver fp_kerberos(has_creds=...).
+    _win = _target_is_windows(services, host)   # Windows: usuarios case-insensitive → no dupliques Fiona/fiona
+    pcreds = parse_provided_creds(args, windows=_win)
     footprints, whatweb_cache = [], {}
     footprint_ok = searchsploit_ok = creds_default_ok = False
     will_need_fresh_whatweb = NIKTO or NUCLEI or CMS_SCAN or CRAWL   # necesitan el whatweb_cache recién hecho de footprint_services, no el de un run viejo
@@ -15165,7 +15263,8 @@ def run_one(ip, name, args, folder=None):
         footprint_ok = True
     elif not args.no_footprint and not args.default_creds:
         try:
-            footprints, whatweb_cache = footprint_services(ip, services, host, extra_dom, args.aggressive, webs_fp, base=base)
+            footprints, whatweb_cache = footprint_services(ip, services, host, extra_dom, args.aggressive, webs_fp,
+                                                            base=base, has_creds=bool(pcreds))
             for f in footprints:
                 f["_phase"] = "footprint"
             footprint_ok = True
@@ -15221,8 +15320,8 @@ def run_one(ip, name, args, folder=None):
     _known_ad_users = any("usuarios del dominio" in t for f in prev_creds_provided.values()
                           for _s, t in f.get("findings", []))
     fresh_creds_provided = []
-    _win = _target_is_windows(services, host)   # Windows: usuarios case-insensitive → no dupliques Fiona/fiona
-    pcreds = parse_provided_creds(args, windows=_win)
+    # _win/pcreds YA se calcularon arriba (antes de la Fase 5: footprint_services los necesita
+    # para fp_kerberos/has_creds) — no se recalculan aquí.
     if pcreds:
         bulk = None
         # Antes exigía --user-list/-U Y --pass-list/-P a la vez para pasar al camino en
@@ -15282,6 +15381,9 @@ def run_one(ip, name, args, folder=None):
     for proto, old in prev_creds_provided.items():
         if proto not in fresh_by_proto:
             footprints.append(old)
+    # Fase 5d YA terminada: si fp_kerberos difirió kerbrute por tener credenciales aportadas
+    # (has_creds=True), ahora se decide de verdad — ver _run_deferred_kerbrute_fallback.
+    _run_deferred_kerbrute_fallback(footprints)
     render_footprint(footprints)
 
     # Se guarda en findings.json (ver write_reports) para que un futuro --resume sepa qué

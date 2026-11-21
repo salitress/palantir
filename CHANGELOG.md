@@ -36,6 +36,31 @@ this project follows [Semantic Versioning](https://semver.org/).
   MVP: only the well-known `Administrator` account, not a dynamic sweep of every current
   member of Domain Admins/Enterprise Admins/Administrators (documented as a follow-up).
 
+### Changed
+
+- `kerbrute userenum` is now always the **last resort** for AD user enumeration, never the
+  first thing tried. It's a wordlist guess against Kerberos pre-auth (minutes, depends on
+  the list), while two faster/more authoritative paths can already give the full user list in
+  the same run:
+  - **Anonymous SMB/LDAP enum (same Fase 5)**: `footprint_services` now processes `smb`/`ldap`
+    buckets *before* `kerberos` (previously it followed port number, so 88/tcp always went
+    first even though 139/389/445 usually follow right after). `_smb_ad_enum`'s RID cycling and
+    `fp_ldap`'s anonymous `--users` now also write any users they find to `ad_users.txt` (same
+    merge-not-overwrite helper kerbrute already used). If that anonymous session already found
+    users, `fp_kerberos` skips kerbrute entirely.
+  - **Credentials provided on the CLI** (`-u`/`-p`/`-H`/`--creds-file`/`-U`/`-P`): `fp_kerberos`
+    now receives `has_creds` and, when set, does *not* run kerbrute in Fase 5 — it leaves a
+    `_pending_kerbrute` marker instead. Fase 5d (right after, in the same run) tries that
+    credential against SMB `--rid-brute` / LDAP `--users`, which is authoritative (the real
+    domain list), not a guess. A new `_run_deferred_kerbrute_fallback`, called once Fase 5d
+    finishes, checks `ad_users.txt`: if the credential actually found users, kerbrute never
+    runs; if it didn't (bad credential, restrictive ACL…), kerbrute runs then as the fallback it
+    always was before credentials were in the picture — same de-dup as before for the AS-REP
+    roast next-step so it doesn't show up twice.
+  - Real-world case that prompted this: `-u CT059 -p charlie1` against a DC still ran the full
+    `kerbrute userenum` wordlist (jsmith.txt) in Fase 5, even though Fase 5d, seconds later,
+    was going to enumerate the complete domain user list with that exact credential anyway.
+
 ## [1.2.0] - 2026-11-21
 
 ### Added
