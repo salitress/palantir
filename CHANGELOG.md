@@ -61,6 +61,46 @@ this project follows [Semantic Versioning](https://semver.org/).
     `kerbrute userenum` wordlist (jsmith.txt) in Fase 5, even though Fase 5d, seconds later,
     was going to enumerate the complete domain user list with that exact credential anyway.
 
+### Fixed
+
+Comprehensive audit of `palantir.py` (external-tool output formats verified against upstream
+source: NetExec, ropnop/kerbrute, logangoins/SOAPy, brutespray). Each fix has a `--selftest`
+test that fails without it. Highlights, by class:
+
+- **Finding→command association in Quick Wins** (operator-reported): a critical ACL finding
+  (`FullControl/WriteDACL` over `Domain Admins`) showed unrelated AS-REP/Kerberoast commands
+  instead of the correct `bloodyAD add groupMember`; same class on SMB relay, SMTP open-relay,
+  FTP bounce and exposed `.git`/`.env`/WebDAV. Findings now carry their exploit command from the
+  point they're raised (`_attach_cmd`), `_STRONG_KW_RE` gained ACL/relay tokens, and the Quick
+  Wins command de-dup compares the command without its inline comment (no more duplicates).
+- **Partial results presented as complete** (operator-reported, over the tunnel): DB enum,
+  `kerbrute userenum`, bulk spray, `fp_smb` Zerologon/MS17-010, and credentialed Kerberoast/AS-REP
+  now check `rc`/retry on empty and mark results `(PARCIAL/POSIBLEMENTE INCOMPLETO)` instead of
+  reporting a truncated result as final; `ffuf` throttles under `--tunnel`.
+- **Crashes that aborted the whole target** (no report at all): synthetic MSSQL port from the SQL
+  Browser lacked `state`/`tunnel` (KeyError); credential-feedback KeyError on MySQL/PostgreSQL;
+  unguarded deferred-kerbrute call; per-target `-sT` fallback latching under `--jobs`.
+- **Guest-mapping as a false valid login**: `(Guest)` is no longer counted as a real login for a
+  provided/default credential (SMB `map to guest = Bad User`).
+- **Wrong port / missing `--port`**: SMB/LDAP spray-confirm now emit `--port` for non-default
+  ports; `fp_vnc`/`fp_redis` loop per port; VNC uses the real `No Auth:True` banner token.
+- **Kerberos/NXC/brutespray parsers**: kerbrute no-preauth (separate line), `VALID LOGIN WITH
+  ERROR`, lockout vs network abort, `-M timeroast` option that crashed the module, `SOAPy` binary
+  case; brutespray scheme by service, `-r` default, no retry-wrapper on an active brute.
+- **Severity / correctness**: `_exploit_severity` matches short acronyms (rce/sqli/…) by whole
+  word (no more `source`→CRITICA); modern-OS exploit downgrade reads `smb-os-discovery` from the
+  host-script where it actually lives; exploit summary sorts before listing sample EDB-IDs.
+- **Privacy**: the 1-by-1 provided-credential path no longer leaks the plaintext password into the
+  stored step command/output/note (it did, even for failed attempts) — only the finding shows it.
+- **Report leakage**: internal `_`-prefixed footprint keys (e.g. `_ldap_signing_disabled`) are no
+  longer serialized into `findings.json`.
+- **HTML report**: per-target port table gains a **state** column (UDP `open|filtered` vs confirmed
+  `open`); vhosts of the same domain are merged into one table; `--vhost-names` size shows `n/d`
+  instead of `- b`; the exploits pill/TOC count distinct EDB-IDs.
+
+See `MEJORAS.md` for the read-only/detection-only feature ideas from the same audit (proposals, not
+implemented) and the design decisions on what palantir deliberately does **not** do.
+
 ## [1.2.0] - 2026-11-21
 
 ### Added
