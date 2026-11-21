@@ -8053,7 +8053,11 @@ def _hydra_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, l
 # para cualquier protocolo suyo. ESTO ES ADITIVO: protocolos sin NINGÚN camino de credenciales
 # aportadas hasta ahora, nunca toca ni reemplaza el hydra/nxc de provided_creds_check (función
 # intacta, ya muy probada) para los que ya lo tenían.
-_BRUTESPRAY_EXTRA_PROTOS = {"telnet", "redis", "snmp", "smtp", "imap_pop3"}
+# mongodb añadido (#63): brutespray lo soporta (docs/services.md: '27017 Stable') y provided_creds_check
+# no lo toca (no es protocolo nxc/hydra) → antes las credenciales aportadas nunca se probaban contra
+# un MongoDB. oracle NO se incluye: brutespray no lo cubre (no está en services.md); fp_oracle ya deja
+# los pasos manuales (odat/sqlplus).
+_BRUTESPRAY_EXTRA_PROTOS = {"telnet", "redis", "snmp", "smtp", "imap_pop3", "mongodb"}
 
 
 def brutespray_bin():
@@ -8135,12 +8139,19 @@ def _brutespray_bulk(res, proto, ip, port, scheme, pairs, bulk):
             # dentro de '-o') — confirmado corriéndolo de verdad sin este flag, ensuciaba el
             # cwd desde el que se lanzó. Apuntado dentro de outdir, se borra solo con el resto
             # (shutil.rmtree del finally) en vez de quedar suelto donde corra palantir.
+            # -r default (3), no '-r 1': '-r' son los reintentos de brutespray tras un fallo de
+            # CONEXIÓN (config.go, default 3); bajarlo a 1 sobre el túnel flaky del operador podía
+            # descartar una credencial VÁLIDA cuya conexión fallara transitoriamente (#62).
             cmd = [bs, "-H", tgt] + cred_args + [
                 "-o", outdir, "-checkpoint", str(Path(outdir) / "checkpoint.json"),
-                "-summary", "-output-format", "json", "-no-tui", "-q", "-r", "1"]
+                "-summary", "-output-format", "json", "-no-tui", "-q"]
             shown = f"{bs} -H {tgt} {shown_cred} -summary -output-format json"
             timeout = min(3600, max(60, n * 3))
-            rc, out = _run_capture_retry(cmd, timeout=timeout, quiet=True)
+            # run_capture, NO _run_capture_retry: brutespray es un brute-forcer ACTIVO y NO
+            # idempotente — _run_capture_retry re-lanza el comando entero si la salida viene vacía, y
+            # un re-run repetiría CADA intento de autenticación (doble presión de bloqueo). El
+            # reintento-en-vacío es para enum de solo-lectura (nxc/ldapsearch), no para esto (#61).
+            rc, out = run_capture(cmd, timeout=timeout, quiet=True)
             summary = Path(outdir) / "brutespray-summary.json"
             hits = []
             if summary.exists():
@@ -8208,7 +8219,14 @@ def brutespray_extra_creds_check(ip, services, creds, bulk=None, base=None):
         results.append(res)
         for p in ports:
             port = p["port"]
-            scheme = _brutespray_scheme(proto, port)
+            if proto == "imap_pop3":
+                # Discrimina imap/pop3 por la CLASIFICACIÓN del servicio (usa el nombre de nmap),
+                # no solo por el número de puerto: un IMAP en un puerto no estándar (name=imap en
+                # 1143) se atacaba como POP3 (1143 ∉ {143,993}) y nunca validaba (#58).
+                _c = classify(p)
+                scheme = _c if _c in ("imap", "pop3") else _brutespray_scheme(proto, port)
+            else:
+                scheme = _brutespray_scheme(proto, port)
             if proto == "snmp":
                 # SNMP v2c no tiene "usuario" real — son community strings. Confirmado
                 # corriendo brutespray de verdad contra un snmpd real: en modo legacy (sin
@@ -11630,12 +11648,33 @@ def selftest():
     _bsres_gnmap = _suggest_brutespray(_bs_fps, "10.0.0.1", _bs_tmp)
     assert any(f"brutespray -f {_bs_tmp / 'nmap' / 'deep.gnmap'}" in n for n in _bsres_gnmap["next"])   # CON .gnmap: la ruta real
     shutil.rmtree(_bs_tmp)
-    # imap_pop3 cuenta como DOS servicios de brutespray (imap Y pop3) — con solo ssh + imap_pop3
-    # ya son 3 servicios de brutespray (ssh, imap, pop3), por encima del umbral de 2.
+    # #59: imap_pop3 se discrimina por los PUERTOS reales, no asume ambos. 143-only → solo imap
+    # (antes contaba imap Y pop3, inflando el conteo y listando un pop3 inexistente).
     _bsres_imap = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("imap_pop3", "IMAP / POP3", [143])],
                                        "10.0.0.1", "/tmp/no-existe-nunca")
     assert _bsres_imap is not None
-    assert any("imap" in t and "pop3" in t for s, t in _bsres_imap["findings"])
+    assert any("imap" in t and "pop3" not in t for s, t in _bsres_imap["findings"]), _bsres_imap["findings"]
+    # con 143 Y 110 presentes, sí cuenta imap Y pop3
+    _bsres_both = _suggest_brutespray([_fp("imap_pop3", "IMAP / POP3", [143, 110])], "10.0.0.1", "/tmp/no-existe-nunca")
+    assert _bsres_both is not None and any("imap" in t and "pop3" in t for s, t in _bsres_both["findings"])
+    # #57: el modo spray MANTIENE '-p' (no lo sustituye); #60: avisa de SNMP en udp.gnmap.
+    _bsres_sn = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("snmp", "SNMP", [161])], "10.0.0.1", "/tmp/no-existe-nunca")
+    _bs_next_txt = " ".join(_bsres_sn["next"])
+    assert "en vez de" not in _bs_next_txt and "MANTENIENDO" in _bs_next_txt, _bs_next_txt
+    assert "udp.gnmap" in _bs_next_txt, _bs_next_txt
+    # #63: mongodb cubierto por brutespray; oracle NO (no está en services.md de brutespray).
+    assert "mongodb" in _BRUTESPRAY_EXTRA_PROTOS and "oracle" not in _BRUTESPRAY_EXTRA_PROTOS
+    # #62: _brutespray_bulk no fuerza '-r 1' (usa el default 3 de brutespray) y no re-lanza en vacío.
+    _real_bsbin62, _real_rc62, _bs_cmd62 = brutespray_bin, run_capture, {}
+    def _cap_bs(cmd, timeout=None, **kw):
+        _bs_cmd62["c"] = cmd
+        return (0, "")
+    globals()["brutespray_bin"], globals()["run_capture"] = (lambda: "FAKE_BS"), _cap_bs
+    try:
+        _brutespray_bulk(_fp("reuse-telnet", "x", [23]), "telnet", "1.2.3.4", 23, "telnet", [("u", "p")], None)
+    finally:
+        globals()["brutespray_bin"], globals()["run_capture"] = _real_bsbin62, _real_rc62
+    assert "-r" not in _bs_cmd62["c"], _bs_cmd62["c"]
 
     # _parse_maq / _maq_finding: 'MachineAccountQuota: N' de nxc -M maq (confirmado en su código
     # fuente). MAQ>0 → 'alta' (precondición de noPac/RBCD); MAQ=0 → 'info' (endurecido); sin dato → None.
@@ -15604,7 +15643,14 @@ def _suggest_brutespray(footprints, ip, base):
     next-steps de esta sección. Devuelve un footprint para el informe, o None."""
     svcs = set()
     for f in footprints:
-        svcs |= set(_BRUTESPRAY_SVC.get(f.get("proto"), []))
+        proto = f.get("proto")
+        if proto == "imap_pop3":
+            # Discrimina imap/pop3 por los puertos REALES del footprint, no asume ambos: un host
+            # solo-IMAP (143) contaba imap Y pop3 → inflaba el conteo y listaba un pop3 inexistente (#59).
+            for _pt in f.get("ports", []):
+                svcs.add("imap" if _pt in (143, 993) else "pop3")
+        else:
+            svcs |= set(_BRUTESPRAY_SVC.get(proto, []))
     if len(svcs) < 2:
         return None
     gnmap = Path(base) / "nmap" / "deep.gnmap"
@@ -15614,10 +15660,15 @@ def _suggest_brutespray(footprints, ip, base):
         "— brutespray (github.com/x90skysn3k/brutespray) los prueba TODOS de una pasada en vez de ir uno a "
         "uno con hydra (que cada protocolo ya sugiere por separado, sigue siendo válido para un único "
         "servicio)"))
+    # '-spray' NO sustituye a '-p': el modo spray de brutespray SIGUE necesitando la lista de
+    # contraseñas (-p) — prueba UNA por ronda contra todos los usuarios. Decir 'en vez de -p' dejaba
+    # el comando sin fuente de contraseñas (#57). SNMP vive en udp.gnmap, no en deep.gnmap (#60).
     tail = ("fuerza bruta de diccionario contra los {0} servicios detectados de una sola pasada "
-            "(paso MANUAL, no se ejecuta solo) — añade '-spray -spray-delay 15m' en vez de "
-            "'-p wordlist.txt' si hay riesgo real de bloqueo de cuentas (p. ej. contra AD)"
+            "(paso MANUAL, no se ejecuta solo) — añade '-spray -spray-delay 15m' (MANTENIENDO '-p') "
+            "si hay riesgo real de bloqueo de cuentas (p. ej. contra AD)"
             ).format(len(svcs))
+    if "snmp" in svcs:
+        tail += "; SNMP está en udp.gnmap (no en deep.gnmap, que es TCP) — pásalo aparte con otro '-f .../nmap/udp.gnmap'"
     if gnmap.exists():
         res["next"].append(
             f"brutespray -f {gnmap} -u users.txt -p /usr/share/wordlists/rockyou.txt   # {tail}")
