@@ -1176,7 +1176,14 @@ def merge_scripts(base, extra):
         return
     byport = {p["port"]: p for p in base["ports"]}
     for p in extra["ports"]:
-        byport.get(p["port"], {}).get("scripts", {}).update(p["scripts"])
+        bp = byport.get(p["port"])
+        if bp is not None:
+            bp.setdefault("scripts", {}).update(p.get("scripts", {}))
+        else:
+            # Puerto presente en el 2º escaneo (agresivo/vuln) pero no en el base: antes su NSE se
+            # escribía en un dict DESECHABLE (byport.get(port, {})) y se perdía en silencio. Se
+            # anexa el puerto para no tirar datos si los conjuntos de puertos llegan a divergir (#12).
+            base["ports"].append(p)
     base["host"].update(extra["host"])
 
 
@@ -1206,6 +1213,14 @@ def grab_banner(ip, port, timeout=3.0, web=False, source_port=None):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             if source_port:              # mismo truco que --source-port en nmap: la
+                # SO_REUSEADDR/REUSEPORT: con --source-port, grab_all_banners lanza hasta 16 sockets
+                # CONCURRENTES atados al MISMO puerto local → sin esto el 2º..N bind daba EADDRINUSE y
+                # el banner salía vacío (silencioso), tumbando la clasificación por banner (#11).
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except (AttributeError, OSError):
+                    pass
                 s.bind(("", source_port))  # conexión real también tiene que salir "de confianza"
             s.connect((ip, port))
             try:
@@ -5105,6 +5120,14 @@ def _parse_finger_users(out):
     ('no such user', 'finger: …') y las líneas vacías. Puro → testable en --selftest sin red."""
     users = []
     for line in (out or "").splitlines():
+        # finger verbose (GNU, sondeo por-usuario 'finger root@ip') devuelve 'Login: root   Name: …':
+        # el 1er token es 'Login:' (con ':') y fallaba el fullmatch, perdiendo la cuenta CONFIRMADA
+        # (la columnar 'Login Name Tty…' sí parseaba, pero no las confirmaciones por-usuario) (#45).
+        mlv = re.match(r"\s*Login:\s*(\S+)", line)
+        if mlv:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", mlv.group(1)):
+                users.append(mlv.group(1))
+            continue
         tok = line.split()[:1]
         if not tok:
             continue
@@ -14367,6 +14390,17 @@ def selftest():
                    "no such user\n")
     assert _parse_finger_users(_finger_out) == ["root", "mrb3n"]
     assert _parse_finger_users("") == []
+    # #45: salida VERBOSE de GNU finger ('finger root@ip' → 'Login: root   Name: ...'): el 1er token
+    # es 'Login:' (con ':') y antes se descartaba, perdiendo la cuenta confirmada.
+    assert _parse_finger_users("Login: root   Name: root   Directory: /root   Shell: /bin/bash") == ["root"]
+    # #12: merge_scripts funde el NSE en el puerto existente y ANEXA un puerto solo visto en el 2º
+    # escaneo (antes se escribia en un dict desechable y se perdia).
+    _ms_base = {"ports": [{"port": 445, "scripts": {"a": "1"}}], "host": {}}
+    merge_scripts(_ms_base, {"ports": [{"port": 445, "scripts": {"b": "2"}},
+                                       {"port": 139, "scripts": {"smb-vuln-ms17-010": "VULNERABLE"}}], "host": {"x": "y"}})
+    assert _ms_base["ports"][0]["scripts"] == {"a": "1", "b": "2"}, _ms_base["ports"][0]["scripts"]
+    assert any(p["port"] == 139 and p["scripts"].get("smb-vuln-ms17-010") == "VULNERABLE" for p in _ms_base["ports"]), _ms_base["ports"]
+    assert _ms_base["host"] == {"x": "y"}
 
     # X11: ¿display abierto? · CUPS: versión de la cabecera Server/cuerpo
     assert _x11_access_granted("| x11-access: X server access is granted") is True
