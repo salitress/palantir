@@ -2114,14 +2114,21 @@ def _parse_kerbrute_users(out):
     for line in (out or "").splitlines():
         clean = _ANSI_RE.sub("", line)
         m = re.search(r"VALID USERNAME:\s*([^\s@]+)", clean)
-        if not m:
-            continue
-        u = m.group(1)
-        users.append(u)
-        # kerbrute marca las AS-REP roastables de varias formas según versión:
-        # "(NO PREAUTH)", "has no pre auth required" → tolera espacios/guiones entre pre y auth.
-        if re.search(r"no[\s-]*pre[\s-]*auth", clean, re.I):
-            noauth.append(u)
+        if m:
+            u = m.group(1)
+            users.append(u)
+            # Alguna versión pega "(NO PREAUTH)" en la MISMA línea de VALID USERNAME → se tolera.
+            if re.search(r"no[\s-]*pre[\s-]*auth", clean, re.I):
+                noauth.append(u)
+        # ropnop/kerbrute imprime el AS-REP roastable en una línea SEPARADA (session.go:180):
+        # "[+] <user> has no pre auth required. Dumping hash to crack offline:" — NO lleva "VALID
+        # USERNAME:". Antes el check de "no pre auth" corría SOLO sobre la línea de VALID USERNAME,
+        # así que noauth quedaba SIEMPRE vacío y el hallazgo "cuentas SIN pre-auth (AS-REP
+        # roastables)" nunca saltaba, y el hash $krb5asrep$ que kerbrute ya volcó se perdía (#30).
+        nm = re.search(r"\[\+\]\s*([^\s@]+?)(?:@\S+)?\s+has no pre[\s-]*auth", clean, re.I)
+        if nm:
+            users.append(nm.group(1))
+            noauth.append(nm.group(1))
     return list(dict.fromkeys(users)), list(dict.fromkeys(noauth))
 
 
@@ -4783,12 +4790,16 @@ def _kerbrute_userenum(res, ip, domain, base):
 def _parse_kerbrute_spray(out):
     """Usuarios cuya contraseña VALIDÓ en la salida de `kerbrute passwordspray`: líneas
     '[+] VALID LOGIN:  user@dominio:contraseña' (se queda con el usuario; la contraseña ya la
-    conoces, es la que rociaste). Tolera color ANSI. Formato confirmado en el repo de kerbrute
-    (ropnop/kerbrute). Puro → testeable sin red."""
+    conoces, es la que rociaste). Tolera color ANSI. kerbrute (ropnop, cmd/worker.go:80/82)
+    imprime TAMBIÉN '[+] VALID LOGIN WITH ERROR:  user@dominio:pass  (motivo)' cuando la
+    credencial es CORRECTA pero la cuenta tiene la contraseña caducada o hay clock skew — es un
+    acierto real (en labs CPTS/OSCP, 'password expired' es una victoria), así que también cuenta;
+    antes la regex 'VALID LOGIN:' no casaba esa variante y se descartaba en silencio (#31).
+    Puro → testeable sin red."""
     users = []
     for line in (out or "").splitlines():
         clean = _ANSI_RE.sub("", line)
-        m = re.search(r"VALID LOGIN:\s*([^\s@:]+)", clean)
+        m = re.search(r"VALID LOGIN(?: WITH ERROR)?:\s*([^\s@:]+)", clean)
         if m:
             users.append(m.group(1))
     return list(dict.fromkeys(users))
@@ -4861,10 +4872,23 @@ def _spray_phase(ip, domain, base, services):
                 f"{_impacket_suggest_bin('GetUserSPNs')} {domain}/{_v0}:'<pass>' -dc-ip {ip} -request   # Kerberoasting con una cred ya válida")
             res["next"].append(
                 f"nxc smb {ip} -u {_v0} -p '<pass>' --shares   # confirma y enumera con la cred válida")
-        if re.search(r"lockout|aborting", out, re.I):
+        # kerbrute (ropnop, session/errors.go) aborta con "...Aborting..." por VARIAS causas: bloqueo
+        # ("USER LOCKED OUT and safe mode on! Aborting..."), red ("NETWORK ERROR - Can't talk to KDC.
+        # Aborting...") o realm equivocado ("...Wrong Realm... Aborting..."). Antes la regex
+        # 'lockout|aborting' marcaba CUALQUIER abort como bloqueo, así que sobre un túnel flaky un
+        # abort de RED se reportaba como "cuentas bloqueadas" (falso, #35). Se distingue la causa.
+        if re.search(r"LOCKED OUT|safe mode", out, re.I):
             res["findings"].append(("alta",
-                "Password spraying: kerbrute ABORTÓ por bloqueo detectado (--safe) — revisa qué cuentas "
+                "Password spraying: kerbrute ABORTÓ por BLOQUEO detectado (--safe) — revisa qué cuentas "
                 "quedaron bloqueadas antes de seguir rociando."))
+            break
+        if re.search(r"aborting", out, re.I):
+            _why = ("red/KDC inalcanzable" if re.search(r"Can't talk to KDC|NETWORK ERROR", out, re.I)
+                    else "realm/dominio equivocado" if re.search(r"Wrong Realm", out, re.I)
+                    else "causa desconocida")
+            res["findings"].append(("media",
+                f"Password spraying: kerbrute ABORTÓ ({_why}) — NO es un bloqueo; revisa túnel/dominio "
+                "y reláncalo. El spray NO se completó."))
             break
     return res
 
@@ -4922,7 +4946,7 @@ def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None, has_cre
         # verdad, solo usa el login como disparador). El rango de RIDs por defecto es 1-2^31 — acótalo
         # (-o rids=500-2000) o puede tardar/ser muy ruidoso. Hash en formato hashcat ($sntp-ms$...) —
         # revisa el modo exacto con 'hashcat --help | grep -i sntp' (no inventado aquí).
-        f"nxc smb {ip} -u '' -p '' -M timeroast -o rids=500-2000   # hashes de cuentas de equipo/trust por NTP sin autenticar — acota el rango de RIDs, el de por defecto (1-2^31) puede tardar mucho",
+        f"nxc smb {ip} -u '' -p '' -M timeroast   # hashes de cuentas de equipo/trust por NTP sin autenticar (nxc/modules/timeroast.py NO parsea rangos: '-o rids=500-2000' revienta el módulo con TypeError; el módulo ya se autolimita con su temporizador de give-up)",
     ]
     for lbl, txt in _nse_for(services, host, ("krb5", "kerberos")):
         _step(res, f"nmap {lbl}", True, txt, note="lo que ya sacó nmap para Kerberos")
@@ -4983,7 +5007,7 @@ def fp_adws(ip, ports, services, host, deep, domain=None):
         "# si ya tienes PowerShell con RSAT en un host del dominio, el módulo ActiveDirectory habla "
         "por ADWS en vez de LDAP — útil si el LDAP está limitado/monitorizado",
         "pipx install git+https://github.com/logangoins/SOAPy   # colector de AD por ADWS en vez de LDAP (repo activo — revisa su wiki si --help no coincide)",
-        f"soapy {domain or 'DOMINIO'}/USER:'PASS'@{ip} --users   # recolección por ADWS — convierte la salida a JSON de BloodHound con bofhound (github.com/coffeegist/bofhound)",
+        f"SOAPy {domain or 'DOMINIO'}/USER:'PASS'@{ip} --users   # recolección por ADWS — el binario es 'SOAPy' con mayúsculas (pyproject [tool.poetry.scripts]); 'soapy' falla en Linux. Convierte la salida a JSON de BloodHound con bofhound (github.com/coffeegist/bofhound)",
     ]
     return res
 
@@ -11066,6 +11090,20 @@ def selftest():
     assert _parse_kerbrute_spray(_spray_out) == ["administrator", "svc_sql", "bob"]
     assert _parse_kerbrute_spray("Done! Tested 56 logins (0 successes)") == []
     assert _parse_kerbrute_spray("") == []
+    # #31: 'VALID LOGIN WITH ERROR' (contraseña correcta pero caducada / clock skew) es un acierto
+    # real — kerbrute/ropnop cmd/worker.go:80. Antes la regex no lo casaba y se descartaba.
+    assert _parse_kerbrute_spray(
+        "2026/01/01 > [+] VALID LOGIN WITH ERROR:\t jdoe@corp.local:Pass123\t (Password has expired)") == ["jdoe"]
+    # #30: la cuenta AS-REP roastable ('has no pre auth required') la imprime kerbrute en una línea
+    # SEPARADA de 'VALID USERNAME:' (ropnop session.go:180). _parse_kerbrute_users debe marcarla en
+    # noauth; antes el check corría solo sobre la línea de VALID USERNAME → noauth siempre vacío.
+    _ku_out = ("2026/01/01 > [+] svc_asrep@corp.local has no pre auth required. Dumping hash to crack offline:\n"
+               "$krb5asrep$23$svc_asrep@CORP.LOCAL:aaaa...\n"
+               "2026/01/01 > [+] VALID USERNAME:\t svc_asrep@corp.local\n"
+               "2026/01/01 > [+] VALID USERNAME:\t normaluser@corp.local\n")
+    _ku_users, _ku_noauth = _parse_kerbrute_users(_ku_out)
+    assert set(_ku_users) == {"svc_asrep", "normaluser"}, _ku_users
+    assert _ku_noauth == ["svc_asrep"], _ku_noauth
 
     # _read_ad_users: lee <base>/ad_users.txt (ignora líneas vacías); [] sin fichero o base None.
     _ad_dir = Path(tempfile.mkdtemp())
@@ -11099,6 +11137,26 @@ def selftest():
     assert any(s == "critica" and "VÁLIDA" in t and "jon" in t for s, t in _sp["findings"])
     assert "Welcome1" not in _sp["steps"][0]["output"] and "***" in _sp["steps"][0]["cmd"]
     assert _sp_nodc is None   # spraying por Kerberos solo contra un DC
+    # #35: un ABORT por BLOQUEO ('USER LOCKED OUT') se reporta alta/BLOQUEO; un ABORT por red/realm
+    # ('Can't talk to KDC. Aborting...') NO es bloqueo → media, sin decir 'cuentas bloqueadas'.
+    def _fake_spray_lock(cmd, timeout=None, **kw):
+        return (1, "[!] administrator@corp.local:Welcome1 - USER LOCKED OUT and safe mode on! Aborting...\n") \
+            if (cmd and "passwordspray" in cmd) else (0, "")
+    def _fake_spray_neterr(cmd, timeout=None, **kw):
+        return (1, "[!] NETWORK ERROR - Can't talk to KDC. Aborting...\n") \
+            if (cmd and "passwordspray" in cmd) else (0, "")
+    globals()["_kerbrute_bin"], globals()["SPRAY_PASSWORDS"] = (lambda: "FAKE_KB"), ["Welcome1"]
+    try:
+        globals()["run_capture"] = _fake_spray_lock
+        _sp_lock = _spray_phase("10.0.0.1", "corp.local", _spray_dir, _dc_services)
+        globals()["run_capture"] = _fake_spray_neterr
+        _sp_net = _spray_phase("10.0.0.1", "corp.local", _spray_dir, _dc_services)
+    finally:
+        globals()["_kerbrute_bin"], globals()["run_capture"] = _real_kbbin_s, _real_rc_s
+        globals()["SPRAY_PASSWORDS"] = _real_spray_pw
+    assert any(s == "alta" and "BLOQUEO" in t for s, t in _sp_lock["findings"]), _sp_lock["findings"]
+    assert any(s == "media" and "red/KDC" in t for s, t in _sp_net["findings"]), _sp_net["findings"]
+    assert not any("BLOQUEO" in t for _s, t in _sp_net["findings"]), _sp_net["findings"]
 
     # _parse_nxc_signing: banner de nxc smb, formato real confirmado contra un run (ver
     # fixtures de arriba, línea con '(signing:False) (SMBv1:None)'). True/False/None.
@@ -11819,7 +11877,7 @@ def selftest():
         "evil-winrm -i 172.16.7.50 -u USER -p PASS   # shell cuando tengas credenciales válidas",
         "impacket-wmiexec DOMINIO/USER:PASS@172.16.7.50   # RCE por WMI",
         "xfreerdp /v:172.16.7.50 /u:USER /p:PASS +clipboard /cert:ignore   # conectar con credenciales",
-        "soapy inlanefreight.local/USER:'PASS'@172.16.7.50 --users   # recolección ADWS",
+        "SOAPy inlanefreight.local/USER:'PASS'@172.16.7.50 --users   # recolección ADWS",
         "nxc winrm 172.16.7.50 -u users.txt -p pass.txt --continue-on-success   # validar LISTA (no debe tocarse)",
     ]
     _fc_lowpriv = _fp("reuse-smb", "x", [445])
@@ -13622,11 +13680,13 @@ def selftest():
                          [{"port": 9389, "name": "mc-nmf", "scripts": {}}], {}, False)
     assert any("Domain Controller" in f[1] for f in _adws_fpr["findings"]), _adws_fpr["findings"]
     assert any("Get-ADUser" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
-    assert any("soapy DOMINIO/USER" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
+    # #34: el binario es 'SOAPy' con mayúsculas (pyproject [tool.poetry.scripts]); 'soapy' falla en Linux.
+    assert any("SOAPy DOMINIO/USER" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
+    assert not any(re.search(r"\bsoapy ", n) for n in _adws_fpr["next"]), _adws_fpr["next"]
     assert any("logangoins/SOAPy" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
     _adws_fpr2 = fp_adws("10.0.0.1", [{"port": 9389, "name": "mc-nmf", "scripts": {}}],
                          [{"port": 9389, "name": "mc-nmf", "scripts": {}}], {}, False, domain="corp.local")
-    assert any("soapy corp.local/USER" in n for n in _adws_fpr2["next"]), _adws_fpr2["next"]
+    assert any("SOAPy corp.local/USER" in n for n in _adws_fpr2["next"]), _adws_fpr2["next"]
 
     # _secretsdump_bin: el nombre de apt ('impacket-secretsdump') va PRIMERO — confirmado
     # contra un Kali real que no tiene 'secretsdump.py' así en el PATH (ver _impacket_suggest_bin
