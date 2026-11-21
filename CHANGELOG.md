@@ -8,6 +8,34 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `_dump_sam_lsa` now chains a third step after `--sam`/`--lsa` on every confirmed SMB
+  `(Pwn3d!)`: `nxc smb ... -M lsassy`, a remote memory dump of `lsass.exe` (comsvcs.dll
+  MiniDump, module source confirmed against nxc's own `nxc/modules/lsassy.py`). Unlike
+  `--sam` (local accounts only) and `--lsa` (secrets at rest: DPAPI/NL$KM/service creds),
+  lsassy surfaces the credential (plaintext or NTLM hash) of **any account with a live logon
+  session on the box right now** — local or domain — which is how a stray Domain Admin RDP
+  session on a compromised host turns into a direct DA hash. Findings are explicit that this
+  is noisier than `--sam`/`--lsa` (one of the most heavily monitored EDR/Defender IOCs) and
+  that it can fail cleanly against Credential Guard or LSA running as a Protected Process
+  (RunAsPPL) even with real admin. Found credentials feed the cross-protocol reuse pool like
+  SAM/LSA already did; a failed on-target cleanup (`[OPSEC] Failed to delete...`) is promoted
+  to its own finding (an artifact left on disk); any Kerberos tickets lsassy saved locally are
+  pointed to in a next-step. No new dependency: `lsassy` is a hard pip dependency of nxc itself.
+- The abusable-ACL audit (added in 1.2.0) now also checks individual high-value **accounts**,
+  not just groups: control over the built-in `Administrator` account (`nxc -M daclread -o
+  TARGET=Administrator` — `TARGET` resolves by `sAMAccountName`, confirmed generic for users
+  too against nxc's own help text/source) means you can reset its password directly and log
+  in as it, without ever joining a group. Real gap found live: the audit already flagged
+  `FullControl`/`WriteDACL`/.../`Self` over `Enterprise Admins`/`Administrators`, but the
+  actual path the operator took was resetting `Administrator`'s password, which the
+  group-only check never saw. `_acl_abuse_cmds` gained a `kind` parameter (`"group"`,
+  unchanged default, vs `"account"`) so the same right→command-chain logic now ends in
+  `bloodyAD ... set password` instead of `add groupMember` when the target is an account.
+  MVP: only the well-known `Administrator` account, not a dynamic sweep of every current
+  member of Domain Admins/Enterprise Admins/Administrators (documented as a follow-up).
+
 ## [1.2.0] - 2026-11-21
 
 ### Added

