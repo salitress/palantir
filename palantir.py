@@ -3482,10 +3482,16 @@ def fp_imap_pop3(ip, ports, services, host, deep):
             res["findings"].append(("info", f"{port}: correo en claro (sin TLS) — credenciales viajan sin cifrar"))
     for lbl, txt in _nse_for(services, host, ("imap", "pop3", "ssl-cert")):
         _step(res, f"nmap {lbl}", True, txt, note="lo que ya sacó nmap con sus scripts NSE para este servicio")
-    res["next"] += [
-        f"openssl s_client -connect {ip}:993   # IMAPS; luego: a LOGIN user pass / a LIST \"\" *",
-        f"curl -k 'imaps://{ip}' --user user:pass -v",
-    ]
+    # Next-steps según los puertos REALMENTE abiertos, no un IMAPS:993 fijo: en un host solo-POP3
+    # (110/995) el 'openssl s_client -connect ip:993' apuntaba a un puerto cerrado y no daba ningún
+    # comando para el POP3 que sí estaba (#41). IMAP: 993(S)/143; POP3: 995(S)/110.
+    _pts = {p["port"] for p in ports}
+    if 993 in _pts or 143 in _pts:
+        _ipt = 993 if 993 in _pts else 143
+        res["next"].append(f"openssl s_client -connect {ip}:{_ipt}   # IMAP{'S' if _ipt == 993 else ''}; luego: a LOGIN user pass / a LIST \"\" *")
+    if 995 in _pts or 110 in _pts:
+        _ppt = 995 if 995 in _pts else 110
+        res["next"].append(f"openssl s_client -connect {ip}:{_ppt}   # POP3{'S' if _ppt == 995 else ''}; luego: USER <u> / PASS <p> / LIST / RETR 1")
     return res
 
 
@@ -3744,9 +3750,14 @@ def fp_winrm(ip, ports, services, host, deep):
         nxc_auth(nxc, "winrm", ip, res)                # fallback null → guest → Administrator
     else:
         res["missing"].append("nxc/netexec")
+    # Interpola el puerto: 5986 es WinRM sobre HTTPS y evil-winrm necesita '-S' (si no, falla contra
+    # 5986); antes se sugería siempre el 5985 por defecto sin -S (#43).
+    _wp = ports[0]["port"] if ports else 5985
+    _ew_extra = " -S" if _wp == 5986 else (f" -P {_wp}" if _wp != 5985 else "")
+    _nxc_wpp = f" --port {_wp}" if _wp != 5985 else ""
     res["next"] += [
-        f"evil-winrm -i {ip} -u USER -p PASS   # shell cuando tengas credenciales válidas",
-        f"nxc winrm {ip} -u users.txt -p pass.txt --continue-on-success   # validar lista de credenciales (manual)",
+        f"evil-winrm -i {ip}{_ew_extra} -u USER -p PASS   # shell cuando tengas credenciales válidas",
+        f"nxc winrm {ip}{_nxc_wpp} -u users.txt -p pass.txt --continue-on-success   # validar lista de credenciales (manual)",
     ]
     return res
 
@@ -3759,10 +3770,14 @@ def fp_ssh(ip, ports, services, host, deep):
     for lbl, txt in _nse_for(services, host, ("ssh",)):
         _step(res, f"nmap {lbl}", True, txt,
               note="algoritmos, métodos de autenticación y hostkeys que ya sacó nmap")
+    # Interpola el puerto DETECTADO (SSH en 2222 y similares es muy común en labs): antes las
+    # sugerencias iban fijas a :22 y el operador tenía que corregirlas a mano (#43).
+    _sp = ports[0]["port"] if ports else 22
+    _nxc_pp = f" --port {_sp}" if _sp != 22 else ""
     res["next"] += [
-        f"nxc ssh {ip} -u users.txt -p pass.txt --continue-on-success   # validar credenciales (manual)",
-        f"hydra -L users.txt -P /usr/share/wordlists/rockyou.txt ssh://{ip}   # fuerza bruta (manual; ojo a bloqueos)",
-        f"ssh {ip} -oPreferredAuthentications=none   # ver métodos ofertados / banner de usuario",
+        f"nxc ssh {ip}{_nxc_pp} -u users.txt -p pass.txt --continue-on-success   # validar credenciales (manual)",
+        f"hydra -L users.txt -P /usr/share/wordlists/rockyou.txt ssh://{ip}:{_sp}   # fuerza bruta (manual; ojo a bloqueos)",
+        f"ssh{(' -p ' + str(_sp)) if _sp != 22 else ''} {ip} -oPreferredAuthentications=none   # ver métodos ofertados / banner de usuario",
     ]
     return res
 
@@ -4638,7 +4653,12 @@ def fp_elastic(ip, ports, services, host, deep):
     """Elasticsearch (9200): por defecto sin autenticación → lectura de todos los
     índices (datos, a veces credenciales). Comprobación read-only con urllib."""
     res = _fp("elastic", "Elasticsearch", [p["port"] for p in ports])
-    for p in ports:
+    # 9300 es el puerto de TRANSPORTE binario (nodo-a-nodo), NO la API REST: un GET HTTP ahí siempre
+    # falla y 'curl .../_cat/indices' sobre 9300 no tiene sentido. Solo se sondea la API REST (9200 y
+    # cualquier otro puerto elastic != 9300). Los next-steps van FUERA del loop, keyados al puerto
+    # REST, para no duplicarse cuando hay 9200 Y 9300 (#42).
+    rest_ports = [p for p in ports if p["port"] != 9300]
+    for p in rest_ports:
         port = p["port"]
         scheme = "https" if p.get("tunnel") == "ssl" else "http"
         st, _hd, body = _http_get(f"{scheme}://{ip}:{port}/")
@@ -4649,10 +4669,15 @@ def fp_elastic(ip, ports, services, host, deep):
             st2, _h2, idx = _http_get(f"{scheme}://{ip}:{port}/_cat/indices?v")
             if st2 == 200 and idx.strip():
                 _step(res, f"GET {scheme}://{ip}:{port}/_cat/indices?v", True, idx[:2000], note="índices disponibles")
+    if rest_ports:
+        p0 = rest_ports[0]
+        scheme0 = "https" if p0.get("tunnel") == "ssl" else "http"
         res["next"] += [
-            f"curl -s {scheme}://{ip}:{port}/_cat/indices?v   # listar índices",
-            f"curl -s '{scheme}://{ip}:{port}/_search?pretty&size=100'   # volcar documentos",
+            f"curl -s {scheme0}://{ip}:{p0['port']}/_cat/indices?v   # listar índices",
+            f"curl -s '{scheme0}://{ip}:{p0['port']}/_search?pretty&size=100'   # volcar documentos",
         ]
+    if any(p["port"] == 9300 for p in ports):
+        res["findings"].append(("info", "Elasticsearch 9300: puerto de transporte (nodo-a-nodo), no la API REST — enumera por la API REST (9200)"))
     return res
 
 
@@ -10872,6 +10897,41 @@ def selftest():
         globals()["run_capture"] = _real_rc_gm
     assert any(s == "media" and "anónimo" in t for s, t in _ftp_an["findings"]), _ftp_an["findings"]
     assert not any("credencial por defecto válida" in t for _s, t in _ftp_an["findings"]), _ftp_an["findings"]
+
+    # #41: fp_imap_pop3 construye los next-steps desde los puertos REALES (no un IMAPS:993 fijo).
+    _real_gb41 = globals().get("grab_banner")
+    globals()["grab_banner"] = lambda *a, **k: ""
+    try:
+        _ipp = fp_imap_pop3("1.2.3.4", [{"port": 995}], [{"port": 995, "name": "pop3s", "scripts": {}}], {}, False)
+    finally:
+        globals()["grab_banner"] = _real_gb41
+    assert any("995" in n and "POP3" in n for n in _ipp["next"]), _ipp["next"]
+    assert not any(":993" in n for n in _ipp["next"]), _ipp["next"]
+
+    # #42: fp_elastic no sondea 9300 (transporte) como REST, no duplica next-steps y marca 9300 info.
+    _real_hg42 = globals()["_http_get"]
+    globals()["_http_get"] = lambda *a, **k: (0, {}, "")
+    try:
+        _el = fp_elastic("1.2.3.4", [{"port": 9200, "name": "http"}, {"port": 9300, "name": "http"}],
+                         [{"port": 9200, "name": "http", "scripts": {}}], {}, False)
+    finally:
+        globals()["_http_get"] = _real_hg42
+    assert any("transporte" in t for _s, t in _el["findings"]), _el["findings"]
+    assert any("9200" in n for n in _el["next"]) and not any("9300" in n for n in _el["next"]), _el["next"]
+    assert sum(1 for n in _el["next"] if "_cat/indices" in n) == 1, _el["next"]   # sin duplicar
+
+    # #43: fp_ssh/fp_winrm interpolan el puerto detectado (ssh 2222; winrm 5986 con -S).
+    _ssh43 = fp_ssh("1.2.3.4", [{"port": 2222, "name": "ssh", "scripts": {}}],
+                    [{"port": 2222, "name": "ssh", "scripts": {}}], {}, False)
+    assert any("ssh://1.2.3.4:2222" in n for n in _ssh43["next"]), _ssh43["next"]
+    assert any(re.search(r"\bssh -p 2222 ", n) for n in _ssh43["next"]), _ssh43["next"]
+    _real_nxcbin43 = nxc_bin
+    globals()["nxc_bin"] = lambda: None
+    try:
+        _wr43 = fp_winrm("1.2.3.4", [{"port": 5986}], [{"port": 5986, "name": "winrm"}], {}, False)
+    finally:
+        globals()["nxc_bin"] = _real_nxcbin43
+    assert any("evil-winrm" in n and " -S" in n for n in _wr43["next"]), _wr43["next"]
 
     # Regresión con ruido REAL capturado contra un objetivo: el módulo SSH de nxc (bug
     # conocido de paramiko, NetExec#312) mete líneas 'ERROR Internal Paramiko error for
