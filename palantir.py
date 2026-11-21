@@ -2211,6 +2211,16 @@ def _nxc_ok(out):
     return bool(re.search(r"\[\+\]", out)) and "STATUS_LOGON_FAILURE" not in out
 
 
+def _nxc_login_ok(out):
+    """¿nxc marcó un login REAL de la credencial probada? Como _nxc_ok pero excluye '(Guest)', que
+    nxc pone a CUALQUIER credencial que el servidor desvía a la cuenta guest (map to guest = Bad
+    User) — eso NO es un login válido de esa cuenta. Un solo punto para el chequeo que antes se
+    repetía inline (el origen del falso positivo de guest-mapping). SOLO para rutas que prueban una
+    credencial concreta (no la identidad guest/anónima explícita, que nxc_auth/_cc_nxc tratan aparte,
+    porque ahí (Guest) SÍ es el resultado esperado). Puro → testeable sin red."""
+    return _nxc_ok(out) and "(Guest)" not in out
+
+
 def _nxc_has_data(out):
     """¿Una enumeración de nxc (--users/--rid-brute/--pass-pol/--groups…) devolvió DATOS
     de verdad, o solo el banner [*] y la línea de login [+]? Un '[+]' NO es un dato: un DC
@@ -7925,7 +7935,7 @@ def _nxc_confirm_smb(nxc, ip, user, password, port, dp, local_auth):
         except OSError:
             pass
     out = out or ""
-    ok = _nxc_ok(out) and "(Guest)" not in out   # (Guest) = guest-mapping, no es un login real
+    ok = _nxc_login_ok(out)   # excluye el guest-mapping '(Guest)' (ver _nxc_login_ok)
     return ok, bool(re.search(r"\(Pwn3d!\)", out))
 
 
@@ -8451,8 +8461,8 @@ def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
     # el servidor desvía a la cuenta guest — NO es un login real de la credencial probada. Aquí la
     # credencial viene del pool (login válido/hash volcado) o de --user/--pass, nunca es la
     # identidad guest anónima, así que un (Guest) es siempre un falso positivo. Mismo guard que
-    # _nxc_confirm_smb (7705) y _parse_nxc_bulk_successes (6387).
-    return (_nxc_ok(out) and "(Guest)" not in out), bool(re.search(r"\(Pwn3d!\)", out)), safe_out, shown
+    # _nxc_confirm_smb y _parse_nxc_bulk_successes (mismo criterio, ahora en _nxc_login_ok).
+    return _nxc_login_ok(out), bool(re.search(r"\(Pwn3d!\)", out)), safe_out, shown
 
 
 def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enriched,
@@ -10965,6 +10975,10 @@ def selftest():
     finally:
         globals()["run_capture"] = _real_rc_gm
     assert _ok_gm is False and _pwn_gm is False, (_ok_gm, _pwn_gm)
+    # _nxc_login_ok: helper compartido = _nxc_ok sin guest-mapping (un solo punto para el chequeo).
+    assert _nxc_login_ok("SMB x 445 WIN [+] WIN\\u:p") is True
+    assert _nxc_login_ok("SMB x 445 WIN [+] WIN\\u:p (Guest)") is False
+    assert _nxc_login_ok("SMB x 445 WIN [-] WIN\\u:p STATUS_LOGON_FAILURE") is False
     # #46: _cc_nxc — una credencial REAL por defecto mapeada a guest se anota como guest-mapping
     # (media), NO como 'credencial por defecto válida', y no cuenta como hit.
     globals()["run_capture"] = lambda *a, **kw: (0, "SMB 10.0.0.1 445 WIN [+] WIN\\administrator:Password123 (Guest)")
