@@ -2476,6 +2476,12 @@ def nxc_auth(nxc, proto, ip, res):
         if re.search(r"\(Pwn3d!\)", out):
             res["findings"].append(("critica", f"{proto.upper()}: acceso de administrador vía {lbl} (Pwn3d!)"))
             return user, lbl
+        if ok and "(Guest)" in out and user not in ("", "guest"):
+            # guest-mapping: el servidor desvía a guest una identidad REAL (p. ej. 'Administrator'
+            # sin contraseña) y nxc la marca (Guest). NO es un login válido de esa cuenta — no lo
+            # reportes como 'sesión válida vía Administrator'. (Para '' y 'guest', (Guest) es el
+            # resultado esperado y SÍ se reporta abajo.)
+            continue
         if ok:
             # null/guest por WMI o LDAP es anónimo de BAJO valor (WMI no consulta nada sin
             # privilegios; el bind LDAP anónimo sin lectura ya se reporta aparte) → media, no
@@ -2777,7 +2783,10 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                 signing = _parse_nxc_signing(out)
             if re.search(r"\(Pwn3d!\)", out):
                 res["findings"].append(("critica", f"SMB: acceso de administrador vía {lbl} (Pwn3d!)"))
-            elif user and _nxc_ok(out):
+            elif user and _nxc_ok(out) and not (user.lower() != "guest" and "(Guest)" in out):
+                # No cuentes como "login válido vía Administrator" lo que en realidad es guest-mapping
+                # (map to guest = Bad User): nxc marca (Guest) a una credencial REAL desviada a guest.
+                # Para 'guest' el (Guest) es el resultado esperado y SÍ se reporta.
                 res["findings"].append(("alta", f"SMB: login válido vía {lbl} (contraseña vacía aceptada)"))
             if re.search(r"\bREAD\b", out):
                 anon_readable = True
@@ -5492,6 +5501,7 @@ def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None):
         # credenciales por defecto SMB (4/4 vacías en un host, 3/4 en otro del mismo run).
         rc, out = _run_capture_retry(cmd, timeout=40)
         ok = _nxc_ok(out)
+        guest = "(Guest)" in out   # nxc marca (Guest) tanto en login guest real como en guest-mapping
         _step(res, shlex.join(cmd), ok, out,
               note=f"probar credencial por defecto «{lbl}» por {nxc_proto.upper()} (1 intento, no es fuerza bruta)")
         if re.search(r"\(Pwn3d!\)", out):
@@ -5500,6 +5510,14 @@ def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None):
             return (u, p, lbl)
         if ok and hit is None:
             anon = p == "" and u.lower() in ("", "guest", "anonymous")
+            if guest and not anon:
+                # guest-mapping (map to guest = Bad User): el servidor desvía a guest una credencial
+                # REAL por defecto (p. ej. administrator/Password123) y nxc la marca (Guest). NO es un
+                # login válido de esa cuenta: se anota UNA vez como media y no se cuenta como hit.
+                if not any("guest-mapping" in t for _s, t in res["findings"]):
+                    res["findings"].append(("media", f"{nxc_proto.upper()}: guest-mapping activo (map to guest) — "
+                        "nxc marca cualquier credencial como válida (Guest); no es un login real de la cuenta"))
+                continue
             sev = "media" if anon else "alta"
             msg = (f"{nxc_proto.upper()}: sesión nula/invitado aceptada ({lbl})" if anon
                    else f"{nxc_proto.upper()}: credencial por defecto válida — {lbl}")
@@ -8206,7 +8224,12 @@ def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
     if port and dp and port != dp:
         shown += f" --port {port}"
     safe_out = out.replace(secret, "***") if secret else out
-    return _nxc_ok(out), bool(re.search(r"\(Pwn3d!\)", out)), safe_out, shown
+    # "(Guest)" = guest-mapping (map to guest = Bad User): nxc marca así CUALQUIER credencial que
+    # el servidor desvía a la cuenta guest — NO es un login real de la credencial probada. Aquí la
+    # credencial viene del pool (login válido/hash volcado) o de --user/--pass, nunca es la
+    # identidad guest anónima, así que un (Guest) es siempre un falso positivo. Mismo guard que
+    # _nxc_confirm_smb (7705) y _parse_nxc_bulk_successes (6387).
+    return (_nxc_ok(out) and "(Guest)" not in out), bool(re.search(r"\(Pwn3d!\)", out)), safe_out, shown
 
 
 def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enriched,
@@ -10593,6 +10616,42 @@ def selftest():
     assert {"user": "john", "password": "Windows Creds", "pwn3d": False} in _sp
     assert {"user": "dave", "password": "correct horse battery", "pwn3d": True} in _sp
     assert not any(h["user"] == "simon" for h in _sp)   # (Guest) descartado
+
+    # ── guest-mapping (map to guest = Bad User) tratado como falso positivo en TODAS las rutas ──
+    _real_rc_gm = run_capture
+    # #53: _nxc_try_cred — una credencial REAL del pool marcada (Guest) NO es login válido.
+    globals()["run_capture"] = lambda *a, **kw: (0, "SMB 10.0.0.1 445 WIN [+] WIN\\admin:pw (Guest)")
+    try:
+        _ok_gm, _pwn_gm, _so_gm, _sh_gm = _nxc_try_cred("FAKE_NXC", "smb", "10.0.0.1", "admin", "pw", False, False, 445, 445)
+    finally:
+        globals()["run_capture"] = _real_rc_gm
+    assert _ok_gm is False and _pwn_gm is False, (_ok_gm, _pwn_gm)
+    # #46: _cc_nxc — una credencial REAL por defecto mapeada a guest se anota como guest-mapping
+    # (media), NO como 'credencial por defecto válida', y no cuenta como hit.
+    globals()["run_capture"] = lambda *a, **kw: (0, "SMB 10.0.0.1 445 WIN [+] WIN\\administrator:Password123 (Guest)")
+    try:
+        _cc_gm = _fp("smb", "SMB", [445])
+        _cc_hit = _cc_nxc(_cc_gm, "FAKE_NXC", "smb", "10.0.0.1", [("administrator", "Password123", "administrator:Password123")])
+    finally:
+        globals()["run_capture"] = _real_rc_gm
+    assert _cc_hit is None, _cc_hit
+    assert any("guest-mapping" in t for _s, t in _cc_gm["findings"]), _cc_gm["findings"]
+    assert not any("credencial por defecto válida" in t for _s, t in _cc_gm["findings"]), _cc_gm["findings"]
+    # #17: nxc_auth — 'Administrator' mapeado a guest no se reporta como 'sesión válida vía
+    # Administrator' (null/guest fallan en este fixture para forzar llegar a Administrator).
+    def _fake_na_gm(cmd, timeout=None, **kw):
+        u = cmd[cmd.index("-u") + 1]
+        if u == "Administrator":
+            return 0, "SMB 10.0.0.1 445 WIN [+] WIN\\Administrator: (Guest)"
+        return 1, f"SMB 10.0.0.1 445 WIN [-] WIN\\{u or 'anon'}: STATUS_LOGON_FAILURE"
+    globals()["run_capture"] = _fake_na_gm
+    try:
+        _na_gm = _fp("smb", "SMB", [445])
+        _na = nxc_auth("FAKE_NXC", "smb", "10.0.0.1", _na_gm)
+    finally:
+        globals()["run_capture"] = _real_rc_gm
+    assert _na is None, _na
+    assert not any("sesión válida" in t and "Administrator" in t for _s, t in _na_gm["findings"]), _na_gm["findings"]
 
     # Regresión con ruido REAL capturado contra un objetivo: el módulo SSH de nxc (bug
     # conocido de paramiko, NetExec#312) mete líneas 'ERROR Internal Paramiko error for
