@@ -1337,6 +1337,12 @@ def run_ffuf(url, wordlist, outfile, scheme, extra, stealth=False, proxy=None, f
     cmd += ["-fs", str(fs)] if fs is not None else ["-ac"]
     if stealth:
         cmd += ["-t", "5", "-p", "0.5-1.5", "-maxtime", "1800", "-H", f"User-Agent: {_STEALTH_UA}"]
+    elif TUNNEL:
+        # Sobre un túnel/pivot (SOCKS) '-t 40' satura la conexión (el propio banner-grabbing baja a
+        # 4 sockets por esto): las peticiones de ffuf expiran y el set de resultados PARCIAL se
+        # escribía como completo (complaint #2 del operador, #7). Menos hilos y más margen por
+        # petición; sin el jitter de stealth, que aquí no hace falta.
+        cmd += ["-t", "8", "-maxtime", "1200"]
     else:
         cmd += ["-t", "40", "-maxtime", "600"]
     if proxy:
@@ -1344,7 +1350,7 @@ def run_ffuf(url, wordlist, outfile, scheme, extra, stealth=False, proxy=None, f
     cmd += extra
     if scheme == "https":
         cmd.append("-k")
-    run(cmd, timeout=2100 if stealth else 900, outfile=outfile, quiet_stdout=True)
+    run(cmd, timeout=2100 if (stealth or TUNNEL) else 900, outfile=outfile, quiet_stdout=True)
     try:
         return json.loads(Path(outfile).read_text()).get("results", [])
     except (OSError, json.JSONDecodeError):
@@ -1428,32 +1434,49 @@ def fuzz_vhost(ip, p, domain, wordlist, webdir, stealth=False, proxy=None):
     return out
 
 
-def _mirror_map(webs, root_redirect):
+def _mirror_map(webs, root_redirect, targets=()):
     """{puerto_http_espejo: puerto_https_destino} para los puertos HTTP cuya raíz redirige
-    permanentemente a HTTPS (el clásico sitio servido en 80 y 443: 80 solo reenvía a 443).
-    Puro: `root_redirect(p)` devuelve la cabecera Location (o '') de la raíz de ese puerto
-    → testable sin red."""
-    https_ports = sorted(p["port"] for p in webs if web_scheme(p) == "https")
+    permanentemente a su versión HTTPS DEL MISMO SITIO (el clásico 80→443).
+
+    Solo se considera espejo si la cabecera Location apunta al MISMO host del objetivo (su
+    ip/hostname, o una URL sin host/relativa) Y a un puerto que de verdad está abierto como https
+    web. Una redirección a OTRO host (p. ej. un SSO/login externo) NO descarta el puerto: es otra
+    aplicación y hay que footprintearla/fuzzearla igual — antes CUALQUIER 'https://…' en la raíz
+    marcaba el puerto como espejo de 443 y lo quitaba del footprint y del fuzzing, perdiéndose toda
+    su superficie (.git/.env/paneles) y etiquetándolo mal como 'mismo sitio' (#5). El destino se
+    toma del puerto de la URL (no un 443 fijo), para no mapear a un puerto https equivocado.
+
+    `targets`: identidades del objetivo (ip + hostnames) para comparar el host de la redirección.
+    `root_redirect(p)` devuelve la Location (o '') de la raíz de ese puerto. Puro → testable."""
+    https_ports = {p["port"] for p in webs if web_scheme(p) == "https"}
     if not https_ports:
         return {}
-    tgt = 443 if 443 in https_ports else https_ports[0]
+    tset = {str(t).lower() for t in targets if t}
     mirrors = {}
     for p in webs:
         if web_scheme(p) == "https":
             continue
-        if (root_redirect(p) or "").lower().startswith("https://"):
-            mirrors[p["port"]] = tgt
+        m = re.match(r"https://([^/:\s]*)(?::(\d+))?", (root_redirect(p) or "").strip(), re.I)
+        if not m:
+            continue
+        host = m.group(1).lower()
+        if host and host not in tset:   # redirige a OTRO host → otra app, NO es espejo
+            continue
+        dst = int(m.group(2)) if m.group(2) else 443
+        if dst not in https_ports:      # el destino no es un https web abierto → no descartar
+            continue
+        mirrors[p["port"]] = dst
     return mirrors
 
 
-def primary_web_ports(ip, webs):
+def primary_web_ports(ip, webs, hostnames=()):
     """Separa los puertos web a procesar a fondo (primarios) de los ESPEJO (un HTTP que
-    solo redirige a su versión HTTPS). Así el fuzzing/crawl del MISMO sitio no se hace dos
-    veces (80 y 443). Devuelve (primarios, {puerto_espejo: puerto_destino})."""
+    solo redirige a su versión HTTPS del mismo sitio). Así el fuzzing/crawl del MISMO sitio no se
+    hace dos veces (80 y 443). Devuelve (primarios, {puerto_espejo: puerto_destino})."""
     def redir(p):
         st, hdrs, _ = _http_get(f"{web_scheme(p)}://{ip}:{p['port']}/", follow=False)
         return hdrs.get("location", "") if st in (301, 302, 307, 308) else ""
-    mirrors = _mirror_map(webs, redir)
+    mirrors = _mirror_map(webs, redir, [ip] + list(hostnames))
     return [p for p in webs if p["port"] not in mirrors], mirrors
 
 
@@ -10382,6 +10405,18 @@ def selftest():
     assert is_web(fake(name="http", port=8080))
     assert is_web(fake(name="unknown", port=3000))       # puerto web típico (dev server) sin fingerprint de nmap → web
     assert not is_web(fake(name="unknown", port=2222))   # puerto no web desconocido → NO se fuzzea
+    # #7: bajo TUNNEL, ffuf baja la concurrencia (-t 8, no -t 40) para no saturar el pivot ni
+    # devolver resultados parciales como completos.
+    _real_run_ff, _real_tunnel_ff, _ff_cmd = globals()["run"], TUNNEL, {}
+    def _cap_run(cmd, timeout=None, outfile=None, quiet_stdout=False, **kw):
+        _ff_cmd["cmd"] = cmd
+    globals()["run"], globals()["TUNNEL"] = _cap_run, True
+    try:
+        run_ffuf("http://x/FUZZ", "/tmp/wl", "/tmp/out.json", "http", [])
+    finally:
+        globals()["run"], globals()["TUNNEL"] = _real_run_ff, _real_tunnel_ff
+    assert _ff_cmd["cmd"][_ff_cmd["cmd"].index("-t") + 1] == "8", _ff_cmd["cmd"]
+    assert "40" not in _ff_cmd["cmd"], _ff_cmd["cmd"]
     # detección de IIS para el mini-recon web
     assert _is_iis(fake(product="Microsoft IIS httpd", version="10.0"))
     assert _is_iis(fake(name="http", **{"http-headers": "X-Powered-By: ASP.NET"}))
@@ -13365,11 +13400,16 @@ def selftest():
     _vh_sig = {"real.x": (200, 120, "A"), "catch.x": (301, 20, "B")}
     assert _drop_catchall(_vh_hits, (301, 20, "B"), lambda h: _vh_sig[h["host"]]) == [{"host": "real.x"}]
     assert _drop_catchall(_vh_hits, (None, 0, ""), lambda h: _vh_sig[h["host"]]) == _vh_hits  # sin baseline: no filtra
-    # dedup web: un HTTP que redirige a HTTPS es espejo de 443; sin puerto https no colapsa
+    # dedup web (#5): un HTTP que redirige a la HTTPS DEL MISMO host/puerto abierto es espejo; a
+    # OTRO host (SSO externo) o a un puerto https que no está abierto NO lo es (se conserva el puerto).
     _wm = [fake(name="http", port=80), fake(name="https", port=443)]
-    assert _mirror_map(_wm, lambda p: "https://x/" if p["port"] == 80 else "") == {80: 443}
-    assert _mirror_map(_wm, lambda p: "") == {}
-    assert _mirror_map([fake(name="http", port=80)], lambda p: "https://x/") == {}
+    assert _mirror_map(_wm, lambda p: "https://tgt/" if p["port"] == 80 else "", ["tgt"]) == {80: 443}
+    assert _mirror_map(_wm, lambda p: "", ["tgt"]) == {}
+    assert _mirror_map([fake(name="http", port=80)], lambda p: "https://tgt/", ["tgt"]) == {}   # sin https abierto
+    assert _mirror_map(_wm, lambda p: "https://sso.vendor.com/login" if p["port"] == 80 else "", ["tgt"]) == {}   # otro host
+    assert _mirror_map(_wm, lambda p: "https://tgt:9443/" if p["port"] == 80 else "", ["tgt"]) == {}   # puerto no abierto
+    _wm3 = [fake(name="http", port=80), fake(name="https", port=8443)]
+    assert _mirror_map(_wm3, lambda p: "https://tgt:8443/" if p["port"] == 80 else "", ["tgt"]) == {80: 8443}
     # heurística de criticidad
     assert _exploit_severity("Remote Code Execution", "remote") == "critica"
     assert _exploit_severity("Local Privilege Escalation", "local") == "alta"
@@ -15767,7 +15807,8 @@ def run_one(ip, name, args, folder=None):
     # siquiera lo hacía: footprinteaba (y, peor, le lanzaba nikto/nuclei/wpscan/katana
     # a) CADA puerto espejo por separado — el mismo sitio, hasta 2-4 veces.
     webs = [p for p in services if is_web(p)]
-    webs_fp, web_mirrors = primary_web_ports(ip, webs) if webs else (webs, {})
+    _web_targets = [h for h in (name, getattr(args, "vhost", None)) if h]
+    webs_fp, web_mirrors = primary_web_ports(ip, webs, _web_targets) if webs else (webs, {})
     for _mp, _tgt in web_mirrors.items():
         info(f":{_mp} redirige a :{_tgt} (mismo sitio) → footprint/fuzzing/vhost solo en :{_tgt}, no lo duplico")
     webs_fuzz = webs_fp   # mismo conjunto deduplicado; el fuzzing de más abajo lo reutiliza tal cual
@@ -16117,8 +16158,10 @@ def run_one(ip, name, args, folder=None):
 
                 # ffuf corre en modo silencioso (-s): fuzzear VARIOS puertos web del mismo
                 # objetivo a la vez no ensucia la pantalla y ahorra tiempo. En --stealth NO
-                # (su gracia es ir despacio y de uno en uno), y con 1 solo puerto tampoco.
-                if args.stealth or len(webs_fuzz) <= 1:
+                # (su gracia es ir despacio y de uno en uno), con 1 solo puerto tampoco, y bajo
+                # --tunnel TAMPOCO: N puertos × hilos de ffuf a la vez sobre-suscriben el pivot y
+                # devuelven resultados parciales (#7) — mejor secuencial (run_ffuf ya baja hilos).
+                if args.stealth or TUNNEL or len(webs_fuzz) <= 1:
                     for p in webs_fuzz:
                         _fuzz_one_port(p)
                 else:
