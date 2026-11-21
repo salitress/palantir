@@ -9735,6 +9735,18 @@ def _h(s):
     return html.escape(str(s))
 
 
+def _fmt_size(length):
+    """Celda 'Tamaño' de las tablas web: 'N b' si length es numérico; 'n/d' si es el placeholder '-'
+    de --vhost-names (host dado a mano, aún no confirmado por una petición) o algo no numérico —
+    antes salía '- b', confuso (#2). Puro → testeable sin red."""
+    if length is None or length in ("", "-"):
+        return "n/d"
+    try:
+        return f"{int(length)} b"
+    except (TypeError, ValueError):
+        return _h(str(length))
+
+
 def _copy_btn(cmd):
     """Botón ⧉ que copia `cmd` al portapapeles (el texto va en data-cmd, escapado para
     el atributo; el JS del informe lo lee). Así no hay que seleccionar a mano comandos
@@ -9907,11 +9919,17 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
         ver = version_str(p)
         unk = not p["name"] or p["name"] in ("unknown", "tcpwrapped") or not ver
         cls = "svc-unk" if unk else "svc-open"
+        # Columna de estado: 'open|filtered' (UDP que el host no confirmó) se distingue en amarillo de
+        # un 'open' real (verde), para que no se lea como un servicio confirmado — _confirmed_open ya
+        # lo excluye del footprinting/creds, ahora también se ve en la tabla (#3).
+        st = p.get("state") or "open"
+        st_cls = "svc-open" if _confirmed_open(p) else "svc-unk"
         rows.append(
             f'<tr><td class="p">{p["port"]}/{p["proto"]}</td>'
+            f'<td class="{st_cls}">{_h(st)}</td>'
             f'<td class="{cls}">{_h(p["name"] or "?")}</td>'
             f'<td>{_h(ver)}</td><td class="miss">{_h(p.get("banner",""))}</td></tr>')
-    ports_tbl = ('<table><tr><th>Puerto</th><th>Servicio</th><th>Versión</th><th>Banner</th></tr>'
+    ports_tbl = ('<table><tr><th>Puerto</th><th>Estado</th><th>Servicio</th><th>Versión</th><th>Banner</th></tr>'
                  + "".join(rows) + "</table>")
 
     fp_html, fp_toc = [], []
@@ -9963,16 +9981,28 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
             titulo = f"Puerto {key} — directorios" if isinstance(key, int) else f"vhost {_h(key)} — directorios"
             rws = "".join(
                 f'<tr><td class="p">{_h(h["status"])}</td><td>/{_h(h["path"])}</td>'
-                f'<td class="miss">{_h(h.get("length",""))} b</td></tr>'
-                for h in sorted(hits, key=lambda x: -(x["length"] or 0))[:80])
+                f'<td class="miss">{_fmt_size(h.get("length"))}</td></tr>'
+                for h in sorted(hits, key=lambda x: -(x["length"] if isinstance(x.get("length"), int) else 0))[:80])
             parts.append(f"<h3>{titulo}</h3>"
                          f"<table><tr><th>Código</th><th>Ruta</th><th>Tamaño</th></tr>{rws}</table>")
+        # Fusiona por dominio antes de pintar: la Fase 7 puede añadir (dom, vh) DOS veces para el
+        # mismo dominio (pre-check de crt.sh + pasada con wordlist), lo que generaba dos tablas
+        # '<h3>vhosts (dom)</h3>' idénticas en cabecera (#1). Dedup de filas por (host, status, length).
+        _merged_vh = {}
         for host_name, vh in vhosts:
-            rws = "".join(f'<tr><td class="p">{_h(v["status"])}</td><td>{_h(v["host"])}</td>'
-                          f'<td class="miss">{_h(v.get("length",""))} b</td></tr>' for v in vh)
-            if rws:
+            _merged_vh.setdefault(host_name, []).extend(vh)
+        for host_name, vh in _merged_vh.items():
+            _seen_vh, _vrows = set(), []
+            for v in vh:
+                _k = (v.get("host"), v.get("status"), v.get("length"))
+                if _k in _seen_vh:
+                    continue
+                _seen_vh.add(_k)
+                _vrows.append(f'<tr><td class="p">{_h(v["status"])}</td><td>{_h(v["host"])}</td>'
+                              f'<td class="miss">{_fmt_size(v.get("length"))}</td></tr>')
+            if _vrows:
                 parts.append(f"<h3>vhosts ({_h(host_name)})</h3>"
-                             f"<table><tr><th>Código</th><th>Host</th><th>Tamaño</th></tr>{rws}</table>")
+                             f"<table><tr><th>Código</th><th>Host</th><th>Tamaño</th></tr>{''.join(_vrows)}</table>")
         if parts:
             web_html = ('<details class="proto" id="sec-web"><summary>Fuzzing web / vhosts</summary>'
                         f'<div class="body">{"".join(parts)}</div></details>')
@@ -9998,7 +10028,10 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
                 f'<span class="miss">({pstr} · término: {_h(v["term"])})</span></h3>'
                 f'<table><tr><th>Criticidad</th><th>EDB-ID</th><th>Título</th><th>Plataforma</th></tr>'
                 f'{trs}</table>{more}')
-        n = sum(len(v["exploits"]) for v in rows_v)
+        # Cuenta EDB-IDs DISTINTOS, no apariciones por-producto: searchsploit casa por título+ruta,
+        # así que un mismo EDB-ID puede listarse bajo varios términos de producto y la pill/TOC
+        # sobre-contaban (#4). Puede haber un EDB sin id ('') → se cuenta por (edb o título).
+        n = len({(e.get("edb") or e.get("title")) for v in rows_v for e in v["exploits"]})
         vuln_html = (
             '<details class="proto" id="sec-vulns"><summary>Exploits conocidos (searchsploit) '
             f'<span class="pill">{n}</span></summary><div class="body">'
@@ -10065,7 +10098,7 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
     # (esté colapsado o no) y hace scroll suave hasta él.
     toc = [("sec-ports", "Puertos", len(services))] + fp_toc
     if vuln_html:
-        toc.append(("sec-vulns", "Exploits (EDB)", sum(len(v["exploits"]) for v in rows_v)))
+        toc.append(("sec-vulns", "Exploits (EDB)", len({(e.get("edb") or e.get("title")) for v in rows_v for e in v["exploits"]})))
     if web_html:
         toc.append(("sec-web", "Fuzzing web/vhosts", None))
     if host_html:
@@ -10222,13 +10255,21 @@ def build_markdown(ip, services, host, footprints, vulns, domains, web_hits, vho
             for h in sorted(hits, key=lambda x: -(x["length"] or 0))[:40]:
                 L.append(f"- `{h['status']}` /{h['path']} ({h['length']} b)")
             L.append("")
+        _md_vh = {}   # fusiona por dominio (crt.sh + wordlist) → una sola sección por dominio (#1)
         for hn, vh in vhosts:
-            if not vh:
-                continue
-            L.append(f"### vhosts ({hn})")
+            _md_vh.setdefault(hn, []).extend(vh)
+        for hn, vh in _md_vh.items():
+            _seen, _rows = set(), []
             for v in vh:
-                L.append(f"- `{v['status']}` {v['host']} ({v.get('length', '')} b)")
-            L.append("")
+                _k = (v.get("host"), v.get("status"), v.get("length"))
+                if _k in _seen:
+                    continue
+                _seen.add(_k)
+                _rows.append(f"- `{v['status']}` {v['host']} ({_fmt_size(v.get('length'))})")   # 'n/d' no '- b' (#2)
+            if _rows:
+                L.append(f"### vhosts ({hn})")
+                L += _rows
+                L.append("")
 
     L += ["---", "_palantir.py · uso solo en objetivos autorizados (labs HTB/CPTS)_"]
     return "\n".join(L)
@@ -13722,6 +13763,23 @@ def selftest():
     assert "Quick wins" in doc   # fprs tiene un hallazgo 'alta' → debe salir la caja
     assert 'class="tip"' in doc and "NETLOGON" in doc   # "share READ" trae su tip (qué hacer A MANO)
     assert "WHOIS" in doc and "registrador: Foo" in doc   # footprint con ports=[] (fp_whois/fp_ctlogs) también sale
+    # #2: _fmt_size → 'n/d' para el placeholder '-'/vacío; 'N b' para numéricos.
+    assert _fmt_size("-") == "n/d" and _fmt_size("") == "n/d" and _fmt_size(None) == "n/d"
+    assert _fmt_size(0) == "0 b" and _fmt_size(1234) == "1234 b"
+    # #1/#2/#3/#4 en build_html: vhosts duplicados por dominio, length '-', UDP open|filtered y un
+    # EDB compartido entre dos filas de producto.
+    _ports34 = [{"port": 445, "proto": "tcp", "state": "open", "name": "microsoft-ds", "product": "", "version": "", "extrainfo": "", "tunnel": "", "banner": "", "scripts": {}},
+                {"port": 161, "proto": "udp", "state": "open|filtered", "name": "snmp", "product": "", "version": "", "extrainfo": "", "tunnel": "", "banner": "", "scripts": {}}]
+    _edb = {"edb": "999", "sev": "alta", "title": "X", "path": "/a", "platform": "linux", "type": "webapps"}
+    _vln34 = [{"ports": [80], "service": "http", "product": "Foo", "version": "1", "term": "Foo", "exploits": [dict(_edb)]},
+              {"ports": [80], "service": "http", "product": "Foo lib", "version": "1", "term": "Foo lib", "exploits": [dict(_edb)]}]
+    _vh34 = [("x.htb", [{"host": "a.x.htb", "status": 200, "length": 10}]),
+             ("x.htb", [{"host": "b.x.htb", "status": 200, "length": "-"}])]
+    _doc34 = build_html("1.2.3.4", _ports34, {}, [], _vln34, ["x.htb"], {}, _vh34, None, "2026-01-01 00:00")
+    assert _doc34.count("vhosts (x.htb)") == 1, "vhosts del mismo dominio deben fusionarse (#1)"
+    assert "- b</td>" not in _doc34 and "n/d" in _doc34                 # #2: placeholder como n/d, no '- b'
+    assert "<th>Estado</th>" in _doc34 and "open|filtered" in _doc34    # #3: columna de estado
+    assert 'Exploits conocidos (searchsploit) <span class="pill">1</span>' in _doc34, "pill de exploits debe contar EDB distintos (#4)"
 
     # Informe PRELIMINAR (pre-fuzzing): banner + meta-refresh solo con preliminary=True
     doc_pre = build_html("10.10.10.10", ports, host, fprs, vlns, ["inlanefreight.htb"],
