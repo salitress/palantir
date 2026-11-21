@@ -2001,6 +2001,14 @@ def _adidnsdump_bin():
     return _bin_with_sudo_fallback(("adidnsdump",), home_dirs=(".local/bin",))
 
 
+def _bloodyad_bin():
+    """bloodyAD (CravateRouge/bloodyAD): no es paquete apt → pipx/pip install bloodyAD. Solo se
+    SUGIERE en next-steps (abuso de ACLs de Fase 5d: meterse en Domain Admins por GenericAll/
+    WriteDACL/WriteOwner, DCSync…) — palantir NUNCA lo ejecuta (modifica el objetivo). Mismo
+    fallback de sudo (.local/bin de pipx) que certipy/adidnsdump."""
+    return _bin_with_sudo_fallback(("bloodyAD",), home_dirs=(".local/bin",))
+
+
 def _impacket_suggest_bin(script):
     """Mejor nombre para SUGERIR un script de ejemplo de impacket que palantir nunca ejecuta él
     mismo (GetNPUsers/GetUserSPNs, de momento — solo aparece en 'next', para que el operador lo
@@ -14034,6 +14042,10 @@ def _install_adidnsdump():
     return _install_pip_pkg("adidnsdump")
 
 
+def _install_bloodyad():
+    return _install_pip_pkg("bloodyAD")
+
+
 def _install_brutespray():
     """Binario precompilado de la última release de x90skysn3k/brutespray — igual que
     crt.sh (no kerbrute): el asset SÍ lleva la versión en el nombre, confirmado contra el
@@ -14123,6 +14135,7 @@ _FETCHABLE_RESOURCES = {
     "creds":      {"fetch": _install_creds,
                    "source": "paquete 'defaultcreds-cheat-sheet' de PyPI (pipx/pip)"},
     "adidnsdump": {"fetch": _install_adidnsdump, "source": "paquete 'adidnsdump' de PyPI (pipx/pip)"},
+    "bloodyAD":   {"fetch": _install_bloodyad, "source": "paquete 'bloodyAD' de PyPI (pipx/pip)"},
     # mongosh NO está aquí a propósito: "npm install -g" necesita sudo si no hay privilegio
     # (como apt), pero bajo sudo el PATH restringido de root probablemente no ve el npm de
     # un Node instalado por nvm (el mismo problema de fondo que ya forzó a crear
@@ -14178,6 +14191,7 @@ TOOL_PKGS = {
     "smtp-user-enum":   ("smtp-user-enum", "SMTP: enum de usuarios por RCPT con --aggressive si hay dominio (VRFY/EXPN suelen estar capados)", ("foot",)),
     "impacket-secretsdump": ("impacket-scripts", "AD: con una credencial de dominio ya validada, confirma derechos DCSync volcando SOLO el hash de krbtgt (no el NTDS completo) — Fase 5d", ("creds",)),
     "adidnsdump":       (None, "AD: vuelca DNS interno del dominio vía LDAP con una credencial ya validada (más fiable que AXFR si la zona no transfiere) — Fase 5d (no está en apt → pip/pipx install adidnsdump)", ("creds",)),
+    "bloodyAD":         (None, "AD: abuso de ACLs (meterse en Domain Admins por GenericAll/WriteDACL/WriteOwner, DCSync…) — comandos SUGERIDOS por la auditoría de ACLs de Fase 5d; palantir no lo ejecuta (no está en apt → pipx install bloodyAD)", ("creds",)),
     "seclists":         ("seclists", "wordlists de descubrimiento (directorios/ficheros web, subdominios DNS, community SNMP, usuarios) usadas en casi todas las fases", ("foot", "fuzz", "creds")),
     "jsmith.txt":       (None, "AD: wordlist de nombres de empleado realistas para el userenum de kerbrute (Fase 5) — no está en seclists ni en apt, ver _JSMITH_USERLISTS", ("foot",)),
 }
@@ -14203,6 +14217,8 @@ def _tool_present(tool):
         return _secretsdump_bin() is not None
     if tool == "adidnsdump":
         return _adidnsdump_bin() is not None
+    if tool == "bloodyAD":
+        return _bloodyad_bin() is not None
     if tool == "brutespray":
         return brutespray_bin() is not None
     if tool == "seclists":

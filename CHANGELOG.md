@@ -10,6 +10,10 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `bloodyAD` is now a known tool: it shows up in `--check-tools` and `--install-missing` installs
+  it (`pipx install bloodyAD`), like certipy/adidnsdump. palantir never runs it — it's only
+  suggested by the ACL audit's abuse next-steps — but now the operator can have it ready in one
+  step instead of hitting a "command not found" when they go to use the suggestion.
 - **Abusable-ACL audit with a provided credential — a "one-question BloodHound"** for the single
   highest-value question: does *this* credential already have a direct path to Domain Admin
   through a misconfigured ACL, without standing up BloodHound/Neo4j? Using `nxc -M daclread`
