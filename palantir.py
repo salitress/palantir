@@ -3521,16 +3521,22 @@ def fp_snmp(ip, ports, services, host, deep):
 def fp_redis(ip, ports, services, host, deep):
     res = _fp("redis", "Redis", [p["port"] for p in ports])
     if have("redis-cli"):
-        rc, out = run_capture(["redis-cli", "-h", ip, "INFO", "server"], timeout=20)
-        _step(res, f"redis-cli -h {ip} INFO server", rc == 0, out, note="acceso sin autenticar")
-        if out and "redis_version" in out:
-            res["findings"].append(("alta", "Redis: accesible SIN autenticación (INFO respondió)"))
-            res["next"] += [
-                f"redis-cli -h {ip} CONFIG GET dir   # ruta de trabajo (abuso RCE vía webshell/SSH key)",
-                f"redis-cli -h {ip} --scan   # volcar claves",
-            ]
-        elif "NOAUTH" in out:
-            res["findings"].append(("info", "Redis: requiere contraseña (NOAUTH)"))
+        # Loop por puerto con '-p': sin él, redis-cli iba siempre a 6379 y un Redis en otro puerto
+        # (6380, o reenviado) se daba por cerrado y el 'accesible SIN autenticación' se perdía
+        # (bug #37). Severidad 'critica' para alinear con cc_redis (Fase 5c), que detecta lo mismo
+        # con PING→PONG: antes fp_redis decía 'alta' y cc_redis 'critica' para el MISMO hecho.
+        for p in ports:
+            port = p["port"]
+            rc, out = run_capture(["redis-cli", "-h", ip, "-p", str(port), "INFO", "server"], timeout=20)
+            _step(res, f"redis-cli -h {ip} -p {port} INFO server", rc == 0, out, note="acceso sin autenticar")
+            if out and "redis_version" in out:
+                res["findings"].append(("critica", f"Redis {port}: accesible SIN autenticación (INFO respondió)"))
+                res["next"] += [
+                    f"redis-cli -h {ip} -p {port} CONFIG GET dir   # ruta de trabajo (abuso RCE vía webshell/SSH key)",
+                    f"redis-cli -h {ip} -p {port} --scan   # volcar claves",
+                ]
+            elif "NOAUTH" in out:
+                res["findings"].append(("info", f"Redis {port}: requiere contraseña (NOAUTH)"))
     else:
         res["missing"].append("redis-cli (redis-tools)")
     for lbl, txt in _nse_for(services, host, ("redis",)):
@@ -3774,11 +3780,17 @@ def fp_vnc(ip, ports, services, host, deep):
     res = _fp("vnc", "VNC", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
-        rc, out = run_capture([nxc, "vnc", ip], timeout=40)
-        _step(res, f"{nxc} vnc {ip}", rc == 0, out,
-              note="¿el VNC acepta conexión sin autenticación? (nxc prueba el puerto 5900 por defecto)")
-        if re.search(r"\(Pwn3d!\)|No Authentication|without password", out, re.I):
-            res["findings"].append(("critica", "VNC: posible acceso remoto gráfico SIN autenticación"))
+        # Loop por puerto + '--port': nxc vnc solo prueba 5900 por defecto, así que un VNC en el
+        # display :1+ (5901-5906) se saltaba y el 'acceso SIN autenticación' se perdía (bug #38).
+        # Tokens REALES de nxc (nxc/protocols/vnc.py): banner ' (No Auth:True)' / login '(Pwn3d!)'
+        # — "No Authentication"/"without password" NO existen en su salida (regex muerta, #48).
+        for p in ports:
+            cmd = [nxc, "vnc", ip, "--port", str(p["port"])]
+            rc, out = run_capture(cmd, timeout=40)
+            _step(res, shlex.join(cmd), rc == 0, out,
+                  note="¿el VNC acepta conexión sin autenticación? (nxc)")
+            if re.search(r"\(Pwn3d!\)|No Auth:\s*True", out, re.I):
+                res["findings"].append(("critica", f"VNC {p['port']}: posible acceso remoto gráfico SIN autenticación"))
     else:
         res["missing"].append("nxc/netexec")
     res["next"].append(f"vncviewer {ip}::PUERTO   # conectar (prueba cada puerto VNC abierto)")
@@ -5394,7 +5406,15 @@ IPMI_CREDS = [("ADMIN", "ADMIN", "Supermicro"), ("root", "calvin", "Dell iDRAC")
               ("Administrator", "Administrator", "genérico")]
 
 # Puerto por defecto de cada protocolo nxc (para añadir --port solo si difiere).
-_NXC_DEFAULT_PORT = {"ssh": 22, "ftp": 21, "mssql": 1433, "rdp": 3389, "winrm": 5985, "vnc": 5900}
+# Puerto por defecto que nxc usa para cada protocolo (para emitir '--port' SOLO cuando el real
+# difiere, vía `if port and dp and port != dp`). smb(445)/ldap(389) FALTABAN: sin ellos dp=None,
+# el '--port' nunca se añadía y un SMB/LDAP en puerto no estándar (139-only, o reenviado por el
+# túnel a otro puerto) se confirmaba/rociaba contra 445/389 y la credencial válida se perdía
+# (bug #3). '--port' verificado en el fuente de NetExec (nxc/protocols/{smb,ldap}/proto_args.py:
+# default=445 y default=389). wmi NO se incluye: su --port es choices={135} (solo 135), así que
+# emitir cualquier otro lo rechazaría — y WMI es siempre 135 (endpoint mapper RPC).
+_NXC_DEFAULT_PORT = {"ssh": 22, "ftp": 21, "mssql": 1433, "rdp": 3389, "winrm": 5985, "vnc": 5900,
+                     "smb": 445, "ldap": 389}
 
 
 def _cc_res(proto, title, ports):
@@ -5509,7 +5529,11 @@ def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None):
             res["findings"].append((_psev, f"{nxc_proto.upper()}: «{lbl}» {_pcl}"))
             return (u, p, lbl)
         if ok and hit is None:
-            anon = p == "" and u.lower() in ("", "guest", "anonymous")
+            # FTP anónimo usa contraseña NO vacía por convención ('anonymous@...'), así que el test
+            # genérico de anon (contraseña vacía) lo clasificaba como 'credencial por defecto válida'
+            # (alta) en vez de acceso anónimo (media), incoherente con null/guest de SMB/LDAP (#50).
+            anon = (p == "" and u.lower() in ("", "guest", "anonymous")) or \
+                   (nxc_proto == "ftp" and u.lower() == "anonymous")
             if guest and not anon:
                 # guest-mapping (map to guest = Bad User): el servidor desvía a guest una credencial
                 # REAL por defecto (p. ej. administrator/Password123) y nxc la marca (Guest). NO es un
@@ -5614,7 +5638,11 @@ def cc_vnc(ip, ports, deep):
             ok = _nxc_ok(out)
             _step(res, shlex.join(cmd), ok, out,
                   note="¿VNC acepta conexión sin autenticación o con contraseña por defecto?")
-            if re.search(r"\(Pwn3d!\)|No Authentication|without password", out, re.I):
+            # Tokens REALES de nxc vnc (verificado en nxc/protocols/vnc.py): el banner marca
+            # ' (No Auth:True)' cuando el security-type es 1 (sin auth), y un login sin credencial
+            # exitoso imprime '(Pwn3d!)'. "No Authentication"/"without password" NO existen en la
+            # salida de nxc, así que la detección por banner estaba MUERTA (bug #48).
+            if re.search(r"\(Pwn3d!\)|No Auth:\s*True", out, re.I):
                 res["findings"].append(("critica", f"VNC {p['port']}: acceso gráfico SIN autenticación"))
     else:
         res["missing"].append("nxc/netexec")
@@ -10652,6 +10680,59 @@ def selftest():
         globals()["run_capture"] = _real_rc_gm
     assert _na is None, _na
     assert not any("sesión válida" in t and "Administrator" in t for _s, t in _na_gm["findings"]), _na_gm["findings"]
+
+    # ── Puerto incorrecto / falta --port ────────────────────────────────────────────────────────
+    # #3: _NXC_DEFAULT_PORT tiene smb/ldap → se emite '--port' cuando el real difiere del por
+    # defecto (verificado contra nxc proto_args: smb default=445, ldap default=389). Antes dp=None
+    # para smb y '--port' nunca salía → un SMB 139-only se confirmaba contra 445 y se perdía.
+    assert _NXC_DEFAULT_PORT["smb"] == 445 and _NXC_DEFAULT_PORT["ldap"] == 389
+    assert "wmi" not in _NXC_DEFAULT_PORT   # wmi es choices={135}: no se incluye
+    _cs_cmd = {}
+    def _fake_cs_rc(cmd, timeout=None, **kw):
+        _cs_cmd["cmd"] = cmd
+        return 0, "SMB 10.0.0.1 139 WIN [+] WIN\\u:p"
+    globals()["run_capture"] = _fake_cs_rc
+    try:
+        _nxc_confirm_smb("FAKE_NXC", "10.0.0.1", "u", "p", 139, _NXC_DEFAULT_PORT["smb"], False)
+    finally:
+        globals()["run_capture"] = _real_rc_gm
+    assert "--port" in _cs_cmd["cmd"] and "139" in _cs_cmd["cmd"], _cs_cmd["cmd"]
+
+    # #48/#38: fp_vnc/cc_vnc detectan el token REAL de nxc 'No Auth:True' (antes buscaban
+    # 'No Authentication'/'without password', que nxc NUNCA imprime → detección muerta) y pasan
+    # '--port' por cada puerto (antes fp_vnc solo probaba 5900 → se perdía VNC en 5901-5906).
+    _vnc_cmds, _real_nxc_bin_gm = [], nxc_bin
+    def _fake_vnc_rc(cmd, timeout=None, **kw):
+        _vnc_cmds.append(cmd)
+        return 0, "VNC 10.0.0.1 5901 HOST RFB 003.008 (No Auth:True)"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_vnc_rc
+    try:
+        _fv = fp_vnc("10.0.0.1", [{"port": 5901}], [{"port": 5901, "name": "vnc", "scripts": {}}], {}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin_gm, _real_rc_gm
+    assert any(s == "critica" and "5901" in t for s, t in _fv["findings"]), _fv["findings"]
+    assert any("--port" in c and "5901" in c for c in _vnc_cmds), _vnc_cmds
+
+    # #37: fp_redis pasa '-p <puerto>' (antes iba siempre a 6379 → Redis en otro puerto se perdía)
+    # y marca 'critica' (alineado con cc_redis; antes 'alta' para el MISMO hecho).
+    _real_have_r = globals()["have"]
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), (lambda *a, **k: (0, "# Server\r\nredis_version:7.0.0"))
+    try:
+        _fr = fp_redis("10.0.0.1", [{"port": 6380}], [{"port": 6380, "name": "redis", "scripts": {}}], {}, False)
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_r, _real_rc_gm
+    assert any(s == "critica" and "6380" in t for s, t in _fr["findings"]), _fr["findings"]
+
+    # #50: FTP anónimo (contraseña 'anonymous@...', no vacía) se puntúa como acceso anónimo (media),
+    # no como 'credencial por defecto válida' (alta) — coherente con null/guest de SMB/LDAP.
+    globals()["run_capture"] = lambda *a, **kw: (0, "FTP 10.0.0.1 21 HOST [+] anonymous:anonymous@palantir")
+    try:
+        _ftp_an = _fp("ftp", "FTP", [21])
+        _cc_nxc(_ftp_an, "FAKE_NXC", "ftp", "10.0.0.1", [("anonymous", "anonymous@palantir", "anónimo")])
+    finally:
+        globals()["run_capture"] = _real_rc_gm
+    assert any(s == "media" and "anónimo" in t for s, t in _ftp_an["findings"]), _ftp_an["findings"]
+    assert not any("credencial por defecto válida" in t for _s, t in _ftp_an["findings"]), _ftp_an["findings"]
 
     # Regresión con ruido REAL capturado contra un objetivo: el módulo SSH de nxc (bug
     # conocido de paramiko, NetExec#312) mete líneas 'ERROR Internal Paramiko error for
