@@ -8,6 +8,8 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-21
+
 ### Added
 
 - `bloodyAD` is now a known tool: it shows up in `--check-tools` and `--install-missing` installs
@@ -48,8 +50,6 @@ this project follows [Semantic Versioning](https://semver.org/).
   separately), so flagging it `alta` overstated it (flagged live). SMB/WinRM/RDP/MSSQL null
   sessions stay `alta` (shares/shell/direct access), and `Administrator` with a blank password
   stays `alta` on every protocol — that's never low-value.
-
-## [1.1.1] - 2026-11-20
 
 ### Fixed
 
