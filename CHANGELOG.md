@@ -8,8 +8,36 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Abusable-ACL audit with a provided credential — a "one-question BloodHound"** for the single
+  highest-value question: does *this* credential already have a direct path to Domain Admin
+  through a misconfigured ACL, without standing up BloodHound/Neo4j? Using `nxc -M daclread`
+  (filtered to the credential as the trustee, format confirmed against nxc's own source), on a DC
+  it now checks:
+  - **DCSync viability** — `DS-Replication-Get-Changes[-All]` over the domain head (`RIGHTS=DCSync`)
+    → critical: dump every hash (krbtgt included) without being an admin, with the exact
+    `impacket-secretsdump -just-dc` command.
+  - **Control over high-value groups** — `GenericAll` / `WriteDACL` / `WriteOwner` / `GenericWrite`
+    / `WriteProperties` / `Self` over Domain Admins, Enterprise Admins or Administrators → critical,
+    with the concrete abuse chain. The abuse commands use **bloodyAD** (`add groupMember`, and for
+    `WriteDACL`/`WriteOwner` the `add genericAll` / `set owner` chain), not `net rpc group addmem`:
+    bloodyAD goes over LDAP/NTLM and works against an IP, whereas `net rpc` tries Kerberos first and
+    fails with `Failed to connect to IPC$` against an IP target with no FQDN (confirmed live).
+    Pass-the-hash uses bloodyAD's `-p :<hash>`.
+
+  This is the gap a real assessment hit: `CT059` had `GenericAll` over Domain Admins and that was
+  the actual path to DA, but palantir had no way to see it on its own — it had to be found by hand
+  with BloodHound. Detection is read-only (daclread only *reads* the DACL); the abuse stays a
+  manual next-step, exactly like the Zerologon/noPac exploit suggestions.
+
 ### Changed
 
+- The WMI/SMB **RCE next-steps** (`impacket-wmiexec`, `nxc … -x`) now spell out that they need
+  **local admin** on the target, not just valid domain credentials — a standard domain account
+  gets `rpc_s_access_denied` / `STATUS_ACCESS_DENIED` (confirmed live: `CT059` authenticated fine
+  but `impacket-wmiexec` came back `rpc_s_access_denied` because it isn't admin on the DC). The
+  comment said "con credenciales válidas", which over-promised RCE.
 - A valid **anonymous (null/guest) session over WMI or LDAP** is now reported as `media`, not
   `alta`. On those two protocols an anonymous bind is common and low-value by itself (WMI can't
   query anything without privileges; an anonymous LDAP bind that can't read is already reported

