@@ -1109,8 +1109,13 @@ def host_discovery(sweep_specs, source_port=None):
     return _parse_sweep_up(out)
 
 
-def fast_ports(ip, nmapdir, min_rate, top, stealth=False, source_port=None, ports=None, tunnel=False):
-    prefix = str(nmapdir / "fast")
+def fast_ports(ip, nmapdir, min_rate, top, stealth=False, source_port=None, ports=None, tunnel=False, tag="fast"):
+    # `tag` nombra el .xml (fast.xml por defecto): los reintentos de run_one usan tags DISTINTOS
+    # ('fast_connect', 'fast_web') para que bajo --resume cada intento se cachee por separado — antes
+    # los tres compartían 'fast.xml', así que un --resume con un fast.xml vacío hacía que el reintento
+    # -sT y el de puertos web reutilizaran ese XML vacío (no re-escaneaban) mientras se imprimía un
+    # 'Reintento con -sT…' que nunca corría y se latcheaba CONNECT sin enviar un solo paquete (#13).
+    prefix = str(nmapdir / tag)
     cmd = ["nmap", scan_type(), "-Pn", "-n", "--open", "-oA", prefix]
     cmd += _fast_scan_timing(stealth, tunnel, min_rate)
     if source_port:
@@ -1400,11 +1405,13 @@ def fuzz_dirs(ip, p, wordlists, ext, webdir, stealth=False, proxy=None, hostname
     return list(hits.values())
 
 
-def _vhost_sig(ip, p, host):
+def _vhost_sig(ip, p, host, max_bytes=65536):
     """Firma (status, len, muestra) de la respuesta web para un `Host` dado. Distingue
     un vhost real del catch-all/comodín (responde IGUAL a cualquier Host). Comparable
-    dentro de una misma ejecución."""
-    st, _h, body = _http_get(f"{web_scheme(p)}://{ip}:{p['port']}/", host=host)
+    dentro de una misma ejecución. `max_bytes`: tope de lectura; para medir el tamaño que
+    usará ffuf en '-fs' hay que leer el cuerpo ENTERO (ffuf cuenta todos los bytes), no los
+    64 KiB por defecto — ver fuzz_vhost (#10)."""
+    st, _h, body = _http_get(f"{web_scheme(p)}://{ip}:{p['port']}/", host=host, max_bytes=max_bytes)
     return (st, len(body), body[:200])
 
 
@@ -1440,8 +1447,15 @@ def fuzz_vhost(ip, p, domain, wordlist, webdir, stealth=False, proxy=None):
     # lo que difiere del comodín) en vez de -ac. Luego el filtro por firma de abajo limpia
     # cualquier resto de comodín que el -fs no pillara (tamaños que no casan al byte).
     if not out:
-        base = _vhost_sig(ip, p, os.urandom(6).hex() + "." + domain)
-        if base[0] is not None:
+        # Mide el comodín con el cuerpo ENTERO (hasta 5 MB): ffuf cuenta todos los bytes en '-fs',
+        # así que un baseline truncado a 64 KiB daba un '-fs' equivocado que no casaba NINGUNA
+        # respuesta real → ffuf devolvía TODO como hit y _drop_catchall tenía que sondear cada uno
+        # (lento sobre el túnel, con falsos positivos en los que expiraban) (#10).
+        _CAP = 5_000_000
+        base = _vhost_sig(ip, p, os.urandom(6).hex() + "." + domain, max_bytes=_CAP)
+        # Solo se usa '-fs' si se pudo medir el tamaño REAL (no truncado): si ni con 5 MB cabe, se
+        # omite el reintento '-fs' (mejor sin él que con un tamaño equivocado que lo marca todo).
+        if base[0] is not None and base[1] < _CAP:
             out = _collect(run_ffuf(url, wordlist, outfile, scheme, hdr,
                                     stealth=stealth, proxy=proxy, fs=base[1]))
     # Guarda anti-comodín: aunque ffuf use -ac/-fs, un catch-all que redirige/sirve lo mismo
@@ -2451,7 +2465,8 @@ def _maq_finding(maq, prefix="AD"):
 # Mapas de valores numéricos confirmados en ESE MISMO código fuente de nxc (la lógica de
 # decodificación, aunque el flag que la dispara no exista), para no inventar el significado.
 _LDAP_TRUST_DIRECTION = {"0": "deshabilitado", "1": "entrante", "2": "saliente", "3": "bidireccional"}
-_LDAP_TRUST_TYPE = {"1": "Windows NT", "2": "Active Directory", "3": "Kerberos (MIT)", "4": "desconocido", "5": "Azure AD"}
+# trustType por MS-ADTS 6.1.6.7.x: 4 = DCE (antes 'desconocido') (#28).
+_LDAP_TRUST_TYPE = {"1": "Windows NT", "2": "Active Directory", "3": "Kerberos (MIT)", "4": "DCE", "5": "Azure AD"}
 
 
 def _parse_ldap_trusts(out):
@@ -3737,7 +3752,10 @@ def fp_ldap(ip, ports, services, host, deep, base=None):
     else:
         res["missing"].append("nxc/netexec")
     if have("ldapsearch"):
-        rc, out = run_capture(["ldapsearch", "-x", "-H", f"ldap://{ip}", "-s", "base", "namingContexts"],
+        # -o ldif-wrap=no: ldapsearch pliega por defecto los valores largos a ~76 columnas con líneas
+        # de continuación que empiezan por un espacio — un trustPartner/namingContext/sAMAccountName
+        # largo se truncaba al parsearlo con '^attr: (\S+)'. Desactivar el folding lo evita (#28).
+        rc, out = run_capture(["ldapsearch", "-x", "-o", "ldif-wrap=no", "-H", f"ldap://{ip}", "-s", "base", "namingContexts"],
                               timeout=20)
         _step(res, f"ldapsearch -x -H ldap://{ip} -s base namingContexts", rc == 0, out,
               note="naming contexts (base DN), sin autenticar")
@@ -3754,7 +3772,7 @@ def fp_ldap(ip, ports, services, host, deep, base=None):
             # manual (sin límite de tiempo) la devuelve completa al momento — fallo transitorio de
             # conexión, no ausencia real de trusts. Un reintento barato evita perder el hallazgo.
             base_dn = ncs[0].strip()
-            rc, tout = _run_capture_retry(["ldapsearch", "-x", "-H", f"ldap://{ip}", "-b", base_dn,
+            rc, tout = _run_capture_retry(["ldapsearch", "-x", "-o", "ldif-wrap=no", "-H", f"ldap://{ip}", "-b", base_dn,
                                            "(objectClass=trustedDomain)", "trustPartner", "trustDirection",
                                            "trustType", "trustAttributes"], timeout=20)
             trusts = _parse_ldap_trusts(tout)
@@ -7466,7 +7484,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 if domain and sec_file and have("ldapsearch"):
                     base_dn = ",".join(f"dc={p}" for p in domain.split("."))
                     rc, tout = _run_capture_retry(
-                        ["ldapsearch", "-x", "-H", f"ldap://{ip}", "-D", f"{u}@{domain}", "-y", sec_file.name,
+                        ["ldapsearch", "-x", "-o", "ldif-wrap=no", "-H", f"ldap://{ip}", "-D", f"{u}@{domain}", "-y", sec_file.name,
                          "-b", base_dn, "(objectClass=trustedDomain)", "trustPartner", "trustDirection",
                          "trustType", "trustAttributes"], timeout=20, quiet=True)
                     tshown = (f"ldapsearch -x -H ldap://{ip} -D {shlex.quote(u + '@' + domain)} -y *** "
@@ -7501,7 +7519,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     # escalada activa (adivinar una credencial, aunque sea 1 intento/cuenta), así que
                     # queda como sugerencia MANUAL ('-M pre2k' de nxc SÍ la prueba; palantir no).
                     rc, p2out = _run_capture_retry(
-                        ["ldapsearch", "-x", "-H", f"ldap://{ip}", "-D", f"{u}@{domain}", "-y", sec_file.name,
+                        ["ldapsearch", "-x", "-o", "ldif-wrap=no", "-H", f"ldap://{ip}", "-D", f"{u}@{domain}", "-y", sec_file.name,
                          "-b", base_dn, "(&(objectClass=computer)(userAccountControl=4128))", "sAMAccountName"],
                         timeout=30, quiet=True)
                     p2shown = (f"ldapsearch -x -H ldap://{ip} -D {shlex.quote(u + '@' + domain)} -y *** "
@@ -11775,6 +11793,8 @@ def selftest():
                           "type": "Windows NT", "forest_transitive": False}
     assert _parse_ldap_trusts("") == []
     assert _parse_ldap_trusts("sin trustPartner aquí") == []
+    # #28: trustType 4 = DCE (MS-ADTS), antes se etiquetaba 'desconocido'.
+    assert _parse_ldap_trusts("trustPartner: dce.local\ntrustDirection: 3\ntrustType: 4\ntrustAttributes: 0")[0]["type"] == "DCE"
 
     # fp_ldap: trusts anónimos vía ldapsearch (mismo base DN que namingContexts, sin llamada
     # de red extra de peso) — y MAQ anónimo (-M maq) cuando --users ya demostró lectura real.
@@ -15967,7 +15987,7 @@ def run_one(ip, name, args, folder=None):
              "(p. ej. WSL2 mirrored + VPN). Reintento con connect scan (-sT)…")
         CONNECT = True
         ports = fast_ports(ip, nmapdir, args.min_rate, args.top, stealth=args.stealth,
-                           source_port=args.source_port, ports=forced_ports, tunnel=args.tunnel)
+                           source_port=args.source_port, ports=forced_ports, tunnel=args.tunnel, tag="fast_connect")
     if not ports and not forced_ports:
         # Algunos WAF/CDN/firewalls detectan y bloquean el PATRÓN de un barrido masivo
         # (muchos puertos en poco tiempo) pero dejan pasar una conexión HTTP normal —
@@ -15976,7 +15996,7 @@ def run_one(ip, name, args, folder=None):
         warn("Barrido completo sin resultados (o el objetivo filtra/limita el escaneo masivo) "
              "— reintento solo con los puertos web habituales (80, 443, 8080, 8443).")
         ports = fast_ports(ip, nmapdir, args.min_rate, args.top, stealth=args.stealth,
-                           source_port=args.source_port, ports=[80, 443, 8080, 8443], tunnel=args.tunnel)
+                           source_port=args.source_port, ports=[80, 443, 8080, 8443], tunnel=args.tunnel, tag="fast_web")
     if not ports:
         warn("No hay puertos abiertos (o el host filtra todo).")
         return
