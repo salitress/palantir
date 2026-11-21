@@ -2826,7 +2826,7 @@ def fp_smb(ip, ports, services, host, deep, base=None):
         #   · webdav: "WebClient Service enabled on: <host>" si el pipe 'DAV RPC Service' existe en
         #     IPC$ (indica el servicio WebClient activo) — vector de coacción NTLM alternativo al
         #     spooler/EFSR (ver fp_msrpc): fuerza al equipo a autenticarse por HTTP en vez de SMB.
-        rc, out17 = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "ms17-010"], timeout=60)
+        rc, out17 = _run_capture_retry([nxc, "smb", ip, "-u", "", "-p", "", "-M", "ms17-010"], timeout=60)
         vuln17 = "VULNERABLE to MS17-010" in (out17 or "")
         dpulsar = "INFECTED with DoublePulsar" in (out17 or "")
         _step(res, f"{nxc} smb {ip} -u '' -p '' -M ms17-010", vuln17, out17,
@@ -2841,6 +2841,9 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                 "VULNERABLE arriba — paso MANUAL, RCE sin autenticar; revisa la arquitectura/build exacta "
                 "primero (el exploit varía por versión de Windows)")
 
+        # OJO: smbghost/webdav NO van por _run_capture_retry — solo imprimen salida cuando SÍ hay
+        # hallazgo (smbghost: "Potentially vulnerable…" o nada; webdav: "WebClient Service…" o nada),
+        # así que la salida vacía es un resultado VÁLIDO ("no vulnerable"), no un blip que reintentar.
         rc, outgh = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "smbghost"], timeout=30)
         vulngh = "Potentially vulnerable to SMBGhost" in (outgh or "")
         _step(res, f"{nxc} smb {ip} -u '' -p '' -M smbghost", vulngh, outgh,
@@ -2887,7 +2890,12 @@ def fp_smb(ip, ports, services, host, deep, base=None):
             # seguridad igualmente — no hace daño — pero si se repite, el problema de fondo
             # probablemente sea contención/carga durante el escaneo, no el propio check.
             zlog_timeout = 120
-            rc, zout = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "zerologon"], timeout=zlog_timeout)
+            # _run_capture_retry (no run_capture): zerologon SIEMPRE imprime algo ("VULNERABLE" o
+            # "Attack failed. Target is probably patched."), así que una salida VACÍA es el blip
+            # transitorio que el propio comentario de arriba documentó (un caso real dio salida
+            # completamente vacía con 60s) → reintentar antes de leerlo como "no vulnerable" evita
+            # tirar en silencio el crítico más importante del run.
+            rc, zout = _run_capture_retry([nxc, "smb", ip, "-u", "", "-p", "", "-M", "zerologon"], timeout=zlog_timeout)
             zvuln = "VULNERABLE" in (zout or "")
             _step(res, f"{nxc} smb {ip} -u '' -p '' -M zerologon", zvuln, zout,
                   note="CVE-2020-1472: ¿el DC es vulnerable a Zerologon? Comprobación de solo lectura, SIN credenciales — nxc no explota, solo confirma")
@@ -4721,12 +4729,20 @@ def _kerbrute_userenum(res, ip, domain, base):
         except OSError:
             pass
     users, noauth = _parse_kerbrute_users(out)
-    _step(res, f"kerbrute userenum -d {domain} --dc {ip} {wl}", bool(users), out,
-          note="enum de usuarios AD por Kerberos pre-auth (solo lectura, no bloquea cuentas)")
+    # run_capture devuelve rc=None cuando saltó el timeout (sobre un túnel lento jsmith.txt o una
+    # --userenum-wordlist grande pueden superarlo): la salida es PARCIAL. Antes se parseaba y se
+    # reportaba como una enumeración COMPLETA, y el operador no sabía que debía relanzarla — justo
+    # la clase de "parcial presentado como completo" que marcó sobre el túnel.
+    partial = rc is None
+    psfx = (f" (PARCIAL — kerbrute superó el timeout de {kb_timeout}s; relánzalo a mano con "
+            "--userenum-wordlist para la lista completa)" if partial else "")
+    _step(res, f"kerbrute userenum -d {domain} --dc {ip} {wl}", bool(users) and not partial, out,
+          note="enum de usuarios AD por Kerberos pre-auth (solo lectura, no bloquea cuentas)"
+               + (" — CORTADO por timeout: lista PARCIAL" if partial else ""))
     if users:
         res["findings"].append(("alta", f"Kerberos: {len(users)} usuario(s) AD válidos por kerbrute"
                                 + (f" (→ {base / 'ad_users.txt'})" if base else "") + ": "
-                                + ", ".join(users[:20]) + (" …" if len(users) > 20 else "")))
+                                + ", ".join(users[:20]) + (" …" if len(users) > 20 else "") + psfx))
         if base:
             try:
                 _merge_write_ad_users(base, users)
@@ -4735,7 +4751,7 @@ def _kerbrute_userenum(res, ip, domain, base):
         res["next"].append(f"{_impacket_suggest_bin('GetNPUsers')} {domain}/ -usersfile ad_users.txt -no-pass -dc-ip {ip}   # AS-REP roast de los usuarios hallados")
     if noauth:
         res["findings"].append(("alta", f"Kerberos: {len(noauth)} cuenta(s) SIN pre-auth (AS-REP roastables, hash crackeable sin credenciales): "
-                                + ", ".join(noauth[:10])))
+                                + ", ".join(noauth[:10]) + psfx))
     return bool(users)
 
 
@@ -5685,7 +5701,10 @@ def _db_enum_mysql(res, ip, port, user, password):
     _step(res, f"mysql -h {ip} -P {port} -u {user} -e 'SELECT schema_name …'  (MYSQL_PWD=***)",
           rc == 0 and "access denied" not in out.lower(), out,
           note="listar las bases de datos con la credencial")
-    if "access denied" in out.lower() or "error 1045" in out.lower():
+    # rc != 0 cubre el timeout sobre el túnel (run_capture → rc=None) y la conexión perdida a
+    # media consulta ('Lost connection to MySQL server during query'): sin este guard, cada línea
+    # de ERROR/salida parcial se contaba como una "base de datos" y se reportaba como completa.
+    if rc != 0 or "access denied" in out.lower() or "error 1045" in out.lower():
         return [], {}
     dbs = [l.strip() for l in out.splitlines() if l.strip()]
     q = ("SELECT table_schema, table_name FROM information_schema.tables "
@@ -5713,7 +5732,10 @@ def _db_enum_postgres(res, ip, port, user, password):
     rc, out = _psql("postgres", "SELECT datname FROM pg_database WHERE datistemplate=false")
     _step(res, f"psql -h {ip} -U {user} -c 'SELECT datname FROM pg_database …'  (PGPASSWORD=***)",
           rc == 0 and "fatal:" not in out.lower(), out, note="listar las bases de datos con la credencial")
-    if "authentication failed" in out.lower() or "fatal:" in out.lower():
+    # rc != 0 cubre el timeout (rc=None) y 'server closed the connection unexpectedly' / 'could not
+    # receive data from server': sin esto, el texto de error se parseaba como nombres de BD (y psql
+    # intentaba conectar a cada BD inventada).
+    if rc != 0 or "authentication failed" in out.lower() or "fatal:" in out.lower():
         return [], {}
     dbs = [l.strip() for l in out.splitlines() if l.strip()]
     tables = {}
@@ -7725,7 +7747,14 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
             safe_out = safe_out.replace(pw, "***")
     hits = _parse_nxc_bulk_successes(out or "")
     _step(res, shown, bool(hits), safe_out,
-          note=f"spray en bloque por {np.upper()} ({n} combinaciones, 1 proceso nxc)")
+          note=f"spray en bloque por {np.upper()} ({n} combinaciones, 1 proceso nxc)"
+               + (" — CORTADO por timeout: INCOMPLETO" if rc is None else ""))
+    if rc is None and not hits:
+        # El spray superó el timeout (run_capture → rc=None) con salida parcial: 0 hits NO
+        # significa "sin credenciales", significa "no terminó". Sin este aviso, un spray cortado
+        # sobre el túnel se leía como un barrido completo sin resultados.
+        res["findings"].append(("media", f"{np.upper()}: el spray en bloque ({n} combinaciones) NO "
+            f"terminó (timeout {timeout}s) — resultado INCOMPLETO; relánzalo a mano o reduce la lista"))
     return hits
 
 
@@ -10996,6 +11025,66 @@ def selftest():
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
     assert not any("EternalBlue" in t or "SMBGhost" in t or "WebClient" in t for _s, t in _novres["findings"])
+
+    # ── Resultados parciales por timeout presentados como completos (complaint #2) ───────────────
+    # #23: la sonda de Zerologon de fp_smb usa _run_capture_retry — una PRIMERA salida vacía (blip
+    # del túnel, caso real documentado en el propio código) se REINTENTA antes de leerse como "no
+    # vulnerable". Sin el fix (run_capture a secas) el crítico se perdía en silencio. Se aísla el
+    # path mockeando _smb_ad_enum (que iría por Popen directo con el binario falso).
+    _zl_calls = {"n": 0}
+    def _fake_zl_rc(cmd, timeout=None, **kw):
+        if "-M" in cmd and "zerologon" in cmd:
+            _zl_calls["n"] += 1
+            return (None, "") if _zl_calls["n"] == 1 else (0, "ZEROLOGON 10.0.0.1 445 DC01 VULNERABLE")
+        return 0, "SMB 10.0.0.1 445 DC01 [*] Windows Server 2019 (name:DC01) (domain:corp.local) (signing:True) (SMBv1:None)"
+    _real_ade = _smb_ad_enum
+    globals()["nxc_bin"], globals()["run_capture"], globals()["_smb_ad_enum"] = (lambda: "FAKE_NXC"), _fake_zl_rc, (lambda *a, **k: None)
+    try:
+        _zlres = fp_smb("10.0.0.1", [{"port": 445}],
+                        [{"port": 445, "name": "smb", "scripts": {}}, {"port": 88, "name": "kerberos", "scripts": {}}], {}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"], globals()["_smb_ad_enum"] = _real_nxcbin_v, _real_rc_v, _real_ade
+    assert _zl_calls["n"] >= 2, f"zerologon no reintentó tras salida vacía: {_zl_calls}"
+    assert any(s == "critica" and "Zerologon" in t for s, t in _zlres["findings"]), _zlres["findings"]
+
+    # #47: una consulta de enum de BD cortada por timeout (rc=None, texto de error como salida) NO
+    # se parsea como "bases de datos" — antes cada línea de error contaba como una BD.
+    _real_have_db, _real_rc_db = globals()["have"], run_capture
+    globals()["have"] = lambda *_a, **_k: True
+    globals()["run_capture"] = lambda *a, **k: (None, "ERROR 2013 (HY000): Lost connection to MySQL server during query")
+    try:
+        assert _db_enum_mysql(_fp("mysql", "MySQL", [3306]), "1.2.3.4", 3306, "root", "x") == ([], {})
+        assert _db_enum_postgres(_fp("postgres", "PostgreSQL", [5432]), "1.2.3.4", 5432, "postgres", "x") == ([], {})
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_db, _real_rc_db
+
+    # #56: un spray en bloque cortado por timeout (rc=None) añade un aviso 'INCOMPLETO' — 0 hits NO
+    # se lee como "sin credenciales".
+    _real_rc_bk = run_capture
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (None, "")
+    try:
+        _bk = _fp("smb", "SMB", [445])
+        _bk_hits = _nxc_bulk(_bk, "smb", "1.2.3.4", 445, 445, ["u1", "u2"], ["p1", "p2"], False, "FAKE_NXC", False, False)
+    finally:
+        globals()["run_capture"] = _real_rc_bk
+    assert _bk_hits == [] and any("INCOMPLETO" in t for _s, t in _bk["findings"]), _bk["findings"]
+
+    # #33: kerbrute userenum cortado por timeout (rc=None, salida parcial) marca el hallazgo como
+    # '(PARCIAL …)' en vez de presentar la lista como completa.
+    _real_kb_b, _real_kb_wl, _real_kb_to = _kerbrute_bin, _userenum_wordlist, _kerbrute_timeout
+    _real_kb_rc, _real_no_ue = run_capture, NO_USERENUM
+    globals()["_kerbrute_bin"] = lambda: "FAKE_KB"
+    globals()["_userenum_wordlist"] = lambda *_a, **_k: "/tmp/fake_wl.txt"
+    globals()["_kerbrute_timeout"] = lambda *_a, **_k: 30
+    globals()["NO_USERENUM"] = False
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (None, "[+] VALID USERNAME:\t jsmith@corp.local")
+    try:
+        _kbp = _fp("kerberos", "Kerberos", [88])
+        _kerbrute_userenum(_kbp, "1.2.3.4", "corp.local", None)
+    finally:
+        globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_kerbrute_timeout"] = _real_kb_b, _real_kb_wl, _real_kb_to
+        globals()["run_capture"], globals()["NO_USERENUM"] = _real_kb_rc, _real_no_ue
+    assert any("PARCIAL" in t for _s, t in _kbp["findings"]), _kbp["findings"]
 
     # _parse_nxc_ldap_signing / _parse_nxc_ldap_cbt: banner de nxc ldap, formato real
     # confirmado contra el código fuente de nxc (print_host_info de nxc/protocols/ldap.py) —
