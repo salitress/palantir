@@ -4432,9 +4432,16 @@ def fp_web_fast(ip, p, services, host, deep, hostname=None):
               note="métodos HTTP que el servidor permite DE VERDAD (confirma PUT/DELETE/WebDAV, no solo lo anunciado)")
         dang = _dangerous_methods(allow)
         if hdrs.get("dav"):
-            res["findings"].append(("alta", f"Web {port}: WebDAV activo (cabecera DAV: {hdrs['dav']}) → posible subida de webshell"))
+            # Comando de explotación VINCULADO al hallazgo (_attach_cmd): sin esto quick_wins caía a
+            # los primeros next-steps del pool ('palantir --nuclei/--crawl --resume', re-escaneos
+            # genéricos), no al paso que explota ESTE hallazgo (#6).
+            _wdav = f"Web {port}: WebDAV activo (cabecera DAV: {hdrs['dav']}) → posible subida de webshell"
+            res["findings"].append(("alta", _wdav))
+            _attach_cmd(res, _wdav, [f"davtest -url {url}   # qué extensiones permite subir WebDAV (→ webshell)"])
         if "PUT" in dang:
-            res["findings"].append(("alta", f"Web {port}: método PUT permitido (OPTIONS) → posible subida de ficheros"))
+            _wput = f"Web {port}: método PUT permitido (OPTIONS) → posible subida de ficheros"
+            res["findings"].append(("alta", _wput))
+            _attach_cmd(res, _wput, [f"curl -s -X PUT '{url}shell.txt' --data 'palantir-put-test' && curl -s '{url}shell.txt'   # confirma subida por PUT (ajusta la extensión al stack para webshell)"])
         elif dang:
             res["findings"].append(("info", f"Web {port}: métodos potencialmente peligrosos: {', '.join(dang)}"))
 
@@ -4461,7 +4468,15 @@ def fp_web_fast(ip, p, services, host, deep, hostname=None):
               note=f"comprobar (solo lectura) si está expuesto: {label}")
         if hit:
             sev = "alta" if any(k in path for k in ("web.config", ".git", ".env", "elmah", "trace")) else "media"
-            res["findings"].append((sev, f"Web {port}: {label} — {url}{path}"))
+            _ftxt = f"Web {port}: {label} — {url}{path}"
+            res["findings"].append((sev, _ftxt))
+            # Comando VINCULADO al hallazgo (_attach_cmd), para que quick_wins no muestre el
+            # re-escaneo genérico '--nuclei/--crawl' como su comando (#6): .git → git-dumper (clona
+            # el repo expuesto), cualquier otro fichero sensible → curl que lo lee.
+            if ".git" in path:
+                _attach_cmd(res, _ftxt, [f"git-dumper '{url}.git/' loot_git_{port}   # descarga el repo .git expuesto → código fuente/credenciales"])
+            else:
+                _attach_cmd(res, _ftxt, [f"curl -sk '{url}{path}'   # lee el fichero expuesto (secretos/config)"])
 
     for path, label, rx in WEB_WELL_KNOWN:
         st, _h2, body = _http_get(f"{url}{path}")
@@ -12168,11 +12183,21 @@ def selftest():
     assert _fc_anon["next"][0] == "evil-winrm -i 172.16.7.50 -u AB920 -p weasal   # shell cuando tengas credenciales válidas", _fc_anon["next"][0]
     assert "AB920:weasal" in _fc_anon["next"][1], _fc_anon["next"][1]
     assert "/u:AB920 /p:weasal" in _fc_anon["next"][2], _fc_anon["next"][2]
-    assert "AB920:'weasal'" in _fc_anon["next"][3], _fc_anon["next"][3]
+    assert "AB920:weasal" in _fc_anon["next"][3], _fc_anon["next"][3]   # #70: shlex.quote; sin caracteres raros, sin comillas
     assert "USER" not in _fc_anon["next"][4] and "users.txt" in _fc_anon["next"][4]  # placeholder de LISTA intacto
     assert not any("svc_sql" in n for n in _fc_anon["next"])     # gana AB920 (admin), no svc_sql (no-admin)
     for _fpr in _fc_fps:                                          # metadata interna NUNCA filtra al informe
         assert "_valid_cred" not in _fpr and "_valid_cred_admin" not in _fpr
+    # #70: una contraseña con ESPACIO/'/$ se quota en TODAS las formas (xfreerdp/SOAPy/impacket),
+    # no solo en -u/-p — antes rompía esos comandos al pegarlos.
+    _fc70 = {"proto": "winrm", "ports": [5985], "steps": [], "findings": [], "missing": [],
+             "next": ["xfreerdp /v:ip /u:USER /p:PASS", "impacket-wmiexec DOMINIO/USER:PASS@ip",
+                      "SOAPy dom/USER:'PASS'@ip --users"]}
+    _stash_valid_cred(_fc70, "bob", "pa ss!", False, admin=True)
+    _fill_cred_placeholder([_fc70])
+    for _n in _fc70["next"]:
+        assert "USER" not in _n and "PASS" not in _n, _n           # placeholders rellenados
+        assert "'pa ss!'" in _n, _n                                # el espacio va quoteado en cada forma
 
     # Sin ninguna credencial confirmada en todo el run: no toca nada (deja los placeholders tal cual).
     _fc_noop = _fp("winrm", "WinRM", [5985])
@@ -13820,6 +13845,15 @@ def selftest():
     _attach_cmd(_d2, "F2", ["impacket-GetNPUsers dom/U:P -request -dc-ip 1.2.3.4   # AS-REP roast (con credenciales válidas)"])
     _dup_cmds = [c for w in quick_wins([_d1, _d2]) for c in w["cmds"]]
     assert len(_dup_cmds) == 1, _dup_cmds
+    # #6: un hallazgo web de alto valor (.git/.env/WebDAV/PUT) muestra su comando vinculado
+    # (git-dumper/curl/davtest), no el re-escaneo genérico '--nuclei/--crawl' que encabeza el pool.
+    _w6txt = "Web 80: .git/ expuesto (repositorio descargable → código fuente) — http://x/.git/HEAD"
+    _w6 = {"proto": "web", "title": "Web", "ports": [80], "steps": [], "findings": [("alta", _w6txt)],
+           "next": ["palantir x --nuclei --resume   # nuclei", "palantir x --crawl --resume   # crawl"], "missing": []}
+    _attach_cmd(_w6, _w6txt, ["git-dumper 'http://x/.git/' loot_git_80   # descarga el repo .git expuesto"])
+    _w6_qw = quick_wins([_w6])
+    assert _w6_qw and "git-dumper" in _w6_qw[0]["cmds"][0], _w6_qw
+    assert not any("--nuclei" in c or "--crawl" in c for c in _w6_qw[0]["cmds"]), _w6_qw
     # _tip_for: "qué hacer A MANO" por categoría de hallazgo — pedido explícito para uso en
     # OSCP (nada de explotación automatizada). Puro, por coincidencia de texto; cada win de
     # quick_wins() lleva su "tip" ya resuelto (None si ninguna categoría aplica).
@@ -15575,12 +15609,17 @@ def _fill_cred_placeholder(footprints):
     if not best:
         return
     user, secret = best
+    # shlex.quote en TODAS las formas (no solo '-u/-p'): una contraseña con espacio/comilla/$ dejaba
+    # el comando roto en las formas '/u:.. /p:..' (xfreerdp), "USER:'PASS'" (SOAPy) y 'USER:PASS'
+    # (URL impacket), que insertaban user/secret CRUDOS. Con quoting, el shell entrega el argumento
+    # intacto (impacket/SOAPy ya lo parsean). El orden importa: "USER:'PASS'" antes que "USER:PASS"
+    # (esta última no es subcadena de la primera, pero se mantiene el orden por claridad) (#70).
     uq, pq = shlex.quote(user), (shlex.quote(secret) if secret else "''")
     for fpr in footprints:
         fpr["next"] = [n.replace("-u USER -p PASS", f"-u {uq} -p {pq}")
-                         .replace("/u:USER /p:PASS", f"/u:{user} /p:{secret}")
-                         .replace("USER:'PASS'", f"{user}:'{secret}'")
-                         .replace("USER:PASS", f"{user}:{secret}")
+                         .replace("/u:USER /p:PASS", f"/u:{uq} /p:{pq}")
+                         .replace("USER:'PASS'", f"{uq}:{pq}")
+                         .replace("USER:PASS", f"{uq}:{pq}")
                         for n in fpr["next"]]
 
 
