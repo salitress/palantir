@@ -2902,7 +2902,11 @@ def fp_smb(ip, ports, services, host, deep, base=None):
         #     spooler/EFSR (ver fp_msrpc): fuerza al equipo a autenticarse por HTTP en vez de SMB.
         rc, out17 = _run_capture_retry([nxc, "smb", ip, "-u", "", "-p", "", "-M", "ms17-010"], timeout=60)
         vuln17 = "VULNERABLE to MS17-010" in (out17 or "")
-        dpulsar = "INFECTED with DoublePulsar" in (out17 or "")
+        # DoublePulsar poco fiable upstream: nxc construye esa línea con key.decode() sobre un int
+        # (AttributeError), así que puede NO imprimirse o salir dentro de un traceback — se exige que
+        # NO venga de un crash para no flipar el 'YA INFECTADO' por un error de nxc (#24).
+        dpulsar = ("INFECTED with DoublePulsar" in (out17 or "")
+                   and "Traceback" not in (out17 or "") and "AttributeError" not in (out17 or ""))
         _step(res, f"{nxc} smb {ip} -u '' -p '' -M ms17-010", vuln17, out17,
               note="CVE-2017-0143/0144/0145/0146/0147/0148 (EternalBlue): ¿es vulnerable a RCE sin autenticar? Comprobación de solo lectura, SIN credenciales")
         if vuln17:
@@ -3671,16 +3675,25 @@ def fp_ldap(ip, ports, services, host, deep, base=None):
                         _merge_write_ad_users(base, ldap_users)
                     except OSError:
                         pass
-                for mod, note in (("--groups", "vuelca los grupos del dominio (quién es Domain Admin)"),
+                # #27: '--groups' SIN valor lista los grupos (nombres + nº de miembros), NO la
+                # membresía de 'Domain Admins' (eso requiere '--groups "Domain Admins"') — la nota lo
+                # dice en vez de prometer 'quién es Domain Admin'. #29: _run_capture_retry + marca
+                # PARCIAL (como ya hace --users), para que un pass-pol truncado por el túnel no
+                # presente datos parciales como completos ni suprima en silencio el hallazgo de lockout.
+                for mod, note in (("--groups", "lista los grupos del dominio (nombres + nº de miembros); para ver quién está en 'Domain Admins' usa '--groups \"Domain Admins\"'"),
                                   ("--pass-pol", "política de contraseñas del dominio (longitud, bloqueo)")):
-                    rc, out = run_capture([nxc, "ldap", ip, "-u", user, "-p", "", mod], timeout=60)
-                    _step(res, f"{nxc} ldap {ip} -u '{user}' -p '' {mod}", rc == 0, out, note=note)
+                    rc, out = _run_capture_retry([nxc, "ldap", ip, "-u", user, "-p", "", mod], timeout=90, quiet=True)
+                    _partial = rc is None
+                    _step(res, f"{nxc} ldap {ip} -u '{user}' -p '' {mod}", rc == 0 and not _partial, out,
+                          note=note + (" — CORTADO por timeout: PARCIAL" if _partial else ""))
                     if mod == "--pass-pol":
                         pol = _parse_pass_pol(out)
                         pp = _format_pass_pol_finding(pol)
                         if pp:
-                            res["findings"].append(("info", pp))
-                        if pol.get("lockout_threshold") in ("None", "0"):
+                            res["findings"].append(("info", pp + (" (PARCIAL — tiempo agotado; relánzalo a mano)" if _partial else "")))
+                        # Solo afirma 'sin bloqueo → spraying seguro' con datos COMPLETOS: en una
+                        # salida parcial la línea del umbral puede faltar y sería un falso 'seguro'.
+                        if not _partial and pol.get("lockout_threshold") in ("None", "0"):
                             res["findings"].append(("alta", "AD: sin bloqueo de cuentas (lockout = None/0) — password spraying sin riesgo de bloquear a nadie contra la lista de usuarios ya enumerada"))
                 # get-desc-users: módulo nxc dedicado a buscar contraseñas en el campo
                 # "description" de las cuentas (fallo de higiene clásico en AD: alguien
@@ -7600,14 +7613,17 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     [getuserspns, k_ident] + k_auth + ["-request", "-dc-ip", ip, "-outputfile", kerb_outfile],
                     timeout=90, quiet=True)
                 n = _count_roast(out)
+                # rc=None = timeout con salida PARCIAL (sobre el túnel): _count_roast subcuenta y se
+                # reportaba como completo. Se marca para que el operador sepa que debe relanzarlo (#55).
+                _kpart = " (POSIBLEMENTE INCOMPLETO — GetUserSPNs superó el timeout de 90s; relánzalo a mano)" if rc is None else ""
                 k_shown = (f"{getuserspns} {domain}/{shlex.quote(u)}:{'***' if (secret and not is_hash) else ''} "
                            + ("-hashes *** " if is_hash else "")
                            + f"-request -dc-ip {ip} -outputfile {kerb_outfile}")
-                _step(res, k_shown, n > 0, mask(out),
+                _step(res, k_shown, n > 0 and rc is not None, mask(out),
                       note="Kerberoast (cuentas con SPN): TGS para TODAS las cuentas con SPN del dominio — "
-                           "vuelca hashes crackeables con hashcat/john")
+                           "vuelca hashes crackeables con hashcat/john" + (" — CORTADO por timeout" if rc is None else ""))
                 if n:
-                    res["findings"].append(("alta", f"LDAP (cred {u}): {n} hash(es) de Kerberoast (cuentas con SPN) → {kerb_outfile} (crackear con hashcat)"))
+                    res["findings"].append(("alta", f"LDAP (cred {u}): {n} hash(es) de Kerberoast (cuentas con SPN) → {kerb_outfile} (crackear con hashcat){_kpart}"))
             else:
                 res["next"].append(
                     f"{getuserspns} DOMINIO/{shlex.quote(u)}:'<pass>' -request -dc-ip {ip} -outputfile {kerb_outfile}   "
@@ -7631,14 +7647,15 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     [getnpusers, g_ident] + g_auth + ["-request", "-dc-ip", ip, "-outputfile", asrep_outfile],
                     timeout=90, quiet=True)
                 n = _count_roast(out)
+                _gpart = " (POSIBLEMENTE INCOMPLETO — GetNPUsers superó el timeout de 90s; relánzalo a mano)" if rc is None else ""
                 g_shown = (f"{getnpusers} {domain}/{shlex.quote(u)}:{'***' if (secret and not is_hash) else ''} "
                            + ("-hashes *** " if is_hash else "")
                            + f"-request -dc-ip {ip} -outputfile {asrep_outfile}")
-                _step(res, g_shown, n > 0, mask(out),
+                _step(res, g_shown, n > 0 and rc is not None, mask(out),
                       note="AS-REP (cuentas sin preauth): consulta LDAP directa por TODAS las roasteables del "
-                           "dominio (no depende de wordlist) — vuelca hashes crackeables con hashcat/john")
+                           "dominio (no depende de wordlist) — vuelca hashes crackeables con hashcat/john" + (" — CORTADO por timeout" if rc is None else ""))
                 if n:
-                    res["findings"].append(("alta", f"LDAP (cred {u}): {n} hash(es) de AS-REP (cuentas sin preauth) → {asrep_outfile} (crackear con hashcat)"))
+                    res["findings"].append(("alta", f"LDAP (cred {u}): {n} hash(es) de AS-REP (cuentas sin preauth) → {asrep_outfile} (crackear con hashcat){_gpart}"))
             else:
                 res["next"].append(
                     f"{getnpusers} DOMINIO/{shlex.quote(u)}:'<pass>' -request -dc-ip {ip} -outputfile {asrep_outfile}   "
@@ -11471,6 +11488,24 @@ def selftest():
     assert any(s == "critica" and "SMBGhost" in t for s, t in _vres["findings"]), _vres["findings"]
     assert any("SMBGhost/scanner.py" in n for n in _vres["next"])
     assert any(s == "media" and "WebClient" in t for s, t in _vres["findings"]), _vres["findings"]
+
+    # #24: 'INFECTED with DoublePulsar' dentro de un TRACEBACK de nxc (bug upstream: key.decode()
+    # sobre un int) NO debe marcar 'YA INFECTADO' — es un crash, no una detección real. EternalBlue
+    # (VULNERABLE, impreso antes del crash) sí se mantiene.
+    def _fake_dp_crash_rc(cmd, timeout=None, **kw):
+        if "-M" in cmd and "ms17-010" in cmd:
+            return 0, ("SMB 10.0.0.1 445 WIN7 [*] 10.0.0.1 is likely VULNERABLE to MS17-010! (Windows 7)\n"
+                       "Traceback (most recent call last):\n"
+                       "  File nxc/modules/ms17-010.py, line 90, in on_admin_login\n"
+                       "AttributeError: 'int' object has no attribute 'decode' - INFECTED with DoublePulsar!")
+        return 0, "SMB 10.0.0.1 445 DC01 [*] Windows 10 (name:DC01) (domain:X) (signing:True) (SMBv1:None)"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dp_crash_rc
+    try:
+        _dpres = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}], {}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
+    assert any(s == "critica" and "EternalBlue" in t for s, t in _dpres["findings"]), _dpres["findings"]
+    assert not any("DoublePulsar" in t for _s, t in _dpres["findings"]), _dpres["findings"]
 
     # Host NO vulnerable a ninguno de los tres → ningún hallazgo falso positivo.
     def _fake_novuln_rc(cmd, timeout=None, **kw):
