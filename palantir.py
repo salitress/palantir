@@ -2385,10 +2385,13 @@ def _format_pass_pol_finding(pol, prefix="AD"):
         if thr in ("None", "0"):
             parts.append("SIN bloqueo de cuentas")
         else:
+            # 'None'/'Not Set' son el texto LITERAL que a veces imprime SAMR en salida parcial: no
+            # son una duración real, así que no se muestran ('None de bloqueo' no decía nada) (#19).
+            _unset = (None, "", "None", "Not Set")
             extra = []
-            if pol.get("lockout_duration"):
+            if pol.get("lockout_duration") not in _unset:
                 extra.append(f"{pol['lockout_duration']} de bloqueo")
-            if pol.get("lockout_reset"):
+            if pol.get("lockout_reset") not in _unset:
                 extra.append(f"contador se reinicia a los {pol['lockout_reset']}")
             tail = f" ({', '.join(extra)})" if extra else ""
             parts.append(f"bloqueo tras {thr} intentos{tail}")
@@ -5714,7 +5717,10 @@ def cc_mysql(ip, ports, deep):
     for p in ports:
         port = p["port"]
         for u, pw, lbl in DEFAULT_CREDS["mysql"]:
-            cmd = ["mysql", "-h", ip, "-P", str(port), "-u", u,
+            # --skip-ssl igual que _db_enum_mysql: si la negociación TLS es el obstáculo (cert/versión
+            # sobre el túnel), SIN el flag el test de login falla y la cred válida se marca inválida,
+            # y la enum (que SÍ lo lleva) nunca se alcanza — las tres invocaciones deben coincidir (#49).
+            cmd = ["mysql", "-h", ip, "-P", str(port), "-u", u, "--skip-ssl",
                    "--connect-timeout=5", "-N", "-B", "-e", "SELECT 1"]
             rc, out = run_capture(cmd, timeout=20, env={"MYSQL_PWD": pw})
             ok = _mysql_ok(rc, out)
@@ -5971,7 +5977,9 @@ def _db_cred_test(np, ip, port, u, p):
     if np == "mysql":
         if not have("mysql"):
             return None, None, None
-        cmd = ["mysql", "-h", ip, "-P", str(port), "-u", u, "--connect-timeout=5", "-N", "-B", "-e", "SELECT 1"]
+        # --skip-ssl: coherente con cc_mysql y _db_enum_mysql (ver #49), para que el test de login y
+        # la enum no discrepen cuando el obstáculo es la negociación TLS sobre el túnel.
+        cmd = ["mysql", "-h", ip, "-P", str(port), "-u", u, "--skip-ssl", "--connect-timeout=5", "-N", "-B", "-e", "SELECT 1"]
         rc, out = run_capture(cmd, timeout=20, env={"MYSQL_PWD": p or ""})
         shown = shlex.join(cmd) + ("  (MYSQL_PWD=***)" if p else "")
         return _mysql_ok(rc, out), shown, out
@@ -6330,14 +6338,19 @@ def _user_pass_combos(args, windows=False):
     diverjan. `windows`: dedup de usuarios case-insensitive (Windows/AD). Devuelve (combos, users, passwords)."""
     users = _read_cred_list(args.user_list, "--user-list") if args.user_list else \
         ([args.user] if args.user is not None else [])
-    if windows:
-        users = _dedup_ci(users)
     # El "secreto" suelto es --pass, o --hash (pass-the-hash) si no hay --pass; vacío si ninguno.
     # (main() ya impide combinar --hash con --pass/--pass-list/--creds-file, así que no se mezclan.)
     lone_secret = args.password if args.password is not None else \
         (args.hash if getattr(args, "hash", None) is not None else "")
     passwords = _read_cred_list(args.pass_list, "--pass-list") if args.pass_list else [lone_secret]
-    if args.no_bruteforce and args.user_list and args.pass_list:
+    pair_mode = args.no_bruteforce and args.user_list and args.pass_list
+    # dedup de usuarios case-insensitive (Windows/AD) SOLO en modo CRUZADO: en el emparejado 1:1
+    # (--no-bruteforce con ambas listas) colapsar un duplicado case-variant ANTES del zip descuadraba
+    # cada par posterior y perdía la última contraseña (-U [Fiona,fiona,Bob] -P [p1,p2,p3] daba
+    # [(Fiona,p1),(Bob,p2)] con Bob mal emparejado y p3 perdida) (#54).
+    if windows and not pair_mode:
+        users = _dedup_ci(users)
+    if pair_mode:
         if len(users) != len(passwords):
             warn(f"--no-bruteforce: {len(users)} usuario(s) en --user-list pero {len(passwords)} "
                  f"en --pass-list — no coinciden, solo emparejo los primeros "
@@ -8715,7 +8728,12 @@ def _ss_terms(product, version):
         m = re.match(r"(\d+\.\d+)", ver)
         if m and m.group(1) != ver:
             vers.append(m.group(1))
-    attempts = [f"{pr} {v}" for v in vers for pr in prods] if vers else list(prods)
+    # product primero, version después (pr externo, v interno): el producto COMPLETO con ambas
+    # versiones (completa y mayor.menor) se prueba ANTES de caer a la 1ª palabra sola — "más
+    # específico primero", como dice el docstring. Antes (v externo) se probaba 'primera-palabra +
+    # versión-completa' antes que 'producto-completo + versión-laxa', así que un producto distinto
+    # que casara con la 1ª palabra podía ganar y ocultar los hits del producto real (#67).
+    attempts = [f"{pr} {v}" for pr in prods for v in vers] if vers else list(prods)
     return list(dict.fromkeys(attempts))
 
 
@@ -9698,9 +9716,13 @@ def _all_findings(services, host, footprints, vulns):
         all_findings.append(("media", f"{label}: {line}"))
     for v in (vulns or []):
         if v["exploits"]:
-            worst = min(v["exploits"], key=lambda e: EXPLOIT_SEV_ORDER.get(e["sev"], 9))["sev"]
+            # Ordena por severidad ANTES de cortar los 4 IDs de muestra: searchsploit los devuelve
+            # por EDB-ID, no por gravedad, así que 'peor: critica' podía ir seguido de 4 EDB-IDs que
+            # NO incluían el crítico (#66). Ahora los IDs mostrados son los más graves y casan con 'peor'.
+            exps = sorted(v["exploits"], key=lambda e: EXPLOIT_SEV_ORDER.get(e["sev"], 9))
+            worst = exps[0]["sev"]
             sev = {"critica": "alta", "alta": "alta", "media": "media", "baja": "info"}[worst]
-            ids = ", ".join(f"EDB-{e['edb']}" for e in v["exploits"][:4])
+            ids = ", ".join(f"EDB-{e['edb']}" for e in exps[:4])
             all_findings.append((sev, f"{v['product']} {v['version']}: {len(v['exploits'])} exploits "
                                  f"en exploit-db (peor: {worst}; {ids}…) — verificar"))
     # Dedup conservando orden: el MISMO hallazgo puede venir de varias fases (p. ej. anónimo y
@@ -10445,6 +10467,17 @@ def selftest():
     # _all_findings: en --resume los findings vienen como listas (JSON) → deben normalizarse a
     # tupla y deduplicarse sin reventar (antes: TypeError al meter una lista en un set).
     assert _all_findings([], {}, [{"findings": [["alta", "x"], ["alta", "x"]]}], []) == [("alta", "x")]
+    # #66: el resumen de exploits ordena por severidad antes de listar los 4 EDB-IDs de muestra, para
+    # que incluyan el más grave y casen con 'peor:' (searchsploit los devuelve por EDB-ID, no gravedad).
+    _vuln66 = [{"product": "X", "version": "1", "ports": [80], "service": "http", "term": "X",
+                "known": False, "known_note": "",
+                "exploits": [{"edb": "111", "sev": "media", "title": "a"},
+                             {"edb": "222", "sev": "media", "title": "b"},
+                             {"edb": "333", "sev": "media", "title": "c"},
+                             {"edb": "444", "sev": "media", "title": "d"},
+                             {"edb": "555", "sev": "critica", "title": "e"}]}]
+    _f66 = [t for _s, t in _all_findings([], {}, [], _vuln66) if "exploit-db" in t][0]
+    assert "peor: critica" in _f66 and "EDB-555" in _f66, _f66
     assert _mysql_ok(0, "1")
     assert not _mysql_ok(0, "ERROR 1045 (28000): Access denied for user 'root'@'host'")
     assert not _mysql_ok(1, "")
@@ -10680,6 +10713,20 @@ def selftest():
     assert set(parse_provided_creds(_pc(user_list=_ulc, password="x"), windows=True)) == {("Fiona", "x"), ("John", "x")}
     assert set(parse_provided_creds(_pc(user_list=_ulc, password="x"))) == {("Fiona", "x"), ("fiona", "x"), ("John", "x")}  # sin windows (Linux): no colapsa
     os.unlink(_ulc)
+    # #54: --no-bruteforce con AMBAS listas empareja 1:1 SIN aplicar el dedup case-insensitive antes
+    # del zip (que descuadraba cada par y perdía la última contraseña). windows=True.
+    _u54f, _p54f = _tmpfile("Fiona\nfiona\nBob\n"), _tmpfile("p1\np2\np3\n")
+    _c54, _, _ = _user_pass_combos(_pc(user_list=_u54f, pass_list=_p54f, no_bruteforce=True), windows=True)
+    assert _c54 == [("Fiona", "p1"), ("fiona", "p2"), ("Bob", "p3")], _c54
+    os.unlink(_u54f); os.unlink(_p54f)
+    # #49: el test de login MySQL lleva --skip-ssl (igual que la enum), para no fallar por TLS.
+    _real_have49, _real_rc49 = globals()["have"], run_capture
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), (lambda cmd, timeout=None, **kw: (0, "1"))
+    try:
+        _ok49, _shown49, _out49 = _db_cred_test("mysql", "1.2.3.4", 3306, "root", "pw")
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have49, _real_rc49
+    assert "--skip-ssl" in _shown49, _shown49
     # se combina con --creds-file (pares explícitos, SIN cruzar) sin perder ninguno
     _cf = _tmpfile("carol:Pass123\n")
     _merged = parse_provided_creds(_pc(user_list=_ul, pass_list=_pl, creds_file=_cf))
@@ -11087,6 +11134,11 @@ def selftest():
     _ppol_none = _parse_pass_pol("SMB x 445 DC  Account Lockout Threshold: None")
     assert _format_pass_pol_finding(_ppol_none) == "AD: política de contraseñas — SIN bloqueo de cuentas"
     assert _format_pass_pol_finding({}) is None   # sin datos reconocibles (acceso denegado): no inventa nada
+    # #19: con umbral real pero duración/reset = literal 'None'/'Not Set' (salida SAMR parcial), no
+    # se imprime 'None de bloqueo' ni 'se reinicia a los None'.
+    _ppol19 = {"lockout_threshold": "5", "lockout_duration": "None", "lockout_reset": "Not Set"}
+    _f19 = _format_pass_pol_finding(_ppol19)
+    assert "bloqueo tras 5 intentos" in _f19 and "None de bloqueo" not in _f19 and "a los None" not in _f19, _f19
     # _parse_rpcclient_dompwinfo: fallback SIN nxc/netexec (HTB Academy, "Obtaining the Password
     # Policy using rpcclient") — solo longitud mínima + complejidad, es todo lo que da el comando.
     _dompw_out = "min_password_length: 8\npassword_properties: 0x00000001\n    DOMAIN_PASSWORD_COMPLEX"
@@ -13342,6 +13394,9 @@ def selftest():
     # searchsploit: construcción de términos y parseo de JSON (sin tocar la red)
     assert _ss_terms("OpenSSH", "8.2p1") == ["OpenSSH 8.2p1", "OpenSSH 8.2"]
     assert _ss_terms("vsftpd", "3.0.3") == ["vsftpd 3.0.3", "vsftpd 3.0"]
+    # #67: producto COMPLETO con ambas versiones ANTES de caer a la 1ª palabra ("más específico
+    # primero"); antes salía 'Foo 1.2.3' (1ª palabra) antes que 'Foo Bar 1.2' (producto completo).
+    assert _ss_terms("Foo Bar", "1.2.3") == ["Foo Bar 1.2.3", "Foo Bar 1.2", "Foo 1.2.3", "Foo 1.2"]
     # "apache" es vendor genérico: NO cae al nombre a secas ("Apache 2.4.x" cuela
     # Tomcat/mod_ssl/CXF/Xerces, nada que ver) → se queda en "Apache httpd ...".
     assert _ss_terms("Apache httpd", "2.4.29") == ["Apache httpd 2.4.29", "Apache httpd 2.4"]
