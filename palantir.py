@@ -8584,17 +8584,29 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             # vivo ("se esconde el hash"). La salida cruda del paso sí sigue enmascarando el hash
             # (safe_out, más abajo) por higiene del volcado, pero el hallazgo lo enseña.
             masked = f"{u}:{'∅' if p == '' else p}"
+            # El COMANDO guardado enmascara SIEMPRE el secreto (contraseña O hash) con '***' — antes
+            # la rama no-hash metía la contraseña EN CLARO en el cmd via shlex.quote(p), así que un
+            # intento FALLIDO (sin hallazgo que lo muestre) dejaba la contraseña en el cmd de
+            # findings.json/report, violando el docstring ('la contraseña NUNCA se escribe en el
+            # informe') — confirmado en un findings.json real (#52). El HALLAZGO sí muestra la cred
+            # (masked), que es el sentido de esta fase; la fuga era solo en el cmd/salida crudos.
             shown_sec = ("-H " + ("''" if not p else "'***'")) if is_hash else \
-                        ("-p " + ("''" if p == "" else shlex.quote(p)))
+                        ("-p " + ("''" if p == "" else "'***'"))
             shown = f"{nxc} {np} {ip} -u {shlex.quote(u)} {shown_sec}"
             if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
                 shown += " --local-auth"
             if port and dp and port != dp:
                 shown += f" --port {port}"
-            safe_out = out.replace(p, "***") if (p and is_hash) else out
+            # La salida cruda enmascara el secreto para hash Y contraseña (antes solo para hash): la
+            # línea de éxito de nxc trae 'DOMINIO\\user:password' en claro, que acababa en el report.
+            safe_out = out.replace(p, "***") if p else out
+            # El NOTE del paso (parte del registro crudo) enmascara el secreto; solo el HALLAZGO
+            # muestra la cred en claro (masked). Antes el note llevaba 'CT059:charlie1' y filtraba la
+            # contraseña incluso en intentos fallidos (sin hallazgo), igual que el cmd/salida (#52).
+            masked_step = f"{u}:{'∅' if p == '' else '***'}"
             ok = _nxc_ok(out)
             _step(res, shown, ok, safe_out,
-                  note=f"probar la credencial aportada «{masked}» por {np.upper()} ({'pass-the-hash' if is_hash else 'reutilización'}, 1 intento)")
+                  note=f"probar la credencial aportada «{masked_step}» por {np.upper()} ({'pass-the-hash' if is_hash else 'reutilización'}, 1 intento)")
             pwn = bool(re.search(r"\(Pwn3d!\)", out))
             tried.add((u, p, is_hash, np))
             if ok or pwn:   # credencial válida → al pool de retroalimentación
@@ -11985,6 +11997,17 @@ def selftest():
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
     assert any("hallazgo justo antes de reventar" in t for r in _pcc_results for _, t in r["findings"])
     assert (_pcc_base / "error.log").exists()
+
+    # #52: la ruta 1-a-1 NO filtra la contraseña en claro al cmd/salida guardados (ni en un intento
+    # FALLIDO, que no genera hallazgo que la muestre). Antes el cmd llevaba '-p charlie1' y la salida
+    # cruda 'CT059:charlie1', violando el docstring — confirmado en un findings.json real.
+    globals()["nxc_bin"] = lambda: "FAKE_NXC"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (1, "SMB 1.2.3.4 445 WIN [-] WIN\\CT059:charlie1 STATUS_LOGON_FAILURE")
+    try:
+        _leak = provided_creds_check("1.2.3.4", [{"port": 445, "name": "microsoft-ds"}], [("CT059", "charlie1")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert "charlie1" not in json.dumps(_leak, ensure_ascii=False), "contraseña en claro filtrada al footprint (#52)"
 
     # --local-auth en provided_creds_check: se añade en protocolos NTLM (smb, aquí) cuando
     # se pide, y se EXCLUYE a propósito en ssh (nxc no distingue dominio/local ahí — ver
