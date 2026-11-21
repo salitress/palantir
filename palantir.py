@@ -2553,7 +2553,10 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False, base=None):
                                        timeout=1800, stall_timeout=300)
     _step(res, f"{nxc} smb {ip} -u '{user}' -p '' --rid-brute", rc == 0, out,
           note="RID cycling por IPC$: recorre los RIDs para sacar nombres de usuario aunque --users esté capado (no es fuerza bruta de contraseñas)")
-    users = re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeUser\)", out)
+    # Fuera cuentas de equipo ($): no sirven para AS-REP roast ni spraying y ensucian ad_users.txt
+    # (lo consume fp_kerberos). El camino credencializado (_surface_ad_enum) ya las filtra; el
+    # anónimo no lo hacía (#18).
+    users = [u for u in re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeUser\)", out) if not u.endswith("$")]
     if users:
         uniq = sorted(set(users))
         res["findings"].append(("alta", f"AD: {len(uniq)} usuarios por RID cycling: "
@@ -2804,7 +2807,13 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                 anon_readable = True
                 res["findings"].append(("alta", f"SMB: al menos un share escribible (WRITE) vía {lbl}"))
             if user == "" and re.search(r"Null Auth:\s*True", out, re.I):
-                anon_readable = True
+                # OJO: 'Null Auth:True' solo significa que el DC ACEPTA un bind nulo (lo hace casi
+                # TODO DC, incluso endurecidos), NO que autorice lectura anónima. Ponía
+                # anon_readable=True y abría la compuerta de _smb_ad_enum, que entonces lanzaba
+                # --users/--computers/--pass-pol por SAMR contra un DC con RestrictAnonymous — todos
+                # devuelven STATUS_ACCESS_DENIED: puro ruido y, sobre el túnel, round-trips lentos
+                # (confirmado en vivo contra 172.16.7.3). anon_readable se reserva para lectura REAL
+                # (share READ/WRITE arriba) o datos de RID cycling (#15/#22).
                 res["findings"].append(("media", "SMB: autenticación nula aceptada (Null Auth: True)"))
             if working is None and _nxc_ok(out):
                 working = user
@@ -11687,6 +11696,42 @@ def selftest():
     assert any(s == "info" and "política de contraseñas" in t and "longitud mínima 8" in t
                for s, t in _smbad_res["findings"])
     assert not any("sin bloqueo" in t for _, t in _smbad_res["findings"])   # lockout=5: no es el caso débil (ninguna severidad)
+
+    # #15/#22: sesión nula aceptada pero SIN lectura real (RestrictAnonymous: rid-brute sin datos,
+    # anon_readable=False) → _smb_ad_enum NO lanza --users/--computers/--pass-pol (round-trips
+    # inútiles sobre el túnel). Antes 'Null Auth:True' ponía anon_readable=True y la compuerta se
+    # abría en todo DC. El rid-brute SÍ se intenta siempre (puede sacar nombres por IPC$).
+    _gate_cmds = []
+    def _fake_gate_rc(cmd, timeout=None, **kw):
+        _gate_cmds.append(cmd)
+        return (0, "SMB 10.0.0.1 445 DC [-] STATUS_ACCESS_DENIED")
+    globals()["run_capture"] = _fake_gate_rc
+    globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: _fake_gate_rc(cmd)
+    try:
+        _gate_res = _fp("reuse", "x", [445])
+        _smb_ad_enum(_gate_res, "FAKE_NXC", "10.0.0.1", auth_user="", anon_readable=False)
+    finally:
+        globals()["run_capture"] = _real_rc_smbad
+        globals()["_run_capture_progressive"] = _real_rcp_smbad
+    assert any("--rid-brute" in c for c in _gate_cmds), _gate_cmds   # el rid-brute SÍ se intenta
+    assert not any(("--users" in c or "--computers" in c or "--pass-pol" in c) for c in _gate_cmds), _gate_cmds
+
+    # #18: el RID cycling anónimo filtra cuentas de equipo ($) del hallazgo y de ad_users.txt
+    # (igual que el camino credencializado _surface_ad_enum).
+    _rid_out = ("SMB 10.0.0.1 445 DC 500: CORP\\Administrator (SidTypeUser)\n"
+                "SMB 10.0.0.1 445 DC 1001: CORP\\DC01$ (SidTypeUser)\n"
+                "SMB 10.0.0.1 445 DC 1103: CORP\\alice (SidTypeUser)\n")
+    globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: (0, _rid_out)
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (0, "SMB x 445 DC [*] ok")
+    try:
+        _rid_res = _fp("reuse", "x", [445])
+        _smb_ad_enum(_rid_res, "FAKE_NXC", "10.0.0.1", auth_user="", anon_readable=False)
+    finally:
+        globals()["run_capture"] = _real_rc_smbad
+        globals()["_run_capture_progressive"] = _real_rcp_smbad
+    _rid_find = [t for s, t in _rid_res["findings"] if "RID cycling" in t]
+    assert _rid_find and "alice" in _rid_find[0] and "Administrator" in _rid_find[0], _rid_find
+    assert "DC01$" not in _rid_find[0], _rid_find
 
     # fp_smb SIN nxc/netexec instalado: 'getdompwinfo' (añadido a la cadena de rpcclient) es el
     # único fallback de política de contraseñas por sesión nula — antes, sin nxc, fp_smb no
