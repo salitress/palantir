@@ -8,6 +8,15 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- A valid **anonymous (null/guest) session over WMI or LDAP** is now reported as `media`, not
+  `alta`. On those two protocols an anonymous bind is common and low-value by itself (WMI can't
+  query anything without privileges; an anonymous LDAP bind that can't read is already reported
+  separately), so flagging it `alta` overstated it (flagged live). SMB/WinRM/RDP/MSSQL null
+  sessions stay `alta` (shares/shell/direct access), and `Administrator` with a blank password
+  stays `alta` on every protocol — that's never low-value.
+
 ## [1.1.1] - 2026-11-20
 
 ### Fixed

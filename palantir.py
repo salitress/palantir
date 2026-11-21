@@ -2443,7 +2443,14 @@ def nxc_auth(nxc, proto, ip, res):
             res["findings"].append(("critica", f"{proto.upper()}: acceso de administrador vía {lbl} (Pwn3d!)"))
             return user, lbl
         if ok:
-            res["findings"].append(("alta", f"{proto.upper()}: sesión válida vía {lbl} (contraseña vacía)"))
+            # null/guest por WMI o LDAP es anónimo de BAJO valor (WMI no consulta nada sin
+            # privilegios; el bind LDAP anónimo sin lectura ya se reporta aparte) → media, no
+            # alta (pedido en vivo: "WMI null es más media que alta"). En SMB/WinRM/RDP/MSSQL sí
+            # es alta (shares/shell/acceso directo). 'Administrator sin contraseña' (admin con
+            # clave vacía) se queda en alta sea cual sea el protocolo: eso nunca es de bajo valor.
+            _anon_lowval = user in ("", "guest") and proto in ("wmi", "ldap")
+            res["findings"].append(("media" if _anon_lowval else "alta",
+                                    f"{proto.upper()}: sesión válida vía {lbl} (contraseña vacía)"))
             return user, lbl
     return None
 
@@ -10536,6 +10543,20 @@ def selftest():
         globals()["run_capture"] = _real_la_rc
     assert not any("signing NO requerido" in t for _s, t in _lares2["findings"])
     assert "_ldap_signing_disabled" not in _lares2
+
+    # nxc_auth: una sesión válida anónima (null/guest) por WMI o LDAP es 'media' (bajo valor),
+    # no 'alta' — pedido en vivo ("WMI null es más media que alta"). Por SMB sí es 'alta'.
+    def _fake_anon_ok(cmd, timeout=None, **kw):
+        return 0, "PROTO 10.0.0.1 135 DC01 [+] inlanefreight\\:"   # null session válida ('[+]' sin Pwn3d)
+    globals()["run_capture"] = _fake_anon_ok
+    try:
+        _wmi_anon = _fp("wmi", "WMI", [135]); nxc_auth("FAKE_NXC", "wmi", "10.0.0.1", _wmi_anon)
+        _smb_anon = _fp("smb", "SMB", [445]); nxc_auth("FAKE_NXC", "smb", "10.0.0.1", _smb_anon)
+    finally:
+        globals()["run_capture"] = _real_la_rc
+    assert any(s == "media" and "sesión válida vía sesión nula" in t for s, t in _wmi_anon["findings"]), _wmi_anon["findings"]
+    assert not any(s == "alta" and "sesión válida" in t for s, t in _wmi_anon["findings"])
+    assert any(s == "alta" and "sesión válida vía sesión nula" in t for s, t in _smb_anon["findings"]), _smb_anon["findings"]
 
     # fp_msrpc: guarda '_coerce'/'_coerce_via' como metadata interna (consumida por
     # footprint_services) además de los findings de PrinterBug/PetitPotam que ya emitía.
