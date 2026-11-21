@@ -8685,21 +8685,27 @@ def _exploit_severity(title, typ=""):
     t = (title or "").lower()
     ty = (typ or "").lower()
     def has(*ws): return any(w in t for w in ws)
-    if ty == "dos" or has("denial of service", "(dos)", " dos ", "crash"):
+    # Acrónimos CORTOS (rce/sqli/lfi/xss/csrf/ssrf/xxe/privesc/dos): coincidencia por PALABRA
+    # COMPLETA, no substring — 'rce' está dentro de 'source'/'force'/'resource'/'commerce'/'coerce'
+    # y 'sqli' dentro de 'mysqli', así que el substring marcaba exploits NO relacionados como
+    # critica/alta e inflaba la severidad del grupo en Quick Wins (#65). Las frases largas
+    # multi-palabra ('remote code execution', …) siguen por substring: ahí no hay colisión.
+    def hasw(*ws): return re.search(r"\b(" + "|".join(ws) + r")\b", t) is not None
+    if ty == "dos" or has("denial of service", "(dos)", "crash") or hasw("dos"):
         return "baja"
-    if has("remote code execution", "rce", "code execution", "command execution",
+    if has("remote code execution", "code execution", "command execution",
            "command injection", "backdoor", "unauthenticated", "deserialization",
-           "pre-auth", "preauth", "arbitrary code"):
+           "pre-auth", "preauth", "arbitrary code") or hasw("rce"):
         return "critica"                           # ejecución de código, sobre todo sin auth
-    if has("authentication bypass", "auth bypass", "sql injection", "sqli",
-           "arbitrary file upload", "file upload", "privilege escalation", "privesc",
+    if has("authentication bypass", "auth bypass", "sql injection",
+           "arbitrary file upload", "file upload", "privilege escalation",
            "arbitrary file write", "arbitrary file read", "directory traversal",
-           "path traversal", "buffer overflow", "overflow", "xxe", "ssrf"):
+           "path traversal", "buffer overflow", "overflow") or hasw("sqli", "privesc", "xxe", "ssrf"):
         return "alta"
     if ty in ("remote", "local"):
         return "alta"                              # exploit real remoto/local sin keyword clara
-    if has("cross-site scripting", "xss", "csrf", "information disclosure",
-           "disclosure", "local file inclusion", "lfi", "memory corruption"):
+    if has("cross-site scripting", "information disclosure",
+           "disclosure", "local file inclusion", "memory corruption") or hasw("xss", "csrf", "lfi"):
         return "media"
     return "media"
 
@@ -8799,26 +8805,32 @@ _OLD_OS_TITLE_RX = re.compile(
     re.I)
 
 
-def _detect_win_build(services):
+def _detect_win_build(services, host=None):
     """Saca el build de kernel de Windows de rdp-ntlm-info (Product_Version,
     inequívoco) o si no de smb-os-discovery (el número de 4-5 cifras más alto del
     texto: el build siempre es mayor que cualquier año de marketing tipo "2019"
     que aparezca en el nombre del producto). None si no hay info suficiente."""
-    for p in services:
+    for p in services:   # rdp-ntlm-info SÍ es un script POR PUERTO (3389)
         txt = (p.get("scripts") or {}).get("rdp-ntlm-info", "")
         m = re.search(r"Product_Version:\s*\d+\.\d+\.(\d+)", txt)
         if m:
             return int(m.group(1))
-    for p in services:
-        txt = (p.get("scripts") or {}).get("smb-os-discovery", "")
-        if "windows" in txt.lower():
+    # smb-os-discovery es un HOST script (parse_nmap_xml lo mete en `host`, bajo ./hostscript),
+    # NUNCA en los scripts de un puerto. Antes se leía solo de los scripts por-puerto, donde jamás
+    # está, así que el build de un DC cuyo SO solo delata smb-os-discovery (sin RDP) no se detectaba
+    # y la rebaja de exploits de SO antiguo contra un DC MODERNO no se aplicaba (#64). Se lee de
+    # `host` y, por compatibilidad, también de los scripts por-puerto (algún caso los trae así).
+    sources = [(host or {}).get("smb-os-discovery", "")]
+    sources += [(p.get("scripts") or {}).get("smb-os-discovery", "") for p in services]
+    for txt in sources:
+        if "windows" in (txt or "").lower():
             nums = [int(n) for n in re.findall(r"\b(\d{4,5})\b", txt)]
             if nums:
                 return max(nums)
     return None
 
 
-def vuln_search(services):
+def vuln_search(services, host=None):
     """Por cada versión detectada (product+version), busca en searchsploit.
     Devuelve None si no está instalado, o una lista (una fila por versión única,
     con los puertos que la comparten y sus exploits).
@@ -8863,7 +8875,7 @@ def vuln_search(services):
         out.append({"ports": [port], "service": "http", "product": name, "version": "",
                     "term": name, "exploits": cache[name], "known": True, "known_note": note})
 
-    build = _detect_win_build(services)
+    build = _detect_win_build(services, host)
     if build is not None and build >= WIN_MODERN_BUILD:
         for v in out:
             for e in v["exploits"]:
@@ -13297,6 +13309,14 @@ def selftest():
     assert _exploit_severity("Denial of Service (DoS)", "dos") == "baja"
     assert _exploit_severity("Reflected XSS", "webapps") == "media"
     assert _exploit_severity("Something generic remote", "remote") == "alta"
+    # #65: 'rce'/'sqli' se emparejan por PALABRA COMPLETA, no substring — 'source'/'force'/'mysqli'
+    # ya no inflan la severidad. (Antes 'Source Code Disclosure' daba 'critica' por el 'rce' de
+    # 'source', y 'MySQLi Extension' daba 'alta' por el 'sqli' de 'mysqli'.)
+    assert _exploit_severity("WordPress Plugin - Source Code Disclosure", "webapps") == "media"
+    assert _exploit_severity("App - Admin Brute Force", "webapps") == "media"
+    assert _exploit_severity("PHP MySQLi Extension Notice", "webapps") == "media"
+    assert _exploit_severity("Service - RCE in handler", "remote") == "critica"   # 'rce' palabra entera SÍ
+    assert _exploit_severity("Login SQLi auth bypass", "webapps") == "alta"       # 'sqli' palabra entera SÍ
 
     fprs = [{"proto": "smb", "title": "SMB", "ports": [445],
              "steps": [{"cmd": "smbclient -N -L //x", "ok": True, "output": "share", "note": "n"}],
@@ -13543,6 +13563,14 @@ def selftest():
     srv2019_svc = [{"port": 445, "scripts": {"smb-os-discovery": "OS: Windows Server 2019 Standard 17763"}}]
     assert _detect_win_build(srv2019_svc) == 17763   # no confunde el "2019" del nombre con el build real
     assert _detect_win_build([{"port": 80, "scripts": {}}]) is None
+    # #64: smb-os-discovery es un HOST script (va en `host`, no en los scripts por-puerto): un DC
+    # SIN RDP cuyo SO solo delata smb-os-discovery debe detectar el build desde `host`. Antes se
+    # leía solo de los scripts por-puerto → None → la rebaja de exploits de SO antiguo no se
+    # aplicaba y ~30 exploits RPC/DCOM ancestrales salían como accionables contra un DC moderno.
+    _dc_no_rdp = [{"port": 445, "scripts": {}}, {"port": 389, "scripts": {}}]
+    _dc_host = {"smb-os-discovery": "OS: Windows Server 2019 Standard 17763; FQDN: dc01.corp.local"}
+    assert _detect_win_build(_dc_no_rdp, _dc_host) == 17763, "build desde el HOST script"
+    assert _detect_win_build(_dc_no_rdp) is None   # sin host no hay forma (regresión del bug)
     old_exploits = [{"title": "Microsoft Windows XP/2000 - 'RPC DCOM' Remote (MS03-026)",
                      "edb": "66", "path": "/x", "platform": "windows", "type": "remote", "sev": "alta"},
                     {"title": "Vendor X - Modern RCE 2026", "edb": "99", "path": "/y",
@@ -15740,7 +15768,7 @@ def run_one(ip, name, args, folder=None):
         searchsploit_ok = True
     elif not args.no_searchsploit:
         try:
-            vulns = vuln_search(services)
+            vulns = vuln_search(services, host)
             render_vulns(vulns)
             searchsploit_ok = True
         except Exception as e:
