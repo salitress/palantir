@@ -1400,8 +1400,13 @@ def fuzz_dirs(ip, p, wordlists, ext, webdir, stealth=False, proxy=None, hostname
             path = r.get("input", {}).get("FUZZ")
             if path is None:
                 continue
-            hits[(path, r.get("status"))] = {"path": path, "status": r.get("status"),
-                                             "length": r.get("length")}
+            hit = {"path": path, "status": r.get("status"), "length": r.get("length")}
+            # #1: ffuf trae 'redirectlocation' para las 30x — un redirect a un login, a otra app
+            # o a un host interno es info útil que antes se perdía (solo se veía el código 301/302).
+            redir = (r.get("redirectlocation") or "").strip()
+            if redir:
+                hit["redir"] = redir
+            hits[(path, r.get("status"))] = hit
     return list(hits.values())
 
 
@@ -1570,6 +1575,9 @@ def fp_vhost_web(ip, webs, vhosts):
                     elif pst:
                         res["next"].append(
                             f"curl -s -H 'Host: {host}' {purl}  # robots.txt la marca, status {pst}")
+                for sm in _robots_sitemaps(rbody):   # #0: los Sitemap listan URLs reales del sitio
+                    res["next"].append(
+                        f"curl -s -H 'Host: {host}' {sm}  # sitemap de robots.txt ({host}): lista de URLs reales del sitio")
     return res
 
 
@@ -4434,6 +4442,20 @@ def _wafw00f_waf(out):
 
 
 _ROBOTS_PATH_RE = re.compile(r"(?mi)^\s*(?:Disallow|Allow)\s*:\s*(/\S*)")
+_ROBOTS_SITEMAP_RE = re.compile(r"(?mi)^\s*Sitemap\s*:\s*(\S+)")
+
+
+def _robots_sitemaps(body):
+    """URLs 'Sitemap:' de un robots.txt, deduplicadas y en orden (puro). Un sitemap lista las URLs
+    reales que el sitio quiere indexar — fuente barata de rutas 'ocultas' sin fuzzing. Antes
+    _robots_paths solo miraba Disallow/Allow y se ignoraban los Sitemap (#0 de MEJORAS.md)."""
+    seen, out = set(), []
+    for m in _ROBOTS_SITEMAP_RE.finditer(body or ""):
+        u = m.group(1).strip()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
 
 def _robots_paths(body):
@@ -9040,7 +9062,7 @@ KNOWN_VULN_WEB_PRODUCTS = [
 ]
 
 
-def _known_web_product(services):
+def _known_web_product(services, whatweb_by_port=None):
     """Busca en el http-title / http-server-header de CUALQUIER puerto (ya
     capturados por nmap) un producto de KNOWN_VULN_WEB_PRODUCTS. nmap -sV a veces
     solo da el banner genérico del framework (p.ej. "Microsoft HTTPAPI httpd 2.0")
@@ -9054,7 +9076,10 @@ def _known_web_product(services):
     coincidencia, o None."""
     for p in services:
         scripts = p.get("scripts") or {}
-        txt = scripts.get("http-title", "") + " " + scripts.get("http-server-header", "")
+        # #3: además del http-title/header de nmap, se mira la salida de whatweb de ESE puerto (si la
+        # hay): whatweb reconoce por firma propia muchos productos que nmap deja en banner genérico.
+        txt = (scripts.get("http-title", "") + " " + scripts.get("http-server-header", "")
+               + " " + (whatweb_by_port or {}).get(p["port"], ""))
         if not txt.strip():
             continue
         for rx, name, note in KNOWN_VULN_WEB_PRODUCTS:
@@ -9106,7 +9131,7 @@ def _detect_win_build(services, host=None):
     return None
 
 
-def vuln_search(services, host=None):
+def vuln_search(services, host=None, whatweb_by_port=None):
     """Por cada versión detectada (product+version), busca en searchsploit.
     Devuelve None si no está instalado, o una lista (una fila por versión única,
     con los puertos que la comparten y sus exploits).
@@ -9143,7 +9168,7 @@ def vuln_search(services, host=None):
                     "service": ps[0]["name"] or "?", "product": prod, "version": ver,
                     "term": term_used, "exploits": hits, "known": False, "known_note": ""})
 
-    kw = _known_web_product(services)
+    kw = _known_web_product(services, whatweb_by_port)
     if kw:
         port, name, note = kw
         if name not in cache:
@@ -10067,12 +10092,13 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
             if not hits:
                 continue
             titulo = f"Puerto {key} — directorios" if isinstance(key, int) else f"vhost {_h(key)} — directorios"
-            rws = "".join(
-                f'<tr><td class="p">{_h(h["status"])}</td><td>/{_h(h["path"])}</td>'
-                f'<td class="miss">{_fmt_size(h.get("length"))}</td></tr>'
-                for h in sorted(hits, key=lambda x: -(x["length"] if isinstance(x.get("length"), int) else 0))[:80])
+            _wh_rows = []
+            for h in sorted(hits, key=lambda x: -(x["length"] if isinstance(x.get("length"), int) else 0))[:80]:
+                _redir = f' <span class="miss">→ {_h(h["redir"])}</span>' if h.get("redir") else ""   # #1
+                _wh_rows.append(f'<tr><td class="p">{_h(h["status"])}</td><td>/{_h(h["path"])}{_redir}</td>'
+                                f'<td class="miss">{_fmt_size(h.get("length"))}</td></tr>')
             parts.append(f"<h3>{titulo}</h3>"
-                         f"<table><tr><th>Código</th><th>Ruta</th><th>Tamaño</th></tr>{rws}</table>")
+                         f"<table><tr><th>Código</th><th>Ruta</th><th>Tamaño</th></tr>{''.join(_wh_rows)}</table>")
         # Fusiona por dominio antes de pintar: la Fase 7 puede añadir (dom, vh) DOS veces para el
         # mismo dominio (pre-check de crt.sh + pasada con wordlist), lo que generaba dos tablas
         # '<h3>vhosts (dom)</h3>' idénticas en cabecera (#1). Dedup de filas por (host, status, length).
@@ -10341,7 +10367,7 @@ def build_markdown(ip, services, host, footprints, vulns, domains, web_hits, vho
             L.append(f"### Puerto {key} — directorios" if isinstance(key, int)
                      else f"### vhost {key} — directorios")
             for h in sorted(hits, key=lambda x: -(x["length"] or 0))[:40]:
-                L.append(f"- `{h['status']}` /{h['path']} ({h['length']} b)")
+                L.append(f"- `{h['status']}` /{h['path']}{(' → ' + h['redir']) if h.get('redir') else ''} ({_fmt_size(h.get('length'))})")
             L.append("")
         _md_vh = {}   # fusiona por dominio (crt.sh + wordlist) → una sola sección por dominio (#1)
         for hn, vh in vhosts:
@@ -13762,6 +13788,10 @@ def selftest():
         ["/index.html", "/admin_h1dd3n"]
     assert _robots_paths("Disallow: /x\ndisallow: /x\nDISALLOW: /y") == ["/x", "/y"]  # dedup, case-insensitive
     assert _robots_paths("") == [] and _robots_paths("User-agent: *\n") == []
+    # #0: Sitemap de robots.txt (URLs reales del sitio), deduplicado y en orden.
+    assert _robots_sitemaps("Sitemap: https://x/sitemap.xml\nDisallow: /a\nSitemap: https://x/s2.xml\nSitemap: https://x/sitemap.xml") \
+        == ["https://x/sitemap.xml", "https://x/s2.xml"]
+    assert _robots_sitemaps("User-agent: *\nDisallow: /x") == []
     assert _parse_ports("80, 443,80,abc,99999") == [80, 443]                # dedup + descarta inválidos
     assert _parse_hostnames(" App.X.local, dev.x.local ,,App.x.local") == ["app.x.local", "dev.x.local"]
     _nikto_sample = "+ 1316 requests: 0 error(s) and 12 item(s) reported on remote host"
@@ -13949,12 +13979,14 @@ def selftest():
              "term": "vsftpd 2.3.4", "exploits": [{"title": "vsftpd 2.3.4 - Backdoor Command Execution",
              "edb": "17491", "path": "/x", "platform": "unix", "type": "remote", "sev": "critica"}]}]
     # web_hits con clave int (puerto, Fase 6) y str "fqdn:puerto" (Fase 7b, dir-fuzz por vhost)
-    web_fix = {80: [{"path": "admin", "status": 200, "length": 12}],
+    web_fix = {80: [{"path": "admin", "status": 200, "length": 12},
+                    {"path": "login", "status": 302, "length": 0, "redir": "/sso/signin"}],   # #1: redirect de ffuf
                "dev.inlanefreight.htb:80": [{"path": "secret", "status": 200, "length": 7}]}
     vhost_fix = [("inlanefreight.htb", [{"host": "dev.inlanefreight.htb", "status": 200, "length": 9}])]
     doc = build_html("10.10.10.10", ports, host, fprs, vlns, ["inlanefreight.htb"],
                      web_fix, vhost_fix, None, "2026-01-01 00:00")
     assert "Puerto 80 — directorios" in doc and "vhost dev.inlanefreight.htb:80 — directorios" in doc
+    assert "→ /sso/signin" in doc   # #1: el destino del redirect de ffuf se muestra en la tabla
     for needle in ("<!DOCTYPE html>", "palantir", "SMB", "share READ", "/admin",
                    "dev.inlanefreight.htb", "10.10.10.10", "EDB-17491", "searchsploit",
                    "badge critica", "CRITICA", "Criticidad"):
@@ -14199,6 +14231,11 @@ def selftest():
     assert _known_web_product([{"port": 80, "proto": "tcp", "name": "http",
                                 "product": "Apache", "version": "",
                                 "scripts": {"http-title": "Welcome"}}]) is None
+    # #3: whatweb detecta el producto aunque el título/banner de nmap no lo delate.
+    _ww_svc = [{"port": 5000, "proto": "tcp", "name": "http", "product": "Microsoft HTTPAPI httpd",
+                "version": "2.0", "scripts": {"http-title": "Loading..."}}]
+    assert _known_web_product(_ww_svc) is None   # sin whatweb: el título genérico no casa
+    assert _known_web_product(_ww_svc, {5000: "FortiLogger[1.0]"}) == (5000, "FortiLogger", KNOWN_VULN_WEB_PRODUCTS[0][2])
     qw_known = quick_wins([], [{"ports": [5000], "service": "http", "product": "FortiLogger",
                                 "version": "", "term": "FortiLogger", "exploits": [],
                                 "known": True, "known_note": "RCE sin autenticación"}])
@@ -16444,7 +16481,7 @@ def run_one(ip, name, args, folder=None):
         searchsploit_ok = True
     elif not args.no_searchsploit:
         try:
-            vulns = vuln_search(services, host)
+            vulns = vuln_search(services, host, whatweb_cache)
             render_vulns(vulns)
             searchsploit_ok = True
         except Exception as e:
