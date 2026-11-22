@@ -6,10 +6,50 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.0.0] - 2026-11-22
+
+Milestone release. No breaking CLI or output changes (everything below is additive and
+backward-compatible); 2.0.0 marks the completion of the comprehensive super-audit: a full pass of
+real-bug fixes (each cited + verified against the external tool's own source + guarded by a
+`--selftest` test that fails without the fix), a code-quality pass, an HTML-report overhaul, and the
+implementation of the audit's read-only/detection-only feature ideas (previously tracked proposals,
+now shipped).
 
 ### Added
 
+- **Read-only detection surface (audit follow-ups).** A batch of detection-only improvements, each
+  reusing output palantir already captures (nxc banners, nmap XML, `whatweb`, `searchsploit -j`), so
+  almost none add new traffic against the target. All are detect-and-suggest; none add active/write
+  or post-exploitation steps.
+  - *Scan engine:* a new **"Escaneo / cobertura"** report section records the effective scan type
+    (`-sS` raw vs `-sT` connect, and why), persists **"flapping" ports** (seen open in Fase 1 but
+    not re-confirmed in Fase 2 — they no longer vanish with only a transient on-screen warning), and
+    marks the report **PARCIAL** when nmap's Fase 2 was cut short (`<runstats><finished exit="error">`);
+    Windows build/OS line surfaced from `smb-os-discovery`/`rdp-ntlm-info` when known.
+  - *SMB/nxc:* SMBv1-enabled flagged from the `(SMBv1:...)` banner; "Maximum password age" /
+    never-expiring passwords from `--pass-pol`; computer (`$`) accounts and groups listed separately
+    from RID cycling; guest-mapping reported as its own finding.
+  - *LDAP:* anonymous Domain/Enterprise Admins membership enumerated when the null bind reads;
+    pre-Windows-2000 computer accounts (`userAccountControl=4128`) on the anonymous path; LDAPS
+    channel binding reported independently of signing.
+  - *Kerberos:* `$krb5asrep$` hashes captured from `kerbrute userenum` output; kerbrute coverage
+    (`Done! Tested N`) reported.
+  - *Web:* `Sitemap:` entries parsed from `robots.txt`; interesting ffuf redirects
+    (`redirectlocation`) surfaced as hits; `whatweb` fingerprints feed product/extension guessing.
+  - *Other protocols:* SMTP AUTH offered without STARTTLS; Redis `redis_version` from INFO; DNS
+    NS/AXFR retried against the scanned DC when the system resolver gives no nameservers.
+  - *Credentials / DB:* post-login privilege probe for MySQL/PostgreSQL (`SHOW GRANTS`,
+    `@@secure_file_priv`, `pg_roles.rolsuper`); high-value table names highlighted in DB enum; NT-hash
+    reuse detected across local accounts of a dumped SAM.
+  - *Tooling:* brutespray major-version detection (v1 THC wrapper vs v2 Go) before invoking it;
+    `udp.gnmap` folded into the single-pass command when a crackable UDP service (SNMP) is present;
+    crackable footprinted services with no automated credential path (e.g. `oracle`) called out.
+  - *searchsploit:* CVE/MSB codes shown next to each EDB-ID (from the `Codes` field); exploit-db
+    `Verified` status marked to prioritize confirmed exploits.
+  - *Report/logic:* quick-win commands labeled **targeted** vs **generic**; near-duplicate next-steps
+    collapsed across the whole report body (not just Quick Wins); a development `--selftest` invariant
+    asserts each high-value critical/high finding type keeps its paired command (regression guard for
+    the finding→command association bug class).
 - `_dump_sam_lsa` now chains a third step after `--sam`/`--lsa` on every confirmed SMB
   `(Pwn3d!)`: `nxc smb ... -M lsassy`, a remote memory dump of `lsass.exe` (comsvcs.dll
   MiniDump, module source confirmed against nxc's own `nxc/modules/lsassy.py`). Unlike
@@ -98,8 +138,12 @@ test that fails without it. Highlights, by class:
   `open`); vhosts of the same domain are merged into one table; `--vhost-names` size shows `n/d`
   instead of `- b`; the exploits pill/TOC count distinct EDB-IDs.
 
-See `MEJORAS.md` for the read-only/detection-only feature ideas from the same audit (proposals, not
-implemented) and the design decisions on what palantir deliberately does **not** do.
+The read-only/detection-only feature ideas from the same audit are now implemented (see **Added**
+above). The design decisions on what palantir deliberately does **not** do — no active/write steps,
+no post-exploitation; high-impact actions (NTDS dump, Zerologon, DCSync, `certipy req`/`shadow`) are
+detected and suggested as manual next-steps but never chained automatically — are documented inline
+in the code at each relevant site (`certipy_bin`, `_surface_acl_abuse`, the Zerologon block of
+`fp_smb`, `_creds_enum`).
 
 ## [1.2.0] - 2026-11-21
 

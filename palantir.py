@@ -977,6 +977,57 @@ def parse_nmap_xml(path):
     return {"ports": ports, "host": hostscripts}
 
 
+def _nmap_finished_exit(path):
+    """'success' / 'error' / None leído de <runstats><finished exit=...> del XML de nmap.
+    nmap escribe exit="success" al terminar limpio; si lo matan (nuestro run() por timeout
+    → SIGTERM) y alcanza a volcar las stats, escribe exit="error" — señal de que el escaneo
+    quedó TRUNCADO y lo que haya salido es PARCIAL. None = no se puede saber (XML ausente,
+    no parsea, o sin <finished>): NO se asume nada (nunca se marca parcial por desconocerlo),
+    así que un objetivo normal jamás dispara un falso 'informe incompleto'."""
+    try:
+        root = ET.fromstring(_BAD_XML.sub("", Path(path).read_text(errors="replace")))
+    except (OSError, ET.ParseError, ValueError):
+        return None
+    fin = root.find("./runstats/finished")
+    return (fin.get("exit") or None) if fin is not None else None
+
+
+def _scan_meta_footprint(ip, missing=None, fase2_truncada=False):
+    """Footprint sintético 'Escaneo / cobertura' con metadata de reproducibilidad del escaneo
+    (super-auditoría: todo SOLO LECTURA sobre lo que nmap ya reportó), para que el informe sea
+    honesto sobre lo que midió en vez de leerse siempre como 'esto es todo lo que hay':
+      • tipo de escaneo EFECTIVO (-sS raw vs -sT connect, y por qué) → reproducible.
+      • puertos 'flapping' (la Fase 1 los vio ABIERTOS, la Fase 2 ya no): persisten en el
+        informe/JSON en vez de desaparecer dejando solo un aviso efímero en pantalla.
+      • Fase 2 truncada (nmap cortado por timeout): marca el informe como PARCIAL.
+    Devuelve None si no hay nada que anotar (nunca un footprint vacío)."""
+    findings = []
+    if CONNECT:
+        st = "connect scan (-sT), forzado por --tcp-connect o auto-fallback (los SYN raw no volvían)"
+    elif is_root():
+        st = "SYN/raw (-sS)"
+    else:
+        st = "connect scan (-sT): sin root, nmap no puede hacer SYN raw"
+    findings.append(("info", f"Escaneo: tipo efectivo = {st}. "
+                     f"Reproducible con: nmap {scan_type()} -p- {ip}"))
+    if missing:
+        ml = ", ".join(map(str, missing))
+        findings.append(("media",
+            f"Escaneo: {len(missing)} puerto(s) 'flapping' — la Fase 1 los vio ABIERTOS pero el "
+            f"re-escaneo de la Fase 2 ya no: {ml}. NO entran en footprint/credenciales/informe (no "
+            f"necesariamente cerrados: probable rate-limit/flapping tras dos barridos seguidos). "
+            f"Compruébalo a mano: nmap -sV -p {ml} {ip}"))
+    if fase2_truncada:
+        findings.append(("media",
+            "Escaneo: la Fase 2 (enumeración de servicios) NO terminó limpia (nmap cortado por "
+            "timeout) — este informe puede estar INCOMPLETO: léelo como parcial, no como 'no hay "
+            f"nada más'. Repite con más margen: nmap -sV -p <puertos> --host-timeout 20m {ip}"))
+    if not findings:
+        return None
+    return {"proto": "scan", "title": "Escaneo / cobertura", "ports": [], "steps": [],
+            "findings": findings, "next": [], "missing": [], "_phase": "scanmeta"}
+
+
 def version_str(p):
     s = " ".join(x for x in (p["product"], p["version"]) if x)
     if p["extrainfo"]:
@@ -2227,7 +2278,8 @@ def certipy_bin():
     dominio YA validada — 'certipy find' es de SOLO LECTURA (enumera CAs/plantillas
     vía LDAP, no escribe nada); 'certipy req'/'certipy shadow' (pedir o fabricar un
     certificado) son una escalada activa y palantir nunca los encadena solo — quedan
-    como sugerencia manual en 'next', igual que el volcado de NTDS (ver MEJORAS.md)."""
+    como sugerencia manual en 'next', igual que el volcado de NTDS (paso activo/destructivo:
+    palantir detecta y sugiere, nunca ejecuta un paso activo por su cuenta)."""
     return _bin_with_sudo_fallback(("certipy", "certipy-ad"), home_dirs=(".local/bin",))
 
 
@@ -3097,7 +3149,9 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                     "no se encadena solo; sustituye NETBIOS-DEL-DC por el nombre del equipo si no se rellenó "
                     "solo arriba). Tras esto: DCSync con esa cuenta ya vacía, y luego RESTAURAR la contraseña "
                     "original (recuperable del secreto LSA local $MACHINE.ACC) con restorepassword.py del "
-                    "mismo repo — ver MEJORAS.md 'Pendiente' para la cadena completa, verificada en un run real")
+                    "mismo repo). La cadena entera (Zerologon → DCSync → restaurar) queda como pasos "
+                    "MANUALES: palantir nunca la encadena sola (alto impacto; Zerologon deja la cuenta "
+                    "de máquina con contraseña vacía hasta restaurarla).")
             # Enum AD de solo lectura: SOLO si alguna identidad anónima (null/guest) abrió sesión.
             # Si ninguna entra, --users/--groups/--pass-pol/--rid-brute no devuelven nada útil —
             # no los lanzamos (ruido) y dejamos indicado que hacen falta credenciales. La Fase 5d
@@ -4527,7 +4581,7 @@ _ROBOTS_SITEMAP_RE = re.compile(r"(?mi)^\s*Sitemap\s*:\s*(\S+)")
 def _robots_sitemaps(body):
     """URLs 'Sitemap:' de un robots.txt, deduplicadas y en orden (puro). Un sitemap lista las URLs
     reales que el sitio quiere indexar — fuente barata de rutas 'ocultas' sin fuzzing. Antes
-    _robots_paths solo miraba Disallow/Allow y se ignoraban los Sitemap (#0 de MEJORAS.md)."""
+    _robots_paths solo miraba Disallow/Allow y se ignoraban los Sitemap."""
     seen, out = set(), []
     for m in _ROBOTS_SITEMAP_RE.finditer(body or ""):
         u = m.group(1).strip()
@@ -7934,7 +7988,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # Admin cuando hay AD CS mal configurado). No escribe nada en el AD. El paso
             # siguiente si encuentra algo vulnerable ('certipy req'/'certipy shadow' — pedir
             # o fabricar un certificado) SÍ es una escalada activa, igual de cualitativa que
-            # el volcado de NTDS (ver "Pendiente" en MEJORAS.md): palantir NUNCA lo encadena
+            # el volcado de NTDS (un paso activo/destructivo): palantir NUNCA lo encadena
             # solo, queda como sugerencia manual en 'next' con el nombre real de CA/plantilla
             # a rellenar de la salida de 'certipy find'.
             certipy = certipy_bin()
@@ -8033,7 +8087,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # pero SOLO de la cuenta krbtgt (-just-dc-user), no el NTDS completo: es la MISMA
             # diferencia cualitativa que ya separa LAPS/certipy (solo lectura puntual) del
             # volcado de NTDS que palantir nunca encadena solo (ver comentario de certipy
-            # arriba y "Pendiente" en MEJORAS.md) — aquí se confirma el derecho con UN hash,
+            # arriba) — aquí se confirma el derecho con UN hash,
             # no se vacía el dominio entero. Sin derechos, secretsdump falla limpio
             # (RPC_S_ACCESS_DENIED) y no imprime la línea de krbtgt.
             secretsdump = _secretsdump_bin()
@@ -8062,7 +8116,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                         "Con él: Golden Ticket (ticketer.py) o volcado COMPLETO de NTDS (paso MANUAL)"))
                     res["next"].append(
                         f"{secretsdump} {shown_hs}-just-dc {shown_target}   # DCSync confirmado arriba: "
-                        "vuelca TODO NTDS (paso MANUAL, no se encadena solo — ver MEJORAS.md)")
+                        "vuelca TODO NTDS (paso MANUAL de alto impacto, no se encadena solo)")
                     res["next"].append(
                         f"ticketer.py -nthash {krbtgt_hash} -domain-sid DOMAIN_SID -domain {domain} "
                         "baduser   # Golden Ticket con el hash de krbtgt confirmado arriba (paso MANUAL) — "
@@ -9495,7 +9549,7 @@ def render_footprint(footprints):
 # siendo (severidad, texto) en las ~cientos de .append() del fichero) — se adjuntan por
 # COINCIDENCIA contra ese texto ya existente, en la capa de presentación (quick_wins →
 # terminal/HTML/Markdown), nunca en la recolección. Lista abierta: ir ampliándola con el
-# tiempo, no hace falta cubrir cada hallazgo posible de golpe (ver MEJORAS.md).
+# tiempo, no hace falta cubrir cada hallazgo posible de golpe.
 _TIPS = (
     (re.compile(r"AXFR permitido", re.I),
      "Un zone transfer da de golpe el mapa del dominio interno: hosts, subdominios y a veces "
@@ -9715,7 +9769,9 @@ def quick_wins(footprints, vulns=None):
             # por CVE/nombre de ataque y, en último término, al orden original del footprint.
             explicit = cmd_for.get(t)
             cmds = list(explicit) if explicit else _cmds_for(t, next_pool)
-            wins.append({"sev": s, "title": t, "cmds": cmds, "tip": _tip_for(t)})
+            # #35: 'targeted' = el comando se vinculó al hallazgo en origen (_attach_cmd), así que es
+            # EL paso que lo explota; sin eso, cmds es el emparejado heurístico/primeros-N (genérico).
+            wins.append({"sev": s, "title": t, "cmds": cmds, "tip": _tip_for(t), "targeted": bool(explicit)})
     for v in (vulns or []):
         if not v.get("known"):
             continue
@@ -9725,7 +9781,7 @@ def quick_wins(footprints, vulns=None):
             cmds = [f"searchsploit {v['term']}   # buscar el módulo/PoC a mano"]
         wins.append({"sev": "critica",
                      "title": f"{v['product']} en puerto {v['ports'][0]}: {v['known_note']}",
-                     "cmds": cmds})
+                     "cmds": cmds, "targeted": True})   # searchsploit -x <edb> es específico del producto
     wins.sort(key=lambda w: SEV_ORDER.get(w["sev"], 9))
     # Dedup DESPUÉS de ordenar: un MISMO next-step se muestra una sola vez, en el win de MAYOR
     # severidad (p. ej. el bloodhound de la Fase 5d, común a varios hallazgos) — así la caja de
@@ -9753,7 +9809,10 @@ def render_quick_wins(wins):
     lines = []
     for w in wins[:12]:
         col = C_RED + C_BOLD if w["sev"] == "critica" else C_RED
-        lines.append(f"{col}[{w['sev']}]{C_RESET} {w['title']}")
+        _tag = ""
+        if w["cmds"]:
+            _tag = f" {C_GREY}·{'dirigido' if w.get('targeted') else 'genérico'}{C_RESET}"   # #35
+        lines.append(f"{col}[{w['sev']}]{C_RESET} {w['title']}{_tag}")
         for c in w["cmds"][:2]:
             lines.append(f"  {C_GREY}$ {c}{C_RESET}")
         if w.get("tip"):
@@ -10234,6 +10293,7 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
                  + "".join(rows) + "</table>")
 
     fp_html, fp_toc = [], []
+    _seen_next = set()   # #37: colapsa next-steps casi-duplicados en TODO el cuerpo (1ª aparición gana)
     for i, g in enumerate(_group_footprints_by_protocol(footprints)):
         pstr = ",".join(map(str, g["ports"]))
         sub_blocks, nf = [], 0
@@ -10249,8 +10309,17 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
             inner = _html_findings_block(fpr["findings"], group=True)
             inner += _html_steps(fpr["steps"], collapsible=(kind != "provided"))
             if fpr["next"]:
-                inner += "<h3>Siguientes pasos</h3><ul class='next'>" + \
-                         "".join(f"<li><code>{_h(x)}</code>{_copy_btn(x)}</li>" for x in fpr["next"]) + "</ul>"
+                # #37: salta un next-step cuyo comando (sin el comentario inline) ya salió en una
+                # sección anterior del informe — evita ver el MISMO comando repetido por protocolo.
+                _nx_items = []
+                for x in fpr["next"]:
+                    _nxkey = x.split("   #", 1)[0].rstrip()
+                    if _nxkey in _seen_next:
+                        continue
+                    _seen_next.add(_nxkey)
+                    _nx_items.append(f"<li><code>{_h(x)}</code>{_copy_btn(x)}</li>")
+                if _nx_items:
+                    inner += "<h3>Siguientes pasos</h3><ul class='next'>" + "".join(_nx_items) + "</ul>"
             if fpr["missing"]:
                 inner += f'<p class="miss">Herramientas no instaladas: {_h(", ".join(fpr["missing"]))}</p>'
             heading = f'<h4 class="subhead">{_h(label)}</h4>' if label else ""
@@ -10393,8 +10462,14 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
         for w in wins[:12]:
             cmds = "".join(f'<div class="cmd">$ {_h(c)}{_copy_btn(c)}</div>' for c in w["cmds"][:2])
             tip_html = f'<div class="tip">💡 {_h(w["tip"])}</div>' if w.get("tip") else ""
+            # #35: marca si el comando es DIRIGIDO (explota este hallazgo) o GENÉRICO (pasos del
+            # protocolo — revisa que apliquen). Solo cuando hay comando que calificar.
+            _lbl = ""
+            if w["cmds"]:
+                _lbl = ('<span class="svc-open"> ·dirigido</span>' if w.get("targeted")
+                        else '<span class="miss"> ·genérico</span>')
             items.append(f'<div class="f"><span class="badge {w["sev"]}">{w["sev"].upper()}</span>'
-                         f'<div style="flex:1"><div>{_h(w["title"])}</div>{cmds}{tip_html}</div></div>')
+                         f'<div style="flex:1"><div>{_h(w["title"])}{_lbl}</div>{cmds}{tip_html}</div></div>')
         qw_html = (f'<h3 style="margin-top:0">★ Quick wins ({len(wins)})</h3>'
                    '<div class="findings">' + "".join(items) + '</div>')
 
@@ -10839,6 +10914,33 @@ def selftest():
     assert host["smb-os-discovery"].startswith("OS: Windows")            # host scripts OK
     assert version_str(next(p for p in ports if p["port"] == 22)) == "OpenSSH 7.6p1 (Ubuntu)"
     assert parse_nmap_xml("/no/existe.xml") is None                      # fichero ausente → None
+
+    # #1: _nmap_finished_exit lee exit= de <runstats><finished> — 'success' = limpio, 'error' =
+    # nmap cortado (→ informe PARCIAL); None cuando no se puede saber (nunca un falso 'parcial').
+    def _wx(_xml):
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as _f:
+            _f.write(_xml)
+            return _f.name
+    _okx = _wx('<nmaprun><runstats><finished exit="success"/></runstats></nmaprun>')
+    _errx = _wx('<nmaprun><runstats><finished exit="error" errormsg="cut"/></runstats></nmaprun>')
+    _nofx = _wx('<nmaprun><host></host></nmaprun>')
+    assert _nmap_finished_exit(_okx) == "success"
+    assert _nmap_finished_exit(_errx) == "error"
+    assert _nmap_finished_exit(_nofx) is None            # sin <finished>: no se sabe → None
+    assert _nmap_finished_exit("/no/existe.xml") is None
+    for _p in (_okx, _errx, _nofx):
+        os.unlink(_p)
+    # #2/#3: _scan_meta_footprint anota SIEMPRE el tipo de escaneo (info); 'flapping' y Fase 2
+    # truncada solo cuando los hay. Todo SOLO LECTURA sobre lo que nmap ya reportó.
+    _sm = _scan_meta_footprint("10.0.0.9", missing=[3389, 8080], fase2_truncada=True)
+    assert _sm and _sm["proto"] == "scan" and _sm["_phase"] == "scanmeta" and _sm["ports"] == []
+    assert any(s == "info" and "tipo efectivo" in t for s, t in _sm["findings"])     # #3
+    assert any("flapping" in t and "3389" in t and "8080" in t for _, t in _sm["findings"])  # #2
+    assert any("INCOMPLETO" in t for _, t in _sm["findings"])                        # #1
+    _sm2 = _scan_meta_footprint("10.0.0.9")              # sin flapping ni truncado
+    assert _sm2 and len(_sm2["findings"]) == 1 and _sm2["findings"][0][0] == "info"  # solo el tipo
+    # el footprint sintético renderiza sin romper en HTML/MD aunque no tenga puertos
+    assert "Escaneo / cobertura" in build_html("10.0.0.9", [], {}, [_sm], [], [], {}, [], None, "2026-01-01 00:00")
 
     def fake(product="", version="", extrainfo="", name="http", port=80, tunnel="", banner="", **sc):
         return {"product": product, "version": version, "extrainfo": extrainfo,
@@ -13431,7 +13533,8 @@ def selftest():
     # dominio se queda en sugerencia manual (placeholder "DOMINIO") y NUNCA se ejecuta a
     # ciegas; y si encuentra una plantilla vulnerable, 'certipy req' (escalada activa:
     # pide un certificado) solo se SUGIERE, nunca se encadena solo — igual que el resto
-    # de pasos activos (NTDS dump, ver MEJORAS.md).
+    # de pasos activos (p. ej. el volcado de NTDS): se detectan y se sugieren, nunca se
+    # encadenan solos (palantir termina donde empieza la explotación activa/destructiva).
     _real_certipy_bin = globals()["certipy_bin"]
     _certipy_cmds = []
 
@@ -14497,6 +14600,34 @@ def selftest():
     _acl_qw = quick_wins([_acl_fp])
     assert _acl_qw and "bloodyAD" in _acl_qw[0]["cmds"][0], _acl_qw
     assert not any("GetNPUsers" in c or "GetUserSPNs" in c for c in _acl_qw[0]["cmds"]), _acl_qw
+    # #35/#36: un hallazgo con comando vinculado en origen (_cmd_for) sale marcado 'targeted'; uno
+    # genérico (primeros-N del pool) no. Invariante: todo win con _cmd_for es targeted.
+    assert _acl_qw[0].get("targeted") is True, _acl_qw[0]
+    _gen_qw = quick_wins([{"proto": "x", "title": "X", "ports": [1], "steps": [],
+                           "findings": [("alta", "Puerto 80 abierto")], "next": ["nmap -sC", "a", "b"], "missing": []}])
+    assert _gen_qw and _gen_qw[0].get("targeted") is False, _gen_qw
+    # #36: regresión de la CLASE de bug de asociación hallazgo→comando. Tabla (una fila por tipo de
+    # hallazgo crítico/alto de alto valor): con su comando vinculado en origen, el quick win debe (a)
+    # mostrar ESE comando el primero y (b) salir marcado 'targeted' — nunca caer al re-escaneo
+    # genérico que encabeza el pool. Añade una fila aquí al introducir una categoría crítica nueva.
+    _assoc_cases = [
+        # (texto del hallazgo, comando vinculado, subcadena del comando correcto, genérico prohibido)
+        ("AD (cred U): «U» tiene WriteDACL sobre 'Domain Admins' → escalada DIRECTA",
+         "bloodyAD --host 1.2.3.4 -d dom -u U -p P add groupMember 'Domain Admins' U", "bloodyAD", "GetNPUsers"),
+        ("Web 80: .git/ expuesto (repositorio descargable → código fuente) — http://x/.git/HEAD",
+         "git-dumper 'http://x/.git/' loot_git", "git-dumper", "--nuclei"),
+        ("LDAP (cred alice): ¡DCSync permitido! hash de krbtgt recuperado",
+         "impacket-secretsdump dom/alice:P@1.2.3.4   # DCSync", "secretsdump", "GetNPUsers"),
+    ]
+    for _ftxt, _fcmd, _want, _forbid in _assoc_cases:
+        _afp = {"proto": "x", "title": "x", "ports": [1], "steps": [], "findings": [("critica", _ftxt)],
+                "next": ["impacket-GetNPUsers dom/U:P -request   # AS-REP", "palantir x --nuclei   # nuclei"],
+                "missing": []}
+        _attach_cmd(_afp, _ftxt, [_fcmd])
+        _aqw = quick_wins([_afp])
+        assert _aqw and _want in _aqw[0]["cmds"][0], (_ftxt, _aqw)
+        assert _aqw[0].get("targeted") is True, (_ftxt, _aqw[0])
+        assert not any(_forbid in c for c in _aqw[0]["cmds"]), (_ftxt, _aqw[0]["cmds"])
     # _attach_cmd añade el comando a res['next'] si no estaba (sigue en la sección completa) y lo
     # guarda en la clave INTERNA '_cmd_for' (prefijo '_'), no en una clave pública.
     assert any("bloodyAD" in n for n in _acl_fp["next"]) and "_cmd_for" in _acl_fp
@@ -14608,6 +14739,26 @@ def selftest():
     _gmd = build_markdown("10.0.0.5", [], {}, _grp_fprs, [], [], {}, [], None, "2026-01-01 00:00")
     assert _gmd.count("## MSRPC / WMI") == 1
     assert "### Credenciales aportadas" in _gmd           # sub-encabezado porque hay 2+ sub-bloques con contenido
+
+    # #37: colapso de next-steps casi-duplicados en TODO el cuerpo del informe (no solo en Quick
+    # Wins). Dos protocolos distintos que emiten el MISMO comando base con comentarios inline
+    # distintos (p. ej. 'impacket-GetUserSPNs …' desde SMB y desde LDAP) deben renderizarlo UNA
+    # sola vez en el <ul class='next'> (gana la 1ª aparición); un comando realmente distinto NO
+    # se pierde. Clave de comparación: el comando SIN su '   # comentario'.
+    # (severidad 'info' a propósito: así no entran en Quick Wins y el conteo aísla el CUERPO).
+    _dedup_cmd = "impacket-GetUserSPNs dom/U:P -request -dc-ip 9.9.9.9"
+    _dd_fprs = [
+        {"proto": "smb", "title": "SMB", "ports": [445], "steps": [], "findings": [("info", "A")],
+         "next": [_dedup_cmd + "   # Kerberoast desde SMB", "nxc smb 9.9.9.9 --shares   # shares"], "missing": []},
+        {"proto": "ldap", "title": "LDAP", "ports": [389], "steps": [], "findings": [("info", "B")],
+         "next": [_dedup_cmd + "   # Kerberoast desde LDAP"], "missing": []},
+    ]
+    _ddoc = build_html("10.0.0.6", [], {}, _dd_fprs, [], [], {}, [], None, "2026-01-01 00:00")
+    # un único <li><code>…</code> con el comando compartido (gana la 1ª aparición: "desde SMB");
+    # la 2ª (misma base, otro comentario: "desde LDAP") se colapsa.
+    assert _ddoc.count("<code>" + _h(_dedup_cmd)) == 1, "el comando compartido debe salir una sola vez en el cuerpo"
+    assert "Kerberoast desde SMB" in _ddoc and "Kerberoast desde LDAP" not in _ddoc
+    assert _h("nxc smb 9.9.9.9 --shares") in _ddoc        # un comando distinto NO se descarta
 
     # _html_steps: solo colapsa si TODOS los pasos fallaron; con al menos 1 éxito, se ve entero
     assert "attempts" not in _html_steps(
@@ -16652,6 +16803,10 @@ def run_one(ip, name, args, folder=None):
              f"que el puerto esté cerrado de verdad. Compruébalo a mano "
              f"(nmap -sV -p {','.join(map(str, missing))} {ip}) o repite el run — --resume NO sirve "
              f"aquí, reutilizaría este mismo resultado sin volver a preguntarle al objetivo.")
+    # Fase 2 truncada (nmap cortado por timeout) → el informe se marcará PARCIAL (ver
+    # _scan_meta_footprint). Solo tiene sentido en un escaneo fresco: en --resume el XML es el
+    # viejo (ya se reportó en su run) y re-marcarlo parcial sería ruido.
+    _fase2_truncada = (not args.resume) and _nmap_finished_exit(str(nmapdir / "deep.xml")) == "error"
 
     want_udp = args.udp or (args.default_creds and is_root())   # creds necesita SNMP(161)/IPMI(623)
     if want_udp and is_root():
@@ -16902,6 +17057,11 @@ def run_one(ip, name, args, folder=None):
         _run_deferred_kerbrute_fallback(footprints)
     except Exception as e:
         _phase_fail("kerbrute diferido (fallback)", e, base)
+    # Metadata de escaneo (tipo efectivo, puertos 'flapping', Fase 2 truncada): se añade al final
+    # para que viaje al informe/JSON como una sección propia, no solo como aviso efímero en pantalla.
+    _scan_fp = _scan_meta_footprint(ip, missing=missing, fase2_truncada=_fase2_truncada)
+    if _scan_fp:
+        footprints.append(_scan_fp)
     render_footprint(footprints)
 
     # Se guarda en findings.json (ver write_reports) para que un futuro --resume sepa qué
