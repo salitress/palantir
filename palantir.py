@@ -2243,6 +2243,16 @@ def _nxc_has_data(out):
 
 
 _NXC_SIGNING_RE = re.compile(r"\(signing:(True|False)\)")
+_NXC_SMBV1_RE = re.compile(r"\(SMBv1:(True|False)\)")
+
+
+def _parse_nxc_smbv1(out):
+    """¿SMBv1 habilitado? True/False/None (no leído) del banner de nxc smb, que lo imprime
+    SIEMPRE tras negociar ('(signing:True) (SMBv1:None)' — None/False = deshabilitado). SMBv1
+    habilitado = protocolo legacy inseguro (superficie de EternalBlue/relay NTLMv1, degradación).
+    Formato confirmado contra el run real. Puro → testeable sin red."""
+    m = _NXC_SMBV1_RE.search(out or "")
+    return {"True": True, "False": False}.get(m.group(1)) if m else None
 
 
 def _parse_nxc_signing(out):
@@ -2289,6 +2299,7 @@ _PASSPOL_FIELD_RE = {
     "min_len": re.compile(r"Minimum password length:\s*(\d+)", re.I),
     "history": re.compile(r"Password history length:\s*(\d+)", re.I),
     "complex": re.compile(r"Domain Password Complex:\s*(\d)", re.I),
+    "max_age": re.compile(r"Maximum password age:\s*([^\n]+)", re.I),
     "lockout_threshold": re.compile(r"Account Lockout Threshold:\s*(\S+)", re.I),
     "lockout_duration": re.compile(r"Locked Account Duration:\s*([^\n]+)", re.I),
     "lockout_reset": re.compile(r"Reset Account Lockout Counter:\s*([^\n]+)", re.I),
@@ -2423,6 +2434,14 @@ def _format_pass_pol_finding(pol, prefix="AD"):
         parts.append("complejidad activada" if pol["complex"] == "1" else "complejidad DESACTIVADA")
     if "history" in pol:
         parts.append(f"historial {pol['history']}")
+    # Maximum password age: si es 'Not Set'/'None'/0 → las contraseñas NUNCA caducan (una cuenta
+    # de servicio con contraseña débil que no expira nunca es un problema de higiene) (#8).
+    if "max_age" in pol:
+        _age = pol["max_age"].strip()
+        if _age.lower() in ("not set", "none", "0") or _age.startswith("0 "):
+            parts.append("las contraseñas NO caducan (sin caducidad máxima)")
+        else:
+            parts.append(f"caducidad máx. {_age}")
     thr = pol.get("lockout_threshold")
     if thr is not None:
         if thr in ("None", "0"):
@@ -2855,12 +2874,15 @@ def fp_smb(ip, ports, services, host, deep, base=None):
         spider_user, spider_out = None, ""
         signing = None   # SMB signing requerido: lo imprime el banner de nxc SIEMPRE, incluso si
         # el login de esta identidad falla — basta con leerlo de la 1ª respuesta que lo traiga.
+        smbv1 = None     # SMBv1 habilitado: mismo banner, misma lógica de "leerlo una vez".
         for user, lbl in NXC_ANON_IDS:
             rc, out = run_capture([nxc, "smb", ip, "-u", user, "-p", "", "--shares"], timeout=60)
             _step(res, f"{nxc} smb {ip} -u '{user}' -p '' --shares", rc == 0, out,
                   note=f"listar comparticiones y permisos como {lbl} (muchos SMB dejan abierta la sesión nula/invitado)")
             if signing is None:
                 signing = _parse_nxc_signing(out)
+            if smbv1 is None:
+                smbv1 = _parse_nxc_smbv1(out)
             if re.search(r"\(Pwn3d!\)", out):
                 res["findings"].append(("critica", f"SMB: acceso de administrador vía {lbl} (Pwn3d!)"))
             elif user and _nxc_ok(out) and not (user.lower() != "guest" and "(Guest)" in out):
@@ -2887,6 +2909,11 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                 res["findings"].append(("media", "SMB: autenticación nula aceptada (Null Auth: True)"))
             if working is None and _nxc_ok(out):
                 working = user
+        if smbv1 is True:
+            res["findings"].append(("media",
+                "SMB: SMBv1 habilitado — protocolo legacy inseguro (superficie de EternalBlue/MS17-010 "
+                "y de relay NTLMv1/downgrade). Deshabilítalo; si además es un objetivo Windows antiguo, "
+                "revisa el check de MS17-010 de arriba."))
         if signing is False:
             res["findings"].append(("media",
                 "SMB: signing NO requerido — superficie de NTLM relay: si además hay un primitivo de "
@@ -11498,6 +11525,10 @@ def selftest():
     assert "longitud mínima 8" in _ppol_finding and "complejidad activada" in _ppol_finding
     assert "bloqueo tras 5 intentos" in _ppol_finding and "30 minutes" in _ppol_finding
     assert "SIN bloqueo" not in _ppol_finding   # hay lockout de verdad: no es el caso "sin bloqueo"
+    # #8: Maximum password age 'Not Set' → se marca que las contraseñas NO caducan.
+    assert _ppol["max_age"] == "Not Set" and "NO caducan" in _ppol_finding, _ppol_finding
+    assert "caducidad máx. 90 days" in _format_pass_pol_finding(_parse_pass_pol(
+        "SMB x 445 DC Minimum password length: 8\nSMB x 445 DC Maximum password age: 90 days ")), "edad real"
     # con credencial: mismo resumen, con el prefijo "AD (cred user)" (igual que el resto de
     # hallazgos de _surface_ad_enum, p. ej. "AD (cred wwhite): N usuarios…")
     assert _format_pass_pol_finding(_ppol, prefix="AD (cred wwhite)").startswith(
@@ -11658,6 +11689,10 @@ def selftest():
         "SMB 10.129.4.104 445 FRONTDESK01 [*] Windows 10 (name:FRONTDESK01) (domain:FrontDesk01) (signing:False) (SMBv1:None)") is False
     assert _parse_nxc_signing("") is None
     assert _parse_nxc_signing("sin el patrón esperado") is None
+    # #7/#10: SMBv1 habilitado desde el mismo banner (SMBv1:True = legacy inseguro; None/False = off).
+    assert _parse_nxc_smbv1("SMB x 445 DC [*] Windows 7 (signing:False) (SMBv1:True)") is True
+    assert _parse_nxc_smbv1("SMB x 445 DC [*] Windows 10 (signing:True) (SMBv1:None)") is None
+    assert _parse_nxc_smbv1("SMB x 445 DC [*] Windows 10 (signing:True) (SMBv1:False)") is False
 
     # fp_smb: signing no requerido → hallazgo 'media' + metadata interna '_signing_disabled' (la
     # consume footprint_services, no se muestra). Con signing:True, nada de esto aparece.
