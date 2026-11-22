@@ -1062,6 +1062,61 @@ CRAWL = False    # --crawl: katana (crawling real: sigue enlaces/JS/formularios,
 NUCLEI = False   # --nuclei: plantillas de nuclei (CVEs/exposiciones/misconfig) contra cada web (opt-in)
 SPIDER = False   # --spider: spidering de CONTENIDO de shares SMB con nxc (--spider --content), busca secretos dentro de los ficheros (opt-in, lento)
 SPIDER_PATTERN = None  # --pattern: patrón(es) para --spider (si no, un regex de secretos por defecto)
+SHOW_SECRETS = False  # --show-password: muestra la contraseña/hash REAL en los comandos del informe
+                      # (para copiar-pegar) en vez de '***'. Por defecto se enmascara: el informe
+                      # (terminal + html/md/json) se comparte y no debe llevar credenciales en claro
+                      # de serie. OJO: los hallazgos de credencial VÁLIDA y los quick-wins ya
+                      # rellenan la credencial descubierta en claro (es botín, no tu input); esto
+                      # solo controla las VISTAS PREVIAS de comando con el secreto que TÚ aportaste.
+
+
+def _sec_disp(secret, is_hash=False):
+    """Cómo se MUESTRA un secreto (contraseña aportada o hash) en un comando del informe, como el
+    valor que va tras '-p '/'-H ': '' si no hay secreto, el valor REAL (shlex-quote) con
+    --show-password, o '***' enmascarado por defecto. is_hash solo cambia el enmascarado
+    (':***' para el pass-the-hash de bloodyAD '-p :hash'); con --show-password se devuelve el
+    valor tal cual. Puro → testeable sin red."""
+    if not secret:
+        return "''"
+    if SHOW_SECRETS:
+        return shlex.quote(":" + secret if is_hash else secret)
+    return "':***'" if is_hash else "'***'"
+
+
+def _cred_note(u, secret):
+    """'user:secret' para el NOTE/registro de un paso: enmascarado ('***') por defecto, en claro
+    con --show-password. '' (sin contraseña) se muestra como '∅'. El HALLAZGO de credencial
+    VÁLIDA sí muestra siempre la credencial en claro (es botín confirmado, no tu input); esto es
+    solo para la nota del paso, que se registra incluso en intentos fallidos."""
+    if secret == "":
+        return f"{u}:∅"
+    return f"{u}:{secret if SHOW_SECRETS else '***'}"
+
+
+def _url_sec(secret, is_hash=False):
+    """Secreto para la forma URL de impacket 'DOMINIO/user:SEC@host' (GetUserSPNs/GetNPUsers/
+    secretsdump/dacledit…): '' cuando es un hash (va aparte por -hashes) o no hay secreto, la
+    contraseña REAL con --show-password, o '***' enmascarada por defecto. Puro → testeable."""
+    if is_hash or not secret:
+        return ""
+    return secret if SHOW_SECRETS else "***"
+
+
+def _env_pw_note(var, pw):
+    """Nota '(VAR=***)' de un secreto pasado por ENTORNO (no en el argv, para que no quede en el
+    'ps'/log): vacío si no hay contraseña, el valor REAL con --show-password, o '***' por defecto."""
+    if not pw:
+        return ""
+    return f"  ({var}={pw})" if SHOW_SECRETS else f"  ({var}=***)"
+
+
+def _mask_out(text, secret):
+    """Enmascara el secreto aportado en una salida capturada, salvo con --show-password. Un
+    secreto en claro de nxc (p. ej. 'DOMINIO\\user:password' en la línea de éxito) no debe
+    acabar en el informe por defecto; con --show-password se deja tal cual."""
+    if secret and not SHOW_SECRETS:
+        return (text or "").replace(secret, "***")
+    return text
 
 
 def _nmap_run(cmd, timeout, outfile):
@@ -4243,9 +4298,9 @@ def fp_mssql(ip, ports, services, host, deep):
     for lbl, txt in _nse_for(services, host, ("ms-sql",)):
         _step(res, f"nmap {lbl}", True, txt, note="instancia, versión y NTLM-info de MSSQL que ya sacó nmap")
     if looks_domain_joined(services, host):
-        res["next"].append(f"impacket-mssqlclient Administrator@{ip} -windows-auth   # Windows auth con credenciales de DOMINIO")
+        res["next"].append(f"impacket-mssqlclient USER:'PASS'@{ip} -windows-auth   # Windows auth con credenciales de DOMINIO (USER:PASS se rellena con la credencial válida si palantir encuentra una)")
     else:
-        res["next"].append(f"impacket-mssqlclient sa:'PASS'@{ip}   # SQL auth (workgroup: no uses -windows-auth de dominio; prueba 'sa' u otra cuenta SQL)")
+        res["next"].append(f"impacket-mssqlclient USER:'PASS'@{ip}   # SQL auth con una credencial (USER:PASS se rellena con la válida si la hay; si es 'sa' u otra cuenta SQL local NO añadas -windows-auth, con una de dominio sí)")
     return res
 
 
@@ -5211,12 +5266,12 @@ def _spray_phase(ip, domain, base, services):
          "detecta un bloqueo). Una pre-auth fallida cuenta como login fallido: con una política de "
          "bloqueo agresiva PUEDE bloquear cuentas — es un paso ACTIVO que pediste tú con --spray.")
     for pw in SPRAY_PASSWORDS:
-        info(f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt '***' --safe   ({len(users)} usuarios)")
+        info(f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt {_sec_disp(pw)} --safe   ({len(users)} usuarios)")
         rc, out = run_capture([kb, "passwordspray", "-d", domain, "--dc", ip, userfile, pw, "--safe"],
                               timeout=1800, quiet=True)
         valid = _parse_kerbrute_spray(out)
-        shown = out.replace(pw, "***") if pw else out
-        _step(res, f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt '***' --safe", bool(valid), shown,
+        shown = _mask_out(out, pw)
+        _step(res, f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt {_sec_disp(pw)} --safe", bool(valid), shown,
               note="password spraying con --safe contra los usuarios descubiertos (pre-auth fallida = login fallido → posible bloqueo)")
         for usr in valid:
             good(f"  ✓ Password spraying VÁLIDO: {usr} : {pw}")   # solo en pantalla; el informe lo enmascara
@@ -6056,7 +6111,7 @@ def cc_mysql(ip, ports, deep):
                    "--connect-timeout=5", "-N", "-B", "-e", "SELECT 1"]
             rc, out = run_capture(cmd, timeout=20, env={"MYSQL_PWD": pw})
             ok = _mysql_ok(rc, out)
-            shown = shlex.join(cmd) + ("  (MYSQL_PWD=***)" if pw else "")
+            shown = shlex.join(cmd) + _env_pw_note("MYSQL_PWD", pw)
             _step(res, shown, ok, out,
                   note=f"probar {lbl} y CONFIRMAR con SELECT 1 (no basta con conectar)")
             if ok:
@@ -6081,7 +6136,7 @@ def cc_postgres(ip, ports, deep):
             rc, out = run_capture(cmd, timeout=20,
                                   env={"PGPASSWORD": pw, "PGCONNECT_TIMEOUT": "5"})
             ok = _psql_ok(rc, out)
-            _step(res, shlex.join(cmd) + "  (PGPASSWORD=***)", ok, out,
+            _step(res, shlex.join(cmd) + _env_pw_note("PGPASSWORD", pw), ok, out,
                   note=f"probar {lbl} y CONFIRMAR con SELECT 1")
             if ok:
                 res["findings"].append(("critica", f"PostgreSQL {port}: acceso con credencial por defecto {lbl} (confirmado)"))
@@ -6148,7 +6203,7 @@ def _db_enum_mysql(res, ip, port, user, password):
                 "--connect-timeout=5", "-N", "-B", "-e"]
     rc, out = run_capture(base_cmd + ["SELECT schema_name FROM information_schema.schemata"],
                           timeout=30, env={"MYSQL_PWD": password}, quiet=True)
-    _step(res, f"mysql -h {ip} -P {port} -u {user} -e 'SELECT schema_name …'  (MYSQL_PWD=***)",
+    _step(res, f"mysql -h {ip} -P {port} -u {user} -e 'SELECT schema_name …'{_env_pw_note('MYSQL_PWD', password)}",
           rc == 0 and "access denied" not in out.lower(), out,
           note="listar las bases de datos con la credencial")
     # rc != 0 cubre el timeout sobre el túnel (run_capture → rc=None) y la conexión perdida a
@@ -6161,7 +6216,7 @@ def _db_enum_mysql(res, ip, port, user, password):
     # FILE habilita LOAD_FILE()/INTO OUTFILE; ALL/SUPER es control total. SHOW GRANTS no modifica nada.
     rcp, outp = run_capture(base_cmd + ["SHOW GRANTS"], timeout=20, env={"MYSQL_PWD": password}, quiet=True)
     if rcp == 0 and outp.strip():
-        _step(res, f"mysql -h {ip} -u {user} -e 'SHOW GRANTS'  (MYSQL_PWD=***)", True, outp,
+        _step(res, f"mysql -h {ip} -u {user} -e 'SHOW GRANTS'{_env_pw_note('MYSQL_PWD', password)}", True, outp,
               note="privilegios de la credencial: FILE → LOAD_FILE()/INTO OUTFILE; ALL/SUPER → control total")
         _privs = [k for k in ("ALL PRIVILEGES", "FILE", "SUPER") if k in outp.upper()]
         if _privs:
@@ -6171,7 +6226,7 @@ def _db_enum_mysql(res, ip, port, user, password):
          "WHERE table_schema NOT IN ('information_schema','mysql','performance_schema','sys') "
          "ORDER BY table_schema, table_name")
     rc2, out2 = run_capture(base_cmd + [q], timeout=30, env={"MYSQL_PWD": password}, quiet=True)
-    _step(res, "mysql … information_schema.tables (bases NO de sistema)  (MYSQL_PWD=***)",
+    _step(res, f"mysql … information_schema.tables (bases NO de sistema){_env_pw_note('MYSQL_PWD', password)}",
           rc2 == 0, out2, note="tablas de las bases de datos no de sistema")
     tables = {}
     for l in out2.splitlines():
@@ -6190,7 +6245,7 @@ def _db_enum_postgres(res, ip, port, user, password):
         return run_capture(["psql", "-h", ip, "-p", str(port), "-U", user, "-w", "-t", "-A",
                             "-c", q, db], timeout=30, env=env, quiet=True)
     rc, out = _psql("postgres", "SELECT datname FROM pg_database WHERE datistemplate=false")
-    _step(res, f"psql -h {ip} -U {user} -c 'SELECT datname FROM pg_database …'  (PGPASSWORD=***)",
+    _step(res, f"psql -h {ip} -U {user} -c 'SELECT datname FROM pg_database …'{_env_pw_note('PGPASSWORD', password)}",
           rc == 0 and "fatal:" not in out.lower(), out, note="listar las bases de datos con la credencial")
     # rc != 0 cubre el timeout (rc=None) y 'server closed the connection unexpectedly' / 'could not
     # receive data from server': sin esto, el texto de error se parseaba como nombres de BD (y psql
@@ -6202,7 +6257,7 @@ def _db_enum_postgres(res, ip, port, user, password):
     # PROGRAM' = RCE directo, que es la ruta que se sugiere abajo. Confirma antes de sugerirla.
     rcs, outs = _psql("postgres", "SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
     if rcs == 0 and outs.strip():
-        _step(res, f"psql -h {ip} -U {user} -c 'SELECT rolsuper …'  (PGPASSWORD=***)", True, outs,
+        _step(res, f"psql -h {ip} -U {user} -c 'SELECT rolsuper …'{_env_pw_note('PGPASSWORD', password)}", True, outs,
               note="¿la credencial es superusuario? → COPY ... FROM PROGRAM = RCE directo")
         if outs.strip().splitlines()[0].strip().lower() in ("t", "true"):
             res["findings"].append(("alta", f"POSTGRES (cred {user}): es SUPERUSER — COPY ... FROM PROGRAM da RCE directo"))
@@ -6242,7 +6297,7 @@ def _db_enum_mssql(res, ip, port, user, password, is_hash):
         if "login failed" not in out.lower() and "authentication" not in out.lower():
             break   # no fue fallo de auth (timeout/otro): no reintentes el otro modo
     dbs = _parse_mssqlclient_col(out)
-    _step(res, f"impacket-mssqlclient {user}:***@{ip} -port {port}"
+    _step(res, f"impacket-mssqlclient {user}:{password if SHOW_SECRETS else '***'}@{ip} -port {port}"
                + (" -windows-auth" if wauth_used else "") + "  ->  SELECT name FROM sys.databases",
           bool(dbs), out, note="listar las bases de datos con la credencial")
     if not dbs:
@@ -6337,14 +6392,14 @@ def _db_cred_test(np, ip, port, u, p):
         # la enum no discrepen cuando el obstáculo es la negociación TLS sobre el túnel.
         cmd = ["mysql", "-h", ip, "-P", str(port), "-u", u, "--skip-ssl", "--connect-timeout=5", "-N", "-B", "-e", "SELECT 1"]
         rc, out = run_capture(cmd, timeout=20, env={"MYSQL_PWD": p or ""})
-        shown = shlex.join(cmd) + ("  (MYSQL_PWD=***)" if p else "")
+        shown = shlex.join(cmd) + _env_pw_note("MYSQL_PWD", p)
         return _mysql_ok(rc, out), shown, out
     if np == "postgres":
         if not have("psql"):
             return None, None, None
         cmd = ["psql", "-h", ip, "-p", str(port), "-U", u, "-w", "-t", "-A", "-c", "SELECT 1", "postgres"]
         rc, out = run_capture(cmd, timeout=20, env={"PGPASSWORD": p or "", "PGCONNECT_TIMEOUT": "5"})
-        shown = shlex.join(cmd) + "  (PGPASSWORD=***)"
+        shown = shlex.join(cmd) + _env_pw_note("PGPASSWORD", p)
         return _psql_ok(rc, out), shown, out
     return None, None, None
 
@@ -6397,7 +6452,7 @@ def _db_enum(res, proto, ip, port, user, password, base, is_hash=False):
         except OSError:
             pass
     if proto == "mssql":
-        res["next"].append(f"impacket-mssqlclient {user}:'PASS'@{ip}"
+        res["next"].append(f"impacket-mssqlclient {user}:{password if SHOW_SECRETS else '***'}@{ip}"
                            + ("" if user.lower() == "sa" else " -windows-auth")
                            + "   ->  enable_xp_cmdshell; xp_cmdshell 'whoami'   # RCE si eres sysadmin / EXECUTE AS para impersonar a sa")
     elif proto == "mysql":
@@ -6426,7 +6481,7 @@ def cc_redis(ip, ports, deep):
                                      "--no-auth-warning", "PING"], timeout=15,
                                     env={"REDISCLI_AUTH": pw})
                 ok = bool(re.search(r"\bPONG\b", o2))
-                _step(res, f"redis-cli -h {ip} -p {port} PING  (REDISCLI_AUTH=***)", ok, o2,
+                _step(res, f"redis-cli -h {ip} -p {port} PING{_env_pw_note('REDISCLI_AUTH', pw)}", ok, o2,
                       note=f"contraseña por defecto '{pw}'")
                 if ok:
                     res["findings"].append(("critica", f"Redis {port}: contraseña por defecto '{pw}'"))
@@ -6499,7 +6554,7 @@ def cc_ipmi(ip, ports, deep):
             cmd = ["ipmitool", "-I", "lanplus", "-H", ip, "-U", u, "-E", "chassis", "status"]
             rc, out = run_capture(cmd, timeout=20, env={"IPMI_PASSWORD": pw})
             ok = rc == 0 and "System Power" in out
-            _step(res, f"ipmitool -I lanplus -H {ip} -U {u} -E chassis status  (IPMI_PASSWORD=***)", ok, out,
+            _step(res, f"ipmitool -I lanplus -H {ip} -U {u} -E chassis status{_env_pw_note('IPMI_PASSWORD', pw)}", ok, out,
                   note=f"probar credencial por defecto {u}/{pw} ({vendor}) por IPMI 2.0")
             if ok:
                 res["findings"].append(("critica", f"IPMI: credencial por defecto {u}/{pw} ({vendor}) válida (chassis status OK)"))
@@ -7046,10 +7101,10 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
         # reutilizable como la contraseña en claro (pass-the-hash no necesita crackeo),
         # así que el informe no debe conservarlo en claro tampoco.
         if is_hash:
-            auth, shown_auth = ["-H", p], "-H " + ("''" if not p else "'***'")
+            auth, shown_auth = ["-H", p], "-H " + _sec_disp(p)
         else:
             auth = ["-p", pw_file.name if pw_file else ""]
-            shown_auth = "-p " + ("''" if not p else "'***'")
+            shown_auth = "-p " + _sec_disp(p)
         base_cmd = [nxc, "smb", ip, "-u", u] + auth
         shown_base = f"{nxc} smb {ip} -u {shlex.quote(u)} {shown_auth}"
         if local_auth:
@@ -7062,7 +7117,7 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
         rc, out = run_capture(base_cmd + ["--sam"], timeout=90, quiet=True)
         out = out or ""
         accounts = _parse_nxc_sam(out)
-        safe_out = out.replace(p, "***") if p else out
+        safe_out = _mask_out(out, p)
         _step(res, shown_base + " --sam", bool(accounts), safe_out,
               note="Pwn3d! por SMB → volcado automático de SAM (hashes de cuentas locales) con la misma credencial de admin")
         for acc in accounts:
@@ -7112,7 +7167,7 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
         lsa = _parse_nxc_lsa(out2)
         lsa_hit = bool(lsa["dpapi"] or lsa["nlkm"] or lsa["mscache"] or lsa["machine"]
                        or lsa["creds"] or lsa["raw"])
-        safe_out2 = out2.replace(p, "***") if p else out2
+        safe_out2 = _mask_out(out2, p)
         _step(res, shown_base + " --lsa", lsa_hit, safe_out2,
               note="Pwn3d! por SMB → volcado automático de LSA secrets (DPAPI/NL$KM/MSCache/credenciales de servicio) con la misma credencial de admin")
         # Credenciales EN TEXTO CLARO: el premio. Al pool con el usuario SIN el prefijo
@@ -7155,7 +7210,7 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
         rc3, out3 = run_capture(base_cmd + ["-M", "lsassy"], timeout=180, quiet=True)
         out3 = out3 or ""
         lsassy_creds, lsassy_tickets = _parse_lsassy(out3)
-        safe_out3 = out3.replace(p, "***") if p else out3
+        safe_out3 = _mask_out(out3, p)
         _step(res, shown_base + " -M lsassy", bool(lsassy_creds), safe_out3,
               note="Pwn3d! por SMB → volcado de MEMORIA de lsass.exe (lsassy): credenciales de cualquier "
                    "sesión activa en la máquina — MÁS RUIDOSO que --sam/--lsa (IOC vigilado por EDR/Defender); "
@@ -7284,7 +7339,7 @@ def _acl_abuse_cmds(rights, target, u, secret, is_hash, domain, ip, kind="group"
     DIRECTAMENTE con `set password` — ni falta pasar por ningún grupo; es el camino que de
     verdad siguió un operador en vivo, y antes esta auditoría solo cubría grupos). Puro →
     testeable sin red."""
-    cred = f"-u {shlex.quote(u)} -p " + ("':***'" if is_hash else "'***'")   # bloodyAD: hash → -p :hash
+    cred = f"-u {shlex.quote(u)} -p " + _sec_disp(secret, is_hash)   # bloodyAD: hash → -p :hash
     base = f"bloodyAD --host {ip} -d {domain} {cred}"
     tq = shlex.quote(target)
     uq = shlex.quote(u)
@@ -7327,7 +7382,7 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
                                   timeout=90, quiet=True)
 
     def _m(o):   # enmascara el secreto en la salida guardada (igual que mask() de _creds_enum)
-        return o.replace(secret, "***") if (secret and not is_hash) else o
+        return o if is_hash else _mask_out(o, secret)
     # 1) DCSync: ¿derecho de replicación sobre el dominio?
     # Dos pasadas: (a) con RIGHTS=DCSync filtra por el GUID específico DS_Replication_Get_Changes_All
     # (nxc/modules/daclread.py:456) y detecta el ACE objeto-específico típico; (b) SIN filtro de
@@ -7358,10 +7413,11 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
     if dcsync_viable and _add_once(res, "critica", _dcsync_txt, "DCSync viable", seen):
         # impacket-secretsdump: formato de auth DISTINTO según sea pass-the-hash o contraseña (antes
         # siempre salía 'user:***@ip', inválido con -H). Hash → '-hashes :<nt>' + 'user@ip'; contraseña → 'user:***@ip'.
+        _sd_sec = secret if SHOW_SECRETS else "***"
         if is_hash:
-            auth_sd = f"-hashes :*** {domain}/{shlex.quote(u)}@{ip}"
+            auth_sd = f"-hashes :{_sd_sec} {domain}/{shlex.quote(u)}@{ip}"
         else:
-            auth_sd = f"{domain}/{shlex.quote(u)}:***@{ip}"
+            auth_sd = f"{domain}/{shlex.quote(u)}:{_sd_sec}@{ip}"
         _attach_cmd(res, _dcsync_txt, [
             f"impacket-secretsdump -just-dc {auth_sd}   # DCSync confirmado arriba: "
             "vuelca el NTDS entero (añade '-just-dc-user krbtgt' para solo la krbtgt → Golden Ticket)"])
@@ -7598,11 +7654,11 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
 
     la = " --local-auth" if use_la else ""
     pt = f" --port {port}" if (port and dp and port != dp) else ""
-    shown_sec = ("-H " if is_hash else "-p ") + ("''" if not secret else "'***'")
+    shown_sec = ("-H " if is_hash else "-p ") + _sec_disp(secret)
     shown_auth = f"-u {shlex.quote(u)} {shown_sec}{la}{pt}"
 
     def mask(o):
-        return o.replace(secret, "***") if secret else o
+        return _mask_out(o, secret)
 
     try:
         if np == "smb":
@@ -7783,7 +7839,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                         # -hashes *** (NO solo el ':' vacío del ident) cuando is_hash: sin esto, el
                         # comando sugerido autenticaría con contraseña VACÍA en vez de con el hash —
                         # mismo patrón que shown_hs/k_auth más abajo para GetUserSPNs/secretsdump.
-                        ident = f"{domain}/{shlex.quote(u)}:{'' if is_hash else '***'}"
+                        ident = f"{domain}/{shlex.quote(u)}:{_url_sec(secret, is_hash)}"
                         hs = "-hashes *** " if is_hash else ""
                         res["next"].append(
                             f"addcomputer.py -computer-name 'EVIL$' -computer-pass 'Passw0rd123!' "
@@ -7954,7 +8010,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 # rc=None = timeout con salida PARCIAL (sobre el túnel): _count_roast subcuenta y se
                 # reportaba como completo. Se marca para que el operador sepa que debe relanzarlo (#55).
                 _kpart = " (POSIBLEMENTE INCOMPLETO — GetUserSPNs superó el timeout de 90s; relánzalo a mano)" if rc is None else ""
-                k_shown = (f"{getuserspns} {domain}/{shlex.quote(u)}:{'***' if (secret and not is_hash) else ''} "
+                k_shown = (f"{getuserspns} {domain}/{shlex.quote(u)}:{_url_sec(secret, is_hash)} "
                            + ("-hashes *** " if is_hash else "")
                            + f"-request -dc-ip {ip} -outputfile {kerb_outfile}")
                 _step(res, k_shown, n > 0 and rc is not None, mask(out),
@@ -7986,7 +8042,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     timeout=90, quiet=True)
                 n = _count_roast(out)
                 _gpart = " (POSIBLEMENTE INCOMPLETO — GetNPUsers superó el timeout de 90s; relánzalo a mano)" if rc is None else ""
-                g_shown = (f"{getnpusers} {domain}/{shlex.quote(u)}:{'***' if (secret and not is_hash) else ''} "
+                g_shown = (f"{getnpusers} {domain}/{shlex.quote(u)}:{_url_sec(secret, is_hash)} "
                            + ("-hashes *** " if is_hash else "")
                            + f"-request -dc-ip {ip} -outputfile {asrep_outfile}")
                 _step(res, g_shown, n > 0 and rc is not None, mask(out),
@@ -8079,7 +8135,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 dom_dn = ",".join(f"DC={p}" for p in domain.split("."))
                 dacl_hs = "-hashes *** " if is_hash else ""
                 res["next"].append(
-                    f"dacledit.py -target 'Domain Admins' {dacl_hs}{domain}/{shlex.quote(u)}:{'' if is_hash else '***'} "
+                    f"dacledit.py -target 'Domain Admins' {dacl_hs}{domain}/{shlex.quote(u)}:{_url_sec(secret, is_hash)} "
                     f"-dc-ip {ip}   # ACL de 'Domain Admins' — repite cambiando -target por "
                     f"'{dom_dn}' (raíz del dominio), 'krbtgt' y 'CN=AdminSDHolder,CN=System,{dom_dn}' — busca "
                     "GenericAll/WriteDACL/WriteOwner/GenericWrite/AllExtendedRights en un trustee que no sea "
@@ -8111,7 +8167,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             if secretsdump and domain:
                 auth_s = ["-hashes", secret] if is_hash else []
                 real_target = f"{domain}/{u}:{'' if is_hash else (secret or '')}@{ip}"
-                shown_target = f"{domain}/{shlex.quote(u)}:{'' if is_hash else '***'}@{ip}"
+                shown_target = f"{domain}/{shlex.quote(u)}:{_url_sec(secret, is_hash)}@{ip}"
                 shown_hs = "-hashes *** " if is_hash else ""
                 rc, out = _run_capture_retry(
                     [secretsdump] + auth_s + ["-just-dc-user", "krbtgt", "-target-ip", ip, real_target],
@@ -8291,7 +8347,7 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
     safe_out = out or ""
     for pw in bulk_passwords:   # se enmascara también el hash: tan reutilizable como la contraseña
         if pw:
-            safe_out = safe_out.replace(pw, "***")
+            safe_out = _mask_out(safe_out, pw)
     hits = _parse_nxc_bulk_successes(out or "")
     _step(res, shown, bool(hits), safe_out,
           note=f"spray en bloque por {np.upper()} ({n} combinaciones, 1 proceso nxc)"
@@ -8366,7 +8422,7 @@ def _hydra_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, l
     safe_out = out
     for pw in bulk_passwords:
         if pw:
-            safe_out = safe_out.replace(pw, "***")
+            safe_out = _mask_out(safe_out, pw)
     hits = _parse_hydra_hits(out)
     conn_errors = any(s in out for s in ("too many connection errors", "all children were disabled",
                                          "could not connect", "No route to host"))
@@ -8572,7 +8628,7 @@ def _brutespray_bulk(res, proto, ip, port, scheme, pairs, bulk):
             safe_out = out or ""
             for pw in all_pw:
                 if pw:
-                    safe_out = safe_out.replace(pw, "***")
+                    safe_out = _mask_out(safe_out, pw)
             _step(res, shown, bool(hits), safe_out,
                   note=f"fuerza bruta de diccionario por {proto.upper()} con brutespray ({n} combinación(es)) "
                        "— protocolo sin módulo nxc/hydra propio, antes sin ningún camino de credenciales "
@@ -8788,13 +8844,13 @@ def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
             except OSError:
                 pass
     out = out or ""
-    shown_sec = ("-H " if is_hash else "-p ") + ("''" if not secret else "'***'")
+    shown_sec = ("-H " if is_hash else "-p ") + _sec_disp(secret)
     shown = f"{nxc} {np} {ip} -u {shlex.quote(user)} {shown_sec}"
     if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
         shown += " --local-auth"
     if port and dp and port != dp:
         shown += f" --port {port}"
-    safe_out = out.replace(secret, "***") if secret else out
+    safe_out = _mask_out(out, secret)
     # "(Guest)" = guest-mapping (map to guest = Bad User): nxc marca así CUALQUIER credencial que
     # el servidor desvía a la cuenta guest — NO es un login real de la credencial probada. Aquí la
     # credencial viene del pool (login válido/hash volcado) o de --user/--pass, nunca es la
@@ -8986,12 +9042,13 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                     if ok is None:
                         res["missing"].append("mysql" if np == "mysql" else "psql")
                         continue
-                    masked = f"{u}:{'∅' if p == '' else '***'}"
-                    safe_out = (out or "").replace(p, "***") if p else out
+                    masked = _cred_note(u, p)
+                    masked_real = f"{u}:{'∅' if p == '' else p}"
+                    safe_out = _mask_out(out, p)
                     _step(res, shown, ok, safe_out,
                           note=f"probar la credencial aportada «{masked}» por {np.upper()} (1 intento, confirmado con SELECT 1)")
                     if ok:
-                        res["findings"].append(("alta", f"{np.upper()}: credencial aportada válida — «{masked}»"))
+                        res["findings"].append(("alta", f"{np.upper()}: credencial aportada válida — «{masked_real}»"))
                         _db_enum(res, np, ip, port, u, p, base)
             continue
         dp = _NXC_DEFAULT_PORT.get(np)
@@ -9113,8 +9170,7 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             # findings.json/report, violando el docstring ('la contraseña NUNCA se escribe en el
             # informe') — confirmado en un findings.json real (#52). El HALLAZGO sí muestra la cred
             # (masked), que es el sentido de esta fase; la fuga era solo en el cmd/salida crudos.
-            shown_sec = ("-H " + ("''" if not p else "'***'")) if is_hash else \
-                        ("-p " + ("''" if p == "" else "'***'"))
+            shown_sec = ("-H " + _sec_disp(p)) if is_hash else ("-p " + _sec_disp(p))
             shown = f"{nxc} {np} {ip} -u {shlex.quote(u)} {shown_sec}"
             if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
                 shown += " --local-auth"
@@ -9122,11 +9178,11 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                 shown += f" --port {port}"
             # La salida cruda enmascara el secreto para hash Y contraseña (antes solo para hash): la
             # línea de éxito de nxc trae 'DOMINIO\\user:password' en claro, que acababa en el report.
-            safe_out = out.replace(p, "***") if p else out
+            safe_out = _mask_out(out, p)
             # El NOTE del paso (parte del registro crudo) enmascara el secreto; solo el HALLAZGO
             # muestra la cred en claro (masked). Antes el note llevaba 'CT059:charlie1' y filtraba la
             # contraseña incluso en intentos fallidos (sin hallazgo), igual que el cmd/salida (#52).
-            masked_step = f"{u}:{'∅' if p == '' else '***'}"
+            masked_step = _cred_note(u, p)
             ok = _nxc_ok(out)
             _step(res, shown, ok, safe_out,
                   note=f"probar la credencial aportada «{masked_step}» por {np.upper()} ({'pass-the-hash' if is_hash else 'reutilización'}, 1 intento)")
@@ -12930,6 +12986,37 @@ def selftest():
     _fc_noop["next"] = ["evil-winrm -i 10.0.0.1 -u USER -p PASS"]
     _fill_cred_placeholder([_fc_noop])
     assert _fc_noop["next"] == ["evil-winrm -i 10.0.0.1 -u USER -p PASS"]
+
+    # --show-password (SHOW_SECRETS): por defecto el secreto APORTADO se enmascara ('***') en las
+    # vistas previas de comando; con el flag se muestra en claro (para copiar-pegar). Los hallazgos
+    # de credencial VÁLIDA y los quick-wins ya salen en claro de todos modos (botín, no input).
+    assert SHOW_SECRETS is False                                   # default seguro
+    assert _sec_disp("charlie1") == "'***'" and _sec_disp("") == "''"
+    assert _sec_disp("h", is_hash=True) == "':***'"
+    assert _cred_note("CT059", "charlie1") == "CT059:***" and _cred_note("CT059", "") == "CT059:∅"
+    assert _url_sec("charlie1", False) == "***" and _url_sec("h", True) == "" and _url_sec("", False) == ""
+    assert _env_pw_note("MYSQL_PWD", "charlie1") == "  (MYSQL_PWD=***)" and _env_pw_note("MYSQL_PWD", "") == ""
+    globals()["SHOW_SECRETS"] = True
+    try:
+        assert _sec_disp("charlie1") == "charlie1" and _sec_disp("p a") == "'p a'"
+        assert _sec_disp("h", is_hash=True) == ":h"        # bloodyAD pass-the-hash '-p :hash' (shlex no cita ':h')
+        assert _cred_note("CT059", "charlie1") == "CT059:charlie1"
+        assert _url_sec("charlie1", False) == "charlie1" and _url_sec("h", True) == ""
+        assert _env_pw_note("MYSQL_PWD", "charlie1") == "  (MYSQL_PWD=charlie1)"
+    finally:
+        globals()["SHOW_SECRETS"] = False
+
+    # fp_mssql: los next-steps usan el placeholder USER:'PASS' (rellenable), NO 'sa:'/'Administrator'
+    # fijos — así una credencial válida descubierta rellena el comando del quick-win (bug reportado
+    # en vivo: el quick win de MSSQL enseñaba 'sa:'PASS'' aunque la válida era CT059:charlie1).
+    _mssql_svc = [{"port": 1433, "proto": "tcp", "name": "ms-sql-s", "product": "Microsoft SQL Server 2019",
+                   "version": "15.00.2000", "extrainfo": "", "tunnel": "", "banner": "", "scripts": {}}]
+    _mssql_fp = fp_mssql("1.2.3.4", _mssql_svc, _mssql_svc, {}, False)
+    assert any("USER:'PASS'" in n for n in _mssql_fp["next"]), _mssql_fp["next"]
+    assert not any("sa:'PASS'" in n for n in _mssql_fp["next"]), _mssql_fp["next"]
+    _mssql_fp["_valid_cred"], _mssql_fp["_valid_cred_admin"] = ("CT059", "charlie1"), False
+    _fill_cred_placeholder([_mssql_fp])
+    assert any("CT059:charlie1" in n for n in _mssql_fp["next"]), _mssql_fp["next"]   # rellenado con la cred real
 
     # _reuse_chain: una credencial hallada en un servicio se reprueba en los demás; si abre uno
     # nuevo (smb/ldap) se enumera con ella (la retroalimentación). robin (ya hallado por ssh) →
@@ -17635,6 +17722,12 @@ def main():
                     help="Patrón(es) para --spider (nxc --pattern), separados por coma. Si no lo das, "
                          "--spider busca un regex de secretos por defecto (passw/secret/cred/claves). "
                          "Dar --pattern implica --spider.")
+    ap.add_argument("--show-password", "--show-secrets", dest="show_password", action="store_true",
+                    help="Muestra la contraseña/hash REAL que aportaste en las vistas previas de comando "
+                         "del informe (para copiar-pegar), en vez de enmascararla con '***'. Por defecto "
+                         "se enmascara: el informe (terminal + HTML/MD/JSON) se comparte y no debe llevar "
+                         "tus credenciales en claro de serie. (Las credenciales VÁLIDAS descubiertas y los "
+                         "quick-wins ya salen en claro de todos modos: son botín, no tu input.)")
     ap.add_argument("--install-missing", action="store_true",
                     help="Instala las herramientas/wordlists que falten (sin preguntar): con apt las que "
                          "están en los repos, y con pip/pipx/npm o descargando un binario/fichero de "
@@ -17694,7 +17787,8 @@ def main():
         ap.error(str(e))
 
     global RESUME, SNMP_WORDLIST, NIKTO, CMS_SCAN, CRAWL, CONNECT, NUCLEI, SPIDER, SPIDER_PATTERN, TUNNEL
-    global USERENUM_WORDLIST, NO_USERENUM, SPRAY_PASSWORDS
+    global USERENUM_WORDLIST, NO_USERENUM, SPRAY_PASSWORDS, SHOW_SECRETS
+    SHOW_SECRETS = args.show_password
     RESUME = args.resume
     NIKTO = args.nikto
     CMS_SCAN = args.cms_scan

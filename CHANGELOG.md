@@ -8,7 +8,25 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `--show-password` (`--show-secrets`): shows the **real** provided credential/hash in the report's
+  command previews (so they're copy-pasteable) instead of masking it with `***`. Default stays masked
+  — the report (terminal + HTML/MD/JSON) is shareable and shouldn't carry your credentials in clear by
+  default. Valid-credential **findings** and **Quick Wins** already show the discovered credential in
+  clear regardless (it's loot, not your input); this flag only controls the command previews that echo
+  the secret **you** supplied. Routed through four helpers (`_sec_disp`, `_cred_note`, `_url_sec`,
+  `_env_pw_note`) so every site — `nxc -p/-H`, `bloodyAD`, `secretsdump`, `impacket-mssqlclient`,
+  Kerberoast/AS-REP (`GetUserSPNs`/`GetNPUsers`), `dacledit`, `kerbrute passwordspray`, and the
+  `MYSQL_PWD`/`PGPASSWORD`/`REDISCLI_AUTH`/`IPMI_PASSWORD` env-var notes — behaves consistently.
+
 ### Fixed
+
+- **MSSQL quick-win showed the wrong credential** (operator-reported): the "valid provided credential"
+  finding for MSSQL surfaced a generic `impacket-mssqlclient sa:'PASS'@...` command instead of the
+  credential that actually worked (e.g. `CT059:charlie1`). `fp_mssql`'s next-steps now use the
+  `USER:'PASS'` placeholder convention (like WinRM/RDP/WMI already did), so `_fill_cred_placeholder`
+  substitutes the discovered credential — same finding→command association class fixed elsewhere.
 
 - **Double execution of per-credential `nxc` probes over a tunnel** (operator-reported against a DC):
   `_run_capture_retry` retried on *any* empty output, including when the command had already
