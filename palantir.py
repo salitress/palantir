@@ -2169,6 +2169,31 @@ def _kerbrute_timeout(wl):
     return 600
 
 
+_KRB5ASREP_RE = re.compile(r"\$krb5asrep\$[^\s]+")
+_KERBRUTE_DONE_RE = re.compile(r"Done!\s*Tested\s+(\d+)\s+usernames\s*\((\d+)\s+valid\)", re.I)
+
+
+def _parse_kerbrute_asrep_hashes(out):
+    """Hashes AS-REP ('$krb5asrep$...') que kerbrute userenum VUELCA cuando una cuenta no requiere
+    pre-auth (ropnop/kerbrute session.go:180 los imprime a stdout). Antes se descartaban aunque ya
+    estaban ahí, listos para crackear offline con hashcat -m 18200 / john. Dedup, orden. Puro (#17)."""
+    seen, out_h = set(), []
+    for m in _KRB5ASREP_RE.finditer(_ANSI_RE.sub("", out or "")):
+        h = m.group(0)
+        if h not in seen:
+            seen.add(h)
+            out_h.append(h)
+    return out_h
+
+
+def _parse_kerbrute_coverage(out):
+    """(probados, válidos) de la línea 'Done! Tested N usernames (M valid) in ...' que kerbrute
+    imprime al terminar (ropnop cmd/userenum.go:78). None si no está (p. ej. cortado por timeout).
+    Puro → testeable sin red (#18)."""
+    m = _KERBRUTE_DONE_RE.search(_ANSI_RE.sub("", out or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def _parse_kerbrute_users(out):
     """Usuarios válidos de la salida de `kerbrute userenum`: líneas con 'VALID USERNAME:'
     seguidas de 'usuario@dominio' (se queda con el usuario, sin el dominio). Marca aparte
@@ -4974,6 +4999,25 @@ def _kerbrute_userenum(res, ip, domain, base):
     if noauth:
         res["findings"].append(("alta", f"Kerberos: {len(noauth)} cuenta(s) SIN pre-auth (AS-REP roastables, hash crackeable sin credenciales): "
                                 + ", ".join(noauth[:10]) + psfx))
+    # #17: kerbrute YA volcó los hashes $krb5asrep$ de las cuentas sin pre-auth — guardarlos (no
+    # re-pedirlos con GetNPUsers) y decir cómo crackearlos. Se escriben a <base>/asrep_kerbrute.txt.
+    hashes = _parse_kerbrute_asrep_hashes(out)
+    if hashes:
+        _hf = "asrep_kerbrute.txt"
+        if base:
+            try:
+                (base / _hf).write_text("\n".join(hashes) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+        res["findings"].append(("alta", f"Kerberos: {len(hashes)} hash(es) AS-REP ya volcados por kerbrute"
+                                + (f" (→ {base / _hf})" if base else "") + " — crackear OFFLINE, sin tocar el dominio"))
+        res["next"].append(f"hashcat -m 18200 {_hf} /usr/share/wordlists/rockyou.txt   # crackea los AS-REP que kerbrute ya volcó (o john --format=krb5asrep)")
+    # #18: cobertura real del enum (cuántos nombres probó) desde la línea 'Done!' de kerbrute, para
+    # que el operador sepa si la lista fue amplia o mínima.
+    cov = _parse_kerbrute_coverage(out)
+    if cov and not partial:
+        res["findings"].append(("info", f"Kerberos: kerbrute probó {cov[0]} nombre(s) de la lista, {cov[1]} válido(s) "
+                                f"— si fueron pocos, relanza con --userenum-wordlist (lista más amplia)"))
     return bool(users)
 
 
@@ -11650,6 +11694,11 @@ def selftest():
                "$krb5asrep$23$svc_asrep@CORP.LOCAL:aaaa...\n"
                "2026/01/01 > [+] VALID USERNAME:\t svc_asrep@corp.local\n"
                "2026/01/01 > [+] VALID USERNAME:\t normaluser@corp.local\n")
+    # #17: captura los hashes $krb5asrep$ que kerbrute vuelca (dedup); #18: cobertura de 'Done!'.
+    _ku_hashes = _parse_kerbrute_asrep_hashes(_ku_out + "\nDone! Tested 48000 usernames (2 valid) in 61.0 seconds")
+    assert _ku_hashes == ["$krb5asrep$23$svc_asrep@CORP.LOCAL:aaaa..."], _ku_hashes
+    assert _parse_kerbrute_coverage("Done! Tested 48000 usernames (2 valid) in 61.0 seconds") == (48000, 2)
+    assert _parse_kerbrute_coverage("sin la linea Done") is None
     _ku_users, _ku_noauth = _parse_kerbrute_users(_ku_out)
     assert set(_ku_users) == {"svc_asrep", "normaluser"}, _ku_users
     assert _ku_noauth == ["svc_asrep"], _ku_noauth
