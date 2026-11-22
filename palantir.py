@@ -772,7 +772,10 @@ def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1, heartbeat_inte
     (credencial mala, host caído) no se confunda con uno transitorio: si el fallo fuera real,
     reintentar no cambiaría nada. Si sigue vacío tras los reintentos, lo dice explícitamente en
     el texto devuelto — para que el informe no lo confunda con "comprobado, sin hallazgos"
-    cuando en realidad el comando no llegó a correr de verdad.
+    cuando en realidad el comando no llegó a correr de verdad. OJO: solo reintenta un vacío
+    INMEDIATO; si la llamada AGOTÓ su timeout NO se reintenta (un timeout no es un glitch
+    transitorio — repetirlo gastaría otro timeout entero; p. ej. 'nxc ldap' anónimo por un túnel,
+    40s vacío ×2 por usuario).
 
     Late de vida cada `heartbeat_interval` s (SIEMPRE, ignora `quiet`): run_capture es
     BLOQUEANTE, así que una consulta lenta por un túnel (--groups "Domain Admins", -M
@@ -795,11 +798,25 @@ def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1, heartbeat_inte
     th = threading.Thread(target=_beat, daemon=True)
     th.start()
     try:
+        t0 = time.monotonic()
         rc, out = run_capture(cmd, timeout=timeout, quiet=quiet)
+        elapsed = time.monotonic() - t0
         tries = 0
-        while not (out or "").strip() and tries < retries:
+        # El reintento es SOLO para el vacío INMEDIATO (glitch transitorio de la conexión: el
+        # comando volvió rápido y sin nada). Si la llamada AGOTÓ su timeout NO se reintenta: un
+        # timeout no es un vacío transitorio — el objetivo respondió lento o se colgó, y repetirlo
+        # malgasta OTRO timeout entero. Bug visto en vivo contra un DC por túnel: 'nxc ldap'
+        # anónimo corría 40s, salía vacío y se relanzaba otros 40s (×3 usuarios ≈ 240s) sin sacar
+        # nada. (timeout=None: sin techo que doblar, se mantiene el reintento por vacío como antes.)
+        while (not (out or "").strip() and tries < retries
+               and not (timeout and elapsed >= timeout * 0.9)):
             tries += 1
+            if not quiet:   # deja claro POR QUÉ el mismo comando sale dos veces seguidas
+                print(f"{C_GREY}      ↳ reintento: la 1ª respuesta vino vacía (posible glitch "
+                      f"transitorio del túnel/conexión, no 'sin hallazgos'){C_RESET}", flush=True)
+            t0 = time.monotonic()
             rc, out = run_capture(cmd, timeout=timeout, quiet=quiet)
+            elapsed = time.monotonic() - t0
     finally:
         stop.set()
         th.join(timeout=1)
@@ -13968,6 +13985,32 @@ def selftest():
     finally:
         globals()["run_capture"] = _real_run_capture
     assert len(_retry_calls3) == 1   # con salida real desde el 1er intento, NO reintenta
+
+    # Un vacío que AGOTÓ el timeout NO se reintenta (no es un vacío transitorio: el objetivo
+    # respondió lento/colgado, y repetir malgastaría otro timeout entero). Caso real: 'nxc ldap'
+    # anónimo por un túnel corría 40s, salía vacío y se relanzaba otros 40s (×3 usuarios). El fake
+    # CONSUME su timeout (sleep) y vuelve vacío → debe quedarse en 1 sola llamada.
+    import time as _time_rto
+    _retry_calls4 = []
+
+    def _fake_empty_timeout(cmd, timeout=None, quiet=False, **kw):
+        _retry_calls4.append(cmd)
+        _time_rto.sleep(timeout or 0)   # simula agotar el timeout
+        return (None, "")               # run_capture devuelve rc=None + parcial vacío al expirar
+    globals()["run_capture"] = _fake_empty_timeout
+    try:
+        _run_capture_retry(["nxc", "ldap", "x"], timeout=0.15)
+    finally:
+        globals()["run_capture"] = _real_run_capture
+    assert len(_retry_calls4) == 1, f"un timeout no debe reintentarse ({len(_retry_calls4)} llamadas)"
+    # control: el MISMO vacío pero INMEDIATO (sin consumir el timeout) SÍ se reintenta
+    _retry_calls5 = []
+    globals()["run_capture"] = lambda cmd, timeout=None, quiet=False, **kw: (_retry_calls5.append(cmd), (0, ""))[1]
+    try:
+        _run_capture_retry(["nxc", "ldap", "x"], timeout=10)
+    finally:
+        globals()["run_capture"] = _real_run_capture
+    assert len(_retry_calls5) == 2, f"un vacío inmediato sí se reintenta ({len(_retry_calls5)} llamadas)"
 
     # _run_capture_progressive: procesos REALES (python3 -c, sin red) para probar el timing de
     # verdad, no un mock — es lo que hace falta pedir "¿esto sigue corriendo con sentido o se

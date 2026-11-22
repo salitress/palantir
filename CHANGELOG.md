@@ -6,6 +6,21 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Double execution of per-credential `nxc` probes over a tunnel** (operator-reported against a DC):
+  `_run_capture_retry` retried on *any* empty output, including when the command had already
+  **consumed its full timeout**. Over a tunnel, anonymous `nxc ldap -u '' -p ''` ran the full 40s,
+  came back empty, and was relaunched for another 40s (×3 users ≈ 240s) producing nothing. A timeout
+  is not a transient glitch, so it is no longer retried — only an *immediate* empty response is (the
+  real transient case the retry was added for, preserved). The retry attempt now also prints a short
+  note explaining why the same command appears twice, so the cheap tunnel-drop recovery is no longer
+  mistaken for a bug. On a DC several protocols live on two ports (SMB 139/445, LDAP 389/3268, RPC
+  135/593); the Fase 5c default-cred checks already de-dup by protocol, so the doubling was purely the
+  retry, not per-port re-testing.
+
 ## [2.0.0] - 2026-11-22
 
 Milestone release. No breaking CLI or output changes (everything below is additive and
