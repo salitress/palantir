@@ -2678,7 +2678,8 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False, base=None):
     # Fuera cuentas de equipo ($): no sirven para AS-REP roast ni spraying y ensucian ad_users.txt
     # (lo consume fp_kerberos). El camino credencializado (_surface_ad_enum) ya las filtra; el
     # anónimo no lo hacía (#18).
-    users = [u for u in re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeUser\)", out) if not u.endswith("$")]
+    _all_sidusers = re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeUser\)", out)
+    users = [u for u in _all_sidusers if not u.endswith("$")]
     if users:
         uniq = sorted(set(users))
         res["findings"].append(("alta", f"AD: {len(uniq)} usuarios por RID cycling: "
@@ -2688,6 +2689,17 @@ def _smb_ad_enum(res, nxc, ip, auth_user=None, anon_readable=False, base=None):
                 _merge_write_ad_users(base, uniq)
             except OSError:
                 pass
+    # #11: el mismo RID cycling también delata cuentas de EQUIPO ($ = mapa de hosts Windows de la
+    # red interna) y GRUPOS (estructura del dominio) — info útil que antes se descartaba (solo se
+    # miraban los usuarios). Se sacan como 'info', aparte de la lista de usuarios roasteables.
+    _computers = sorted({c for c in _all_sidusers if c.endswith("$")})
+    if _computers:
+        res["findings"].append(("info", f"AD: {len(_computers)} cuenta(s) de equipo por RID cycling (mapa de hosts Windows): "
+                                + ", ".join(_computers[:15]) + (" …" if len(_computers) > 15 else "")))
+    _groups = sorted(set(re.findall(r"\d+:\s+[^\s\\]+\\(.+?)\s+\(SidTypeGroup\)", out)))
+    if _groups:
+        res["findings"].append(("info", f"AD: {len(_groups)} grupo(s) por RID cycling (estructura del dominio): "
+                                + ", ".join(_groups[:15]) + (" …" if len(_groups) > 15 else "")))
     # ¿Esta identidad anónima/invitado puede LEER algo de verdad? El RID cycling (arriba) o el
     # listado de shares (anon_readable) son la prueba. Si NINGUNO devolvió nada, el DC acepta la
     # sesión pero deniega la lectura anónima (RestrictAnonymous): --users/--computers/--pass-pol
@@ -3780,6 +3792,17 @@ def fp_ldap(ip, ports, services, host, deep, base=None):
                         # salida parcial la línea del umbral puede faltar y sería un falso 'seguro'.
                         if not _partial and pol.get("lockout_threshold") in ("None", "0"):
                             res["findings"].append(("alta", "AD: sin bloqueo de cuentas (lockout = None/0) — password spraying sin riesgo de bloquear a nadie contra la lista de usuarios ya enumerada"))
+                # #14: si el bind anónimo lee, saca la MEMBRESÍA de Domain/Enterprise Admins
+                # ('--groups "Grupo"', que sí da los miembros — el '--groups' pelado de arriba solo da
+                # nombres+conteo). Saber quién manda en el dominio SIN credenciales es un hallazgo real.
+                for _hvg in ("Domain Admins", "Enterprise Admins"):
+                    rc_g, gout = _run_capture_retry([nxc, "ldap", ip, "-u", user, "-p", "", "--groups", _hvg], timeout=60, quiet=True)
+                    _gmembers = _parse_nxc_group_members(gout)
+                    _step(res, f"{nxc} ldap {ip} -u '{user}' -p '' --groups \"{_hvg}\"", bool(_gmembers), gout,
+                          note=f"membresía de '{_hvg}' por LDAP anónimo (quién manda en el dominio sin credenciales)")
+                    if _gmembers:
+                        res["findings"].append(("alta", f"AD (anónimo): miembros de '{_hvg}' legibles sin credenciales — "
+                                                + ", ".join(_gmembers[:15]) + (" …" if len(_gmembers) > 15 else "")))
                 # get-desc-users: módulo nxc dedicado a buscar contraseñas en el campo
                 # "description" de las cuentas (fallo de higiene clásico en AD: alguien
                 # apunta ahí la contraseña inicial/temporal). Antes solo quedaba como
@@ -11510,6 +11533,10 @@ def selftest():
                        "LDAP 10.0.0.1 389 DC  Minimum password length: 8\n"
                        "LDAP 10.0.0.1 389 DC     Domain Password Complex: 1\n"
                        "LDAP 10.0.0.1 389 DC  Account Lockout Threshold: 5")
+        if cmd[1] == "ldap" and "--groups" in cmd and cmd[-1] == "Domain Admins":
+            return 0, ("LDAP 10.0.0.1 389 DC [+] dom\\: (null auth)\n"
+                       "LDAP 10.0.0.1 389 DC Administrator\n"
+                       "LDAP 10.0.0.1 389 DC svc_admin")   # #14: miembros de Domain Admins
         if cmd[1] == "ldap" and cmd[-1] in ("--users", "--groups"):
             return 0, "ok"
         return 0, "LDAP 10.0.0.1 389 DC [+] dom\\: (null auth)"   # nxc_auth: bind anónimo entra
@@ -11528,6 +11555,9 @@ def selftest():
     # sea normal (no solo cuando es None/0 — ver _format_pass_pol_finding).
     assert any(s == "info" and "política de contraseñas" in t and "longitud mínima 8" in t
                for s, t in _lres["findings"])
+    # #14: membresía anónima de Domain Admins legible sin credenciales.
+    assert any(s == "alta" and "Domain Admins" in t and "sin credenciales" in t and "Administrator" in t
+               for s, t in _lres["findings"]), _lres["findings"]
 
     # _parse_nxc_userlist: 1er token de cada fila de 'nxc --users', sin banner/cabecera/$ (equipos)
     _users_out = ("SMB  10.0.0.1 445 DC01  [*] Windows 10 (name:DC01) (Null Auth:True)\n"
@@ -12330,7 +12360,8 @@ def selftest():
     # (igual que el camino credencializado _surface_ad_enum).
     _rid_out = ("SMB 10.0.0.1 445 DC 500: CORP\\Administrator (SidTypeUser)\n"
                 "SMB 10.0.0.1 445 DC 1001: CORP\\DC01$ (SidTypeUser)\n"
-                "SMB 10.0.0.1 445 DC 1103: CORP\\alice (SidTypeUser)\n")
+                "SMB 10.0.0.1 445 DC 1103: CORP\\alice (SidTypeUser)\n"
+                "SMB 10.0.0.1 445 DC 512: CORP\\Domain Admins (SidTypeGroup)\n")
     globals()["_run_capture_progressive"] = lambda cmd, timeout=None, stall_timeout=None, quiet=False: (0, _rid_out)
     globals()["run_capture"] = lambda cmd, timeout=None, **kw: (0, "SMB x 445 DC [*] ok")
     try:
@@ -12339,9 +12370,12 @@ def selftest():
     finally:
         globals()["run_capture"] = _real_rc_smbad
         globals()["_run_capture_progressive"] = _real_rcp_smbad
-    _rid_find = [t for s, t in _rid_res["findings"] if "RID cycling" in t]
+    _rid_find = [t for s, t in _rid_res["findings"] if "RID cycling" in t and "usuarios" in t]
     assert _rid_find and "alice" in _rid_find[0] and "Administrator" in _rid_find[0], _rid_find
     assert "DC01$" not in _rid_find[0], _rid_find
+    # #11: equipos ($) y grupos del RID cycling salen como 'info' aparte de los usuarios.
+    assert any(s == "info" and "cuenta(s) de equipo" in t and "DC01$" in t for s, t in _rid_res["findings"]), _rid_res["findings"]
+    assert any(s == "info" and "grupo(s)" in t and "Domain Admins" in t for s, t in _rid_res["findings"]), _rid_res["findings"]
 
     # fp_smb SIN nxc/netexec instalado: 'getdompwinfo' (añadido a la cadena de rpcclient) es el
     # único fallback de política de contraseñas por sesión nula — antes, sin nxc, fp_smb no
