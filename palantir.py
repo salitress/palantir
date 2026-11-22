@@ -8361,6 +8361,11 @@ def _hydra_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, l
 # un MongoDB. oracle NO se incluye: brutespray no lo cubre (no está en services.md); fp_oracle ya deja
 # los pasos manuales (odat/sqlplus).
 _BRUTESPRAY_EXTRA_PROTOS = {"telnet", "redis", "snmp", "smtp", "imap_pop3", "mongodb"}
+# Servicios que classify() reconoce, son crackeables por diccionario, pero para los que palantir NO
+# tiene camino de credenciales AUTOMATIZADO (ni nxc, ni cliente DB propio, ni brutespray): se avisa
+# para probarlos a mano en vez de que pasen en silencio (#31). oracle: nxc no lo habla, brutespray
+# no lo cubre (no está en su services.md) — queda odat/hydra manual (ya en fp_oracle).
+_CRACKABLE_NO_AUTO_PATH = {"oracle": "odat / hydra oracle-listener (ver fp_oracle)"}
 
 
 def brutespray_bin():
@@ -8368,6 +8373,21 @@ def brutespray_bin():
     'go install github.com/x90skysn3k/brutespray/v2@latest' (cae en ~/go/bin) o los binarios
     de sus releases (~/.local/bin)."""
     return _bin_with_sudo_fallback(("brutespray",), home_dirs=(".local/bin", "go/bin"))
+
+
+def _brutespray_is_v2(out):
+    """¿La salida de 'brutespray -h'/--version es la v2 (Go, x90skysn3k) y no la v1 (wrapper THC de
+    Python)? La v2 trae flags que la v1 no tiene (-no-tui, -checkpoint, --output-format, -summary) y
+    palantir los usa en _brutespray_bulk — contra la v1 el comando fallaría. Puro → testeable sin red
+    (#29). Ante la duda (sin señal reconocible) devuelve True: no bloquear si no se puede determinar."""
+    low = (out or "").lower()
+    if any(t in low for t in ("-no-tui", "no-tui", "-checkpoint", "output-format", "-summary")):
+        return True
+    # v1 (THC wrapper) tiene pistas propias: '-f <gnmapfile>' con '-s <service>' y '-t <threads>'
+    # pero NINGUNO de los de arriba. Si vemos la ayuda y no hay flags v2, es v1.
+    if "brutespray" in low and ("usage" in low or "-s " in low or "service" in low):
+        return False
+    return True
 
 
 def _brutespray_scheme(proto, port):
@@ -8395,6 +8415,14 @@ def _brutespray_bulk(res, proto, ip, port, scheme, pairs, bulk):
     import tempfile
     bs = brutespray_bin()
     if not bs:
+        return []
+    # #29: palantir usa flags de la v2 (Go) — '-summary/-checkpoint/--output-format/-no-tui'. Si el
+    # 'brutespray' instalado es la v1 (wrapper THC de Python), esos flags petan. Se comprueba una vez.
+    _rcv, _vout = run_capture([bs, "-h"], timeout=15, quiet=True)
+    if not _brutespray_is_v2(_vout):
+        res["findings"].append(("info", "brutespray instalado parece la v1 (wrapper THC), no la v2 (Go) — palantir usa "
+                                "flags de la v2 ('-summary'/'-no-tui'/'--output-format'). Instala la v2: "
+                                "'go install github.com/x90skysn3k/brutespray/v2@latest'. No lanzo el spray automático."))
         return []
     exact_pairs = list(pairs or [])
     cross = None
@@ -8810,6 +8838,10 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
     if not buckets:
         res = _fp("reuse", "Credenciales aportadas (reutilización)", sorted({p["port"] for p in services}))
         res["findings"].append(("info", "ningún servicio compatible para probar las credenciales aportadas"))
+        # #31: aunque no haya servicio con camino automatizado, avisar de los crackeables sin él.
+        for _c in sorted({classify(p) for p in services if classify(p) in _CRACKABLE_NO_AUTO_PATH}):
+            res["findings"].append(("info", f"{_c.upper()}: servicio crackeable detectado pero sin camino "
+                                    f"automatizado en palantir — pruébalo a mano: {_CRACKABLE_NO_AUTO_PATH[_c]}"))
         return [res]
     # nxc solo hace falta para los protocolos que lo usan (todos salvo mysql/postgres, que van
     # por el cliente CLI real — ver _db_cred_test); si el objetivo solo tiene una BD, no hay que
@@ -9052,6 +9084,15 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                      nxc, local_auth, is_dc, base, ad_seen, domain)
     except Exception as e:
         _phase_fail("credenciales aportadas (retroalimentación)", e, base)
+    # #31: servicios crackeables footprinteados SIN camino automatizado (p. ej. oracle) — se avisa
+    # explícitamente (antes la credencial aportada simplemente no se probaba contra ellos, en silencio).
+    _nopath = sorted({classify(p) for p in services if classify(p) in _CRACKABLE_NO_AUTO_PATH})
+    if _nopath:
+        _np_res = _fp("reuse-manual", "Credenciales aportadas — sin camino automatizado", [])
+        for _c in _nopath:
+            _np_res["findings"].append(("info", f"{_c.upper()}: servicio crackeable detectado pero palantir no "
+                                        f"tiene camino automatizado — pruébalo a mano: {_CRACKABLE_NO_AUTO_PATH[_c]}"))
+        results.append(_np_res)
     return results
 
 
@@ -12170,6 +12211,27 @@ def selftest():
     finally:
         globals()["brutespray_bin"], globals()["run_capture"] = _real_bsbin62, _real_rc62
     assert "-r" not in _bs_cmd62["c"], _bs_cmd62["c"]
+    # #29: _brutespray_is_v2 distingue la v2 (Go, con -no-tui/-summary) de la v1 (wrapper THC).
+    assert _brutespray_is_v2("Usage of brutespray:\n  -no-tui\n  -summary\n  -checkpoint string") is True
+    assert _brutespray_is_v2("brutespray.py Usage: -f <gnmapfile> -s ssh -t 5 --service") is False
+    assert _brutespray_is_v2("") is True   # ante la duda, no bloquear
+    # #30: con SNMP en el set Y un udp.gnmap en disco, el comando incluye un segundo '-f udp.gnmap'.
+    _bs30 = Path(tempfile.mkdtemp())
+    (_bs30 / "nmap").mkdir()
+    (_bs30 / "nmap" / "deep.gnmap").write_text("# tcp\n")
+    (_bs30 / "nmap" / "udp.gnmap").write_text("# udp snmp\n")
+    _bsr30 = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("snmp", "SNMP", [161])], "10.0.0.1", _bs30)
+    assert any(f"-f {_bs30 / 'nmap' / 'udp.gnmap'}" in n for n in _bsr30["next"]), _bsr30["next"]
+    shutil.rmtree(_bs30)
+    # #31: un servicio crackeable SIN camino automatizado (oracle) se avisa aunque no haya nada que probar por nxc.
+    _real_nxcbin31, _real_rc31 = nxc_bin, run_capture
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), (lambda *a, **kw: (1, "x"))
+    try:
+        _pc31 = provided_creds_check("1.2.3.4", [{"port": 1521, "name": "oracle-tns"}], [("scott", "tiger")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin31, _real_rc31
+    assert any("ORACLE" in t and "sin camino automatizado" in t
+               for r in _pc31 for _s, t in r["findings"]), _pc31
 
     # _parse_maq / _maq_finding: 'MachineAccountQuota: N' de nxc -M maq (confirmado en su código
     # fuente). MAQ>0 → 'alta' (precondición de noPac/RBCD); MAQ=0 → 'info' (endurecido); sin dato → None.
@@ -13080,6 +13142,8 @@ def selftest():
     _bs_cmds = []
 
     def _fake_bs_rc(cmd, timeout=None, quiet=False, **kw):
+        if "-h" in cmd and "-o" not in cmd:   # #29: sonda de versión de _brutespray_bulk → simula v2
+            return 0, "Usage of brutespray:\n  -no-tui\n  -summary\n  --output-format string"
         _bs_cmds.append(cmd)
         outdir = cmd[cmd.index("-o") + 1]
         joined = " ".join(cmd)
@@ -16288,11 +16352,16 @@ def _suggest_brutespray(footprints, ip, base):
             "(paso MANUAL, no se ejecuta solo) — añade '-spray -spray-delay 15m' (MANTENIENDO '-p') "
             "si hay riesgo real de bloqueo de cuentas (p. ej. contra AD)"
             ).format(len(svcs))
-    if "snmp" in svcs:
+    udp_gnmap = Path(base) / "nmap" / "udp.gnmap"
+    _snmp_udp = "snmp" in svcs and udp_gnmap.exists()
+    if "snmp" in svcs and not _snmp_udp:
         tail += "; SNMP está en udp.gnmap (no en deep.gnmap, que es TCP) — pásalo aparte con otro '-f .../nmap/udp.gnmap'"
     if gnmap.exists():
+        # #30: brutespray acepta varios '-f'; si SNMP (161/udp) está en el set y tenemos el
+        # udp.gnmap en disco, se añade para que la "una sola pasada" también cubra SNMP.
+        _f_args = f"-f {gnmap}" + (f" -f {udp_gnmap}" if _snmp_udp else "")
         res["next"].append(
-            f"brutespray -f {gnmap} -u users.txt -p /usr/share/wordlists/rockyou.txt   # {tail}")
+            f"brutespray {_f_args} -u users.txt -p /usr/share/wordlists/rockyou.txt   # {tail}")
     else:
         # '-f' espera un FICHERO (gnmap/xml/nessus/nexpose/json) — nunca una IP suelta (eso es
         # '-H protocolo://host:puerto', y aquí hay varios protocolos a la vez, no uno). Sin el
