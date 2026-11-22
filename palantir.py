@@ -2959,6 +2959,12 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                 "SMB: SMBv1 habilitado — protocolo legacy inseguro (superficie de EternalBlue/MS17-010 "
                 "y de relay NTLMv1/downgrade). Deshabilítalo; si además es un objetivo Windows antiguo, "
                 "revisa el check de MS17-010 de arriba."))
+        # #34: deja la build de Windows como hallazgo estructurado (no solo enterrada en el banner) —
+        # contexto útil y lo que decide la rebaja de exploits de SO antiguo (ver _detect_win_build).
+        _wbuild = _detect_win_build(services, host)
+        if _wbuild is not None:
+            _modern = " (SO moderno: los exploits de Windows antiguo no aplican)" if _wbuild >= WIN_MODERN_BUILD else " (build antiguo: revisa exploits de SO)"
+            res["findings"].append(("info", f"Windows build {_wbuild}{_modern}"))
         if signing is False:
             res["findings"].append(("media",
                 "SMB: signing NO requerido — superficie de NTLM relay: si además hay un primitivo de "
@@ -9205,12 +9211,19 @@ def _ss_parse(out):
     res, seen = [], set()
     for e in data.get("RESULTS_EXPLOIT", []):
         title, typ = e.get("Title", ""), e.get("Type", "")
-        edb = e.get("EDB-ID") or e.get("Codes") or ""
-        key = edb or title
+        # #38: el EDB-ID es SOLO 'EDB-ID'. Antes caía a 'Codes' (que son códigos CVE/MSB, no un
+        # EDB-ID) → si 'EDB-ID' faltaba, se metía una lista de CVEs donde iba el id, corrompiendo
+        # 'searchsploit -x <id>'. 'Codes' ahora es un campo aparte (#32).
+        edb = e.get("EDB-ID") or ""
+        codes = (e.get("Codes") or "").strip()
+        # #33: 'Verified' (0/1) de exploit-db — un exploit verificado es prioritario.
+        verified = str(e.get("Verified", "")).strip() in ("1", "true", "True")
+        key = edb or codes or title
         if key in seen:
             continue
         seen.add(key)
         res.append({"title": title, "edb": edb,
+                    "codes": codes, "verified": verified,
                     "path": e.get("Path", ""),
                     "platform": e.get("Platform", ""),
                     "type": typ,
@@ -9824,8 +9837,9 @@ def render_vulns(vulns):
               f"{C_GREY}({pstr}) · término: {v['term']}{C_RESET}")
         for e in exps[:12]:
             col = sevcol.get(e["sev"], C_GREY)
+            _extra = (f"  {e['codes']}" if e.get("codes") else "") + ("  ✓" if e.get("verified") else "")   # #32/#33
             print(f"    {col}[{e['sev']:<7}]{C_RESET} {C_RED}EDB-{e['edb']}{C_RESET}  "
-                  f"{sanitize(e['title'])}  {C_GREY}[{e['platform']}]{C_RESET}")
+                  f"{sanitize(e['title'])}  {C_GREY}[{e['platform']}]{_extra}{C_RESET}")
         if len(exps) > 12:
             print(f"    {C_GREY}… y {len(exps)-12} más (ver report.html){C_RESET}")
     print(f"\n  {C_GREY}Criticidad = estimación por tipo/título (no es CVSS). Verifica cada uno "
@@ -10303,11 +10317,14 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
         for v in rows_v:
             pstr = ",".join(map(str, v["ports"]))
             exps = sorted(v["exploits"], key=lambda e: EXPLOIT_SEV_ORDER.get(e["sev"], 9))
-            trs = "".join(
-                f'<tr><td><span class="badge {e["sev"]}">{e["sev"].upper()}</span></td>'
-                f'<td class="p">EDB-{_h(e["edb"])}</td><td>{_h(e["title"])}</td>'
-                f'<td class="miss">{_h(e["platform"])}</td></tr>'
-                for e in exps[:8])
+            _erows = []
+            for e in exps[:8]:
+                _cve = f' <span class="miss">{_h(e["codes"])}</span>' if e.get("codes") else ""   # #32: CVE/MSB
+                _ver = ' <span class="svc-open">✓ verificado</span>' if e.get("verified") else ""  # #33
+                _erows.append(f'<tr><td><span class="badge {e["sev"]}">{e["sev"].upper()}</span></td>'
+                              f'<td class="p">EDB-{_h(e["edb"])}</td><td>{_h(e["title"])}{_cve}{_ver}</td>'
+                              f'<td class="miss">{_h(e["platform"])}</td></tr>')
+            trs = "".join(_erows)
             more = (f'<p class="miss">… y {len(exps) - 8} más (ruido por coincidencia de versión; '
                     f'<code>searchsploit -x EDB-ID</code> para ver cada uno)</p>'
                     if len(exps) > 8 else "")
@@ -10530,7 +10547,8 @@ def build_markdown(ip, services, host, footprints, vulns, domains, web_hits, vho
         for v in rows_v:
             L.append(f"### {v['product']} {v['version']} ({','.join(map(str, v['ports']))})")
             for e in sorted(v["exploits"], key=lambda e: EXPLOIT_SEV_ORDER.get(e["sev"], 9))[:15]:
-                L.append(f"- [{e['sev']}] EDB-{e['edb']} — {_md_esc(e['title'])} [{e['platform']}]")
+                _ex = (f" {_md_esc(e['codes'])}" if e.get("codes") else "") + (" ✓verificado" if e.get("verified") else "")   # #32/#33
+                L.append(f"- [{e['sev']}] EDB-{e['edb']} — {_md_esc(e['title'])} [{e['platform']}]{_ex}")
             L.append("")
 
     if any(web_hits.values()) or vhosts:
@@ -11988,9 +12006,13 @@ def selftest():
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_novuln_rc
     try:
         _novres = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}], {}, False)
+        # #34: con smb-os-discovery (host-script) se reporta la build de Windows como info.
+        _wbres = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}],
+                        {"smb-os-discovery": "OS: Windows Server 2019 Standard 17763"}, False)
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
     assert not any("EternalBlue" in t or "SMBGhost" in t or "WebClient" in t for _s, t in _novres["findings"])
+    assert any(s == "info" and "Windows build 17763" in t for s, t in _wbres["findings"]), _wbres["findings"]
 
     # ── Resultados parciales por timeout presentados como completos (complaint #2) ───────────────
     # #23: la sonda de Zerologon de fp_smb usa _run_capture_retry — una PRIMERA salida vacía (blip
@@ -14201,6 +14223,15 @@ def selftest():
                   '{"Title":"X","Codes":"","Type":"remote"},'
                   '{"Title":"Y","Codes":"","Type":"remote"}]}')
     assert len(_ss_parse(_noedb_ssj)) == 2
+    # #32/#33/#38: 'Codes' (CVE/MSB) es un campo APARTE del EDB-ID (antes 'Codes' se usaba como
+    # fallback del id, corrompiendo 'searchsploit -x'); 'Verified' se expone como bool.
+    _cv_ssj = ('{"RESULTS_EXPLOIT":[{"Title":"Foo RCE","EDB-ID":"12345","Codes":"CVE-2021-1234;CVE-2021-1235",'
+               '"Verified":"1","Path":"/x","Platform":"linux","Type":"remote"}]}')
+    _cv = _ss_parse(_cv_ssj)[0]
+    assert _cv["edb"] == "12345" and _cv["codes"] == "CVE-2021-1234;CVE-2021-1235" and _cv["verified"] is True
+    # sin EDB-ID pero con Codes: el id NO se contamina con los CVE (#38); dedupe por Codes.
+    _onlycodes = _ss_parse('{"RESULTS_EXPLOIT":[{"Title":"Z","Codes":"CVE-2020-0001","Type":"remote"}]}')[0]
+    assert _onlycodes["edb"] == "" and _onlycodes["codes"] == "CVE-2020-0001"
 
     # vuln_search: el mismo product+version puede salir en tcp Y udp con el MISMO número
     # de puerto (confirmado en un run real: 'Simple DNS Plus' en 53/tcp y 53/udp) — las
