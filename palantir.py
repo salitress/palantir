@@ -3274,7 +3274,7 @@ def _parse_ns_records(out):
                   if l.strip() and not l.lstrip().startswith(";")})
 
 
-def fp_dns_nameservers(domains, extra_domain):
+def fp_dns_nameservers(domains, extra_domain, dc_ip=None):
     """DNS del dominio contra sus NAME SERVERS REALES — no el IP que se esté escaneando.
     fp_dns (arriba) solo se dispara si el 53 está abierto en el objetivo escaneado, pero en
     la mayoría de labs (HTB/CPTS incluidos) el host que resuelve el dominio es un web/DC
@@ -3294,8 +3294,16 @@ def fp_dns_nameservers(domains, extra_domain):
         rc, out = run_capture(["dig", "NS", dom, "+short"], timeout=15)
         nss = _parse_ns_records(out) if rc == 0 else []
         _step(res, f"dig NS {dom} +short", bool(nss), out, note="name servers autoritativos del dominio")
+        if not nss and dc_ip:
+            # #19: el resolutor del sistema no conoce el dominio (interno/solo-VPN, lo normal en un
+            # lab por túnel) → reintenta la consulta de NS contra el PROPIO objetivo escaneado (suele
+            # ser el DC y su DNS autoritativo), en vez de rendirse.
+            rc_dc, out_dc = run_capture(["dig", "NS", dom, f"@{dc_ip}", "+short"], timeout=15)
+            nss = _parse_ns_records(out_dc) if rc_dc == 0 else []
+            _step(res, f"dig NS {dom} @{dc_ip} +short", bool(nss), out_dc,
+                  note="name servers del dominio preguntando al objetivo escaneado (el resolutor del sistema no lo conocía)")
         if not nss:
-            res["next"].append(f"dig NS {dom}   # sin NS resueltos (¿dominio interno/solo-VPN? prueba con @<DC>)")
+            res["next"].append(f"dig NS {dom} @<DC>   # sin NS resueltos (¿dominio interno/solo-VPN? pregunta al DC)")
             continue
         res["findings"].append(("info", f"Name servers de {dom}: {', '.join(nss)}"))
         rc2, out2 = run_capture(["dig", dom, "TXT", "+short"], timeout=15)
@@ -3519,6 +3527,14 @@ def _smtp_is_open_relay(txt):
     return "is an open relay" in (txt or "").lower()
 
 
+def _smtp_auth_no_starttls(features, port):
+    """¿El servidor SMTP ofrece AUTH pero NO STARTTLS en un puerto en claro? → las credenciales
+    viajarían sniffables. `features`: nombres de extensión EHLO (se normalizan a minúsculas). El 465
+    es TLS implícito (no necesita STARTTLS), así que no aplica. Puro → testeable sin red (#20)."""
+    f = {str(k).lower() for k in (features or [])}
+    return "auth" in f and "starttls" not in f and port != 465
+
+
 def fp_smtp(ip, ports, services, host, deep, domains=(), extra_domain=None):
     import smtplib
     res = _fp("smtp", "SMTP", [p["port"] for p in ports])
@@ -3537,6 +3553,10 @@ def fp_smtp(ip, ports, services, host, deep, domains=(), extra_domain=None):
             except smtplib.SMTPException:
                 srv.close()
             _step(res, f"smtplib: EHLO + VRFY root @{ip}:{port}", True, "\n".join(body))
+            # #20: AUTH ofrecido SIN STARTTLS en un puerto en claro → credenciales sniffables.
+            if _smtp_auth_no_starttls(srv.esmtp_features or {}, port):
+                res["findings"].append(("media", f"SMTP {port}: AUTH ofrecido SIN STARTTLS — las credenciales "
+                                        "viajarían EN CLARO (sniffables); el servidor debería exigir STARTTLS o usar 465 (TLS implícito)"))
             if vcode == 250:
                 res["findings"].append(("media", f"SMTP {port}: VRFY habilitado (enumeración de usuarios posible)"))
                 res["next"].append(f"smtp-user-enum -M VRFY -U users.txt -t {ip} -w 15 -v")
@@ -3699,6 +3719,11 @@ def fp_redis(ip, ports, services, host, deep):
             _step(res, f"redis-cli -h {ip} -p {port} INFO server", rc == 0, out, note="acceso sin autenticar")
             if out and "redis_version" in out:
                 res["findings"].append(("critica", f"Redis {port}: accesible SIN autenticación (INFO respondió)"))
+                # #22: la versión ya viene en el INFO — exponerla para cruzarla con CVEs conocidas
+                # (p. ej. Lua sandbox escape / RCE según versión) sin tener que volver a consultar.
+                _rv = re.search(r"redis_version:\s*(\S+)", out)
+                if _rv:
+                    res["findings"].append(("info", f"Redis {port}: versión {_rv.group(1)} — cruza con CVEs (searchsploit redis {_rv.group(1)})"))
                 res["next"] += [
                     f"redis-cli -h {ip} -p {port} CONFIG GET dir   # ruta de trabajo (abuso RCE vía webshell/SSH key)",
                     f"redis-cli -h {ip} -p {port} --scan   # volcar claves",
@@ -5484,7 +5509,7 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
         out.append(fp_ctlogs(domains, extra_domain))
         out.append(fp_subdomains(domains, extra_domain))
         out.append(fp_wayback(domains, extra_domain))
-        out.append(fp_dns_nameservers(domains, extra_domain))
+        out.append(fp_dns_nameservers(domains, extra_domain, dc_ip=ip))
     # kerberos se procesa EL ÚLTIMO a propósito (no por número de puerto, que lo pondría
     # antes que smb/ldap): kerbrute userenum es SIEMPRE el último recurso (ver fp_kerberos),
     # así que primero se les da su turno a smb/ldap en esta MISMA Fase 5 — si la sesión
@@ -13853,6 +13878,37 @@ def selftest():
     assert _smtp_is_open_relay("Server is an open relay (14/16 tests)") is True
     assert _smtp_is_open_relay("Server isn't an open relay, authentication needed") is False
     assert _smtp_is_open_relay("") is False
+    # #20: AUTH sin STARTTLS en puerto en claro → sniffable; con STARTTLS o en 465 (TLS implícito) no.
+    assert _smtp_auth_no_starttls(["AUTH", "SIZE"], 25) is True
+    assert _smtp_auth_no_starttls(["AUTH", "STARTTLS"], 25) is False
+    assert _smtp_auth_no_starttls(["AUTH"], 465) is False
+    assert _smtp_auth_no_starttls(["SIZE"], 25) is False
+    # #22: fp_redis saca la versión del INFO para cruzar CVEs.
+    _real_have_r22, _real_rc_r22 = globals()["have"], run_capture
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), (lambda *a, **k: (0, "# Server\r\nredis_version:6.0.16\r\n"))
+    try:
+        _fr22 = fp_redis("1.2.3.4", [{"port": 6379, "name": "redis", "scripts": {}}], [], {}, False)
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_r22, _real_rc_r22
+    assert any(s == "info" and "versión 6.0.16" in t for s, t in _fr22["findings"]), _fr22["findings"]
+    # #19: si el resolutor del sistema no da NS, se reintenta contra el DC escaneado (@ip).
+    _real_have_d19, _real_rc_d19 = globals()["have"], run_capture
+    def _fake_dns19(cmd, timeout=None, **kw):
+        s = " ".join(cmd)
+        if "NS" in cmd and f"@1.2.3.4" in s:
+            return 0, "ns1.corp.local.\n"
+        if "NS" in cmd:   # resolutor del sistema: vacío
+            return 0, ""
+        if "axfr" in cmd:
+            return 0, ";; Transfer failed."
+        return 0, ""
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), _fake_dns19
+    try:
+        _dns19 = fp_dns_nameservers(["corp.local"], None, dc_ip="1.2.3.4")
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_d19, _real_rc_d19
+    assert any("corp.local" in s["cmd"] and "@1.2.3.4" in s["cmd"] for s in _dns19["steps"]), _dns19["steps"]
+    assert any("ns1.corp.local" in t for _s, t in _dns19["findings"]), _dns19["findings"]
     # Windows → wordlists -lowercase (URLs case-insensitive); Linux → se quedan igual
     assert _target_is_windows([{"port": 3389, "name": "ms-wbt-server", "scripts": {}}], {}) is True   # RDP
     assert _target_is_windows([{"port": 80, "name": "http", "product": "Apache httpd 2.4.53", "extrainfo": "Win64", "scripts": {}}], {}) is True
