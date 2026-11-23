@@ -1062,20 +1062,23 @@ CRAWL = False    # --crawl: katana (crawling real: sigue enlaces/JS/formularios,
 NUCLEI = False   # --nuclei: plantillas de nuclei (CVEs/exposiciones/misconfig) contra cada web (opt-in)
 SPIDER = False   # --spider: spidering de CONTENIDO de shares SMB con nxc (--spider --content), busca secretos dentro de los ficheros (opt-in, lento)
 SPIDER_PATTERN = None  # --pattern: patrón(es) para --spider (si no, un regex de secretos por defecto)
-SHOW_SECRETS = False  # --show-password: muestra la contraseña/hash REAL en los comandos del informe
-                      # (para copiar-pegar) en vez de '***'. Por defecto se enmascara: el informe
-                      # (terminal + html/md/json) se comparte y no debe llevar credenciales en claro
-                      # de serie. OJO: los hallazgos de credencial VÁLIDA y los quick-wins ya
-                      # rellenan la credencial descubierta en claro (es botín, no tu input); esto
-                      # solo controla las VISTAS PREVIAS de comando con el secreto que TÚ aportaste.
+SHOW_SECRETS = True  # --hide-secrets: enmascara con '***' la contraseña/hash REAL en los comandos
+                     # del informe. Por defecto se MUESTRA en claro (para copiar-pegar): son tus
+                     # propias credenciales de pentest, no un secreto ajeno, y copiar/pegar el
+                     # comando tal cual del informe es el caso de uso normal. Si el informe se va a
+                     # compartir (cliente, equipo, ticket), usa --hide-secrets para no llevarlas de
+                     # serie. OJO: los hallazgos de credencial VÁLIDA y los quick-wins siempre
+                     # muestran la credencial descubierta en claro (es botín, no tu input, y
+                     # --hide-secrets no los toca); esto solo controla las VISTAS PREVIAS de
+                     # comando con el secreto que TÚ aportaste.
 
 
 def _sec_disp(secret, is_hash=False):
     """Cómo se MUESTRA un secreto (contraseña aportada o hash) en un comando del informe, como el
-    valor que va tras '-p '/'-H ': '' si no hay secreto, el valor REAL (shlex-quote) con
-    --show-password, o '***' enmascarado por defecto. is_hash solo cambia el enmascarado
-    (':***' para el pass-the-hash de bloodyAD '-p :hash'); con --show-password se devuelve el
-    valor tal cual. Puro → testeable sin red."""
+    valor que va tras '-p '/'-H ': '' si no hay secreto, el valor REAL (shlex-quote) por defecto,
+    o '***' enmascarado con --hide-secrets. is_hash solo cambia el enmascarado (':***' para el
+    pass-the-hash de bloodyAD '-p :hash'); sin --hide-secrets se devuelve el valor tal cual.
+    Puro → testeable sin red."""
     if not secret:
         return "''"
     if SHOW_SECRETS:
@@ -1084,10 +1087,10 @@ def _sec_disp(secret, is_hash=False):
 
 
 def _cred_note(u, secret):
-    """'user:secret' para el NOTE/registro de un paso: enmascarado ('***') por defecto, en claro
-    con --show-password. '' (sin contraseña) se muestra como '∅'. El HALLAZGO de credencial
-    VÁLIDA sí muestra siempre la credencial en claro (es botín confirmado, no tu input); esto es
-    solo para la nota del paso, que se registra incluso en intentos fallidos."""
+    """'user:secret' para el NOTE/registro de un paso: en claro por defecto, enmascarado ('***')
+    con --hide-secrets. '' (sin contraseña) se muestra como '∅'. El HALLAZGO de credencial VÁLIDA
+    sí muestra siempre la credencial en claro (es botín confirmado, no tu input); esto es solo
+    para la nota del paso, que se registra incluso en intentos fallidos."""
     if secret == "":
         return f"{u}:∅"
     return f"{u}:{secret if SHOW_SECRETS else '***'}"
@@ -1096,7 +1099,7 @@ def _cred_note(u, secret):
 def _url_sec(secret, is_hash=False):
     """Secreto para la forma URL de impacket 'DOMINIO/user:SEC@host' (GetUserSPNs/GetNPUsers/
     secretsdump/dacledit…): '' cuando es un hash (va aparte por -hashes) o no hay secreto, la
-    contraseña REAL con --show-password, o '***' enmascarada por defecto. Puro → testeable."""
+    contraseña REAL por defecto, o '***' enmascarada con --hide-secrets. Puro → testeable."""
     if is_hash or not secret:
         return ""
     return secret if SHOW_SECRETS else "***"
@@ -1104,16 +1107,16 @@ def _url_sec(secret, is_hash=False):
 
 def _env_pw_note(var, pw):
     """Nota '(VAR=***)' de un secreto pasado por ENTORNO (no en el argv, para que no quede en el
-    'ps'/log): vacío si no hay contraseña, el valor REAL con --show-password, o '***' por defecto."""
+    'ps'/log): vacío si no hay contraseña, el valor REAL por defecto, o '***' con --hide-secrets."""
     if not pw:
         return ""
     return f"  ({var}={pw})" if SHOW_SECRETS else f"  ({var}=***)"
 
 
 def _mask_out(text, secret):
-    """Enmascara el secreto aportado en una salida capturada, salvo con --show-password. Un
-    secreto en claro de nxc (p. ej. 'DOMINIO\\user:password' en la línea de éxito) no debe
-    acabar en el informe por defecto; con --show-password se deja tal cual."""
+    """Enmascara el secreto aportado en una salida capturada, solo con --hide-secrets. Por
+    defecto un secreto en claro de nxc (p. ej. 'DOMINIO\\user:password' en la línea de éxito) se
+    deja tal cual en el informe; con --hide-secrets se enmascara."""
     if secret and not SHOW_SECRETS:
         return (text or "").replace(secret, "***")
     return text
@@ -5239,8 +5242,9 @@ def _spray_phase(ip, domain, base, services):
     fallida SÍ cuenta como login fallido y PUEDE bloquear cuentas — por eso --safe (kerbrute
     aborta en cuanto ve un bloqueo) y el aviso fuerte. Devuelve un footprint para el informe, o
     None si no aplica (no es un DC). El password spraying por Kerberos solo tiene sentido contra
-    un DC. Las contraseñas se ENMASCARAN en el informe/commands.log (igual que --pass); los
-    aciertos user:pass se enseñan EN PANTALLA (good(), no se persiste)."""
+    un DC. Las contraseñas salen en claro en el informe/commands.log por defecto (igual que
+    --pass), o enmascaradas con --hide-secrets; los aciertos user:pass se enseñan EN PANTALLA
+    (good()) además."""
     if not is_domain_controller(services):
         return None
     res = _fp("spray", "Password Spraying (--spray)", [])
@@ -5274,7 +5278,7 @@ def _spray_phase(ip, domain, base, services):
         _step(res, f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt {_sec_disp(pw)} --safe", bool(valid), shown,
               note="password spraying con --safe contra los usuarios descubiertos (pre-auth fallida = login fallido → posible bloqueo)")
         for usr in valid:
-            good(f"  ✓ Password spraying VÁLIDO: {usr} : {pw}")   # solo en pantalla; el informe lo enmascara
+            good(f"  ✓ Password spraying VÁLIDO: {usr} : {pw}")   # en pantalla; el informe la enmascara solo con --hide-secrets
         if valid:
             res["findings"].append(("critica",
                 f"Password spraying: {len(valid)} credencial(es) VÁLIDA(S) con la contraseña de --spray "
@@ -6688,7 +6692,7 @@ def creds_check(ip, services, host, deep):
 # una credencial válida en otros protocolos/cuentas es uno de los caminos más habituales
 # (ver labs CPTS). 1 intento por par y servicio — salvo -U+-P con listas grandes, que ya
 # es spraying real a propósito (avisa y pide confirmar, ver confirm_creds_spray). La
-# contraseña se enmascara en el informe.
+# contraseña sale en claro en el informe por defecto (--hide-secrets la enmascara).
 _NXC_PROTO_OF = {"smb": "smb", "ssh": "ssh", "winrm": "winrm", "rdp": "rdp",
                  "vnc": "vnc", "msrpc": "wmi", "mssql": "mssql", "ldap": "ldap", "ftp": "ftp"}
 
@@ -6897,8 +6901,8 @@ def _parse_nxc_bulk_successes(out):
     que uno perdido. Devuelve una lista de {"user": str|None, "password": str|None,
     "pwn3d": bool} — "password" es la credencial GANADORA de esta línea (necesaria para
     encadenar un volcado SAM/LSA automático tras un Pwn3d! sin tener que volver a
-    probar toda la lista); el llamante la enmascara en el output crudo por separado,
-    nunca se pierde aquí.
+    probar toda la lista); el llamante la enmascara en el output crudo por separado
+    solo con --hide-secrets (en claro por defecto), nunca se pierde aquí.
 
     SSH en bulk puede meter ruido de verdad en 'out': contra algunos servidores (visto
     con OpenSSH-for-Windows en un run real) el módulo SSH de nxc, basado en paramiko,
@@ -7096,10 +7100,10 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
     try:
         # Hash NTLM → -H (pass-the-hash; nxc no admite ahí el truco de fichero que SÍ
         # soporta -p, así que va literal en el argv mientras nxc corre — inevitable).
-        # Contraseña → -p FICHERO 0600 (nunca en el argv). En AMBOS casos se enmascara
-        # en lo que queda guardado (informe/commands.log): un hash NTLM es tan
-        # reutilizable como la contraseña en claro (pass-the-hash no necesita crackeo),
-        # así que el informe no debe conservarlo en claro tampoco.
+        # Contraseña → -p FICHERO 0600 (nunca en el argv). En AMBOS casos sale en claro
+        # por defecto en lo que queda guardado (informe/commands.log), enmascarable con
+        # --hide-secrets: un hash NTLM es tan reutilizable como la contraseña en claro
+        # (pass-the-hash no necesita crackeo), así que se trata igual.
         if is_hash:
             auth, shown_auth = ["-H", p], "-H " + _sec_disp(p)
         else:
@@ -7330,8 +7334,8 @@ def _acl_abuse_cmds(rights, target, u, secret, is_hash, domain, ip, kind="group"
     acabar con el control total de la cuenta/dominio. bloodyAD va por LDAP/NTLM y funciona
     contra una IP — a diferencia de 'net rpc group addmem', que intenta Kerberos primero y
     falla con 'Failed to connect to IPC$' contra un target por IP sin FQDN (confirmado en
-    vivo). Pass-the-hash: '-p :<hash>'. El secreto se enmascara (***), igual que el resto de
-    next-steps de _creds_enum.
+    vivo). Pass-the-hash: '-p :<hash>'. El secreto sale en claro por defecto (o enmascarado
+    '***' con --hide-secrets), igual que el resto de next-steps de _creds_enum.
 
     `kind`: 'group' (el objetivo es un grupo de alto valor: Domain Admins/Enterprise Admins/
     Administrators → meterse en el grupo, el paso final es `add groupMember`) o 'account' (el
@@ -7616,8 +7620,9 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
     (certipy instalado + dominio ya conocido), 'certipy find -vulnerable' (plantillas de
     certificados vulnerables ESC1-8, ver más abajo). La contraseña va
     por fichero 0600 (-p FICHERO); el hash, literal por -H (nxc no admite ahí el truco de
-    fichero). AMBOS se enmascaran en lo que queda guardado (informe/commands.log) — un hash
-    NTLM es tan reutilizable como la contraseña en claro (pass-the-hash no necesita crackeo).
+    fichero). AMBOS salen en claro por defecto en lo que queda guardado (informe/commands.log),
+    enmascarables con --hide-secrets — un hash NTLM es tan reutilizable como la contraseña en
+    claro (pass-the-hash no necesita crackeo).
     Se llama UNA vez por protocolo (la 1ª credencial válida basta para enumerar el dominio).
     `domain`: dominio AD ya resuelto (discover_domains, calculado pronto — ver run_one) o
     None si todavía no se conoce; sin él, certipy no puede formar '-u user@dominio' y el
@@ -8070,7 +8075,8 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 # OJO: a diferencia de nxc, certipy no admite la contraseña por fichero — va
                 # literal en el argv mientras el proceso corre (visible por ps aux/
                 # /proc/<pid>/cmdline durante esos segundos), inevitable con la interfaz de
-                # certipy. Se enmascara igual en lo que queda GUARDADO (informe/commands.log).
+                # certipy. Sale en claro por defecto en lo que queda GUARDADO
+                # (informe/commands.log), enmascarable con --hide-secrets.
                 rc, out = _run_capture_retry(
                     [certipy, "find", "-u", f"{u}@{domain}"] + auth_c +
                     ["-dc-ip", ip, "-vulnerable", "-stdout", "-silent"], timeout=120, quiet=True)
@@ -8309,7 +8315,7 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
     """Spray de listas por nxc (fallback: protocolo que hydra no cubre, pass-the-hash, o hydra
     ausente). Escribe las dos listas a fichero (secreto nunca en argv), lanza UN nxc con -u/-p
     de fichero + --continue-on-success, parsea los '[+]' y registra el paso con la contraseña
-    enmascarada. Devuelve [{"user","password","pwn3d"}]."""
+    en claro por defecto (--hide-secrets la enmascara). Devuelve [{"user","password","pwn3d"}]."""
     import tempfile
     uf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".users")
     uf.write("\n".join(bulk_users) + "\n")
@@ -8345,7 +8351,7 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
     if port and dp and port != dp:
         shown += f" --port {port}"
     safe_out = out or ""
-    for pw in bulk_passwords:   # se enmascara también el hash: tan reutilizable como la contraseña
+    for pw in bulk_passwords:   # --hide-secrets enmascara también el hash: tan reutilizable como la contraseña
         if pw:
             safe_out = _mask_out(safe_out, pw)
     hits = _parse_nxc_bulk_successes(out or "")
@@ -8364,7 +8370,8 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
 def _hydra_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, local_auth):
     """Spray de listas por HYDRA (ssh/ftp/smb): más rápido que nxc y sin su bug de paramiko
     por SSH. Listas a fichero (secreto nunca en argv), lanza hydra, parsea los aciertos y
-    registra el paso con la contraseña enmascarada. Devuelve [{"user","password","pwn3d"}].
+    registra el paso con la contraseña en claro por defecto (--hide-secrets la enmascara).
+    Devuelve [{"user","password","pwn3d"}].
 
     Casos especiales vistos en objetivos reales:
       · SSH solo-publickey: hydra dice 'does not support password authentication (method
@@ -8916,17 +8923,17 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
     (reutilización entre protocolos). Devuelve UN footprint-dict POR PROTOCOLO REAL usado
     (proto="reuse-smb"/"reuse-ldap"/…, no un único bloque "reuse" mezclando todos como antes)
     para que el informe pueda agrupar las 3 fases de un mismo protocolo (footprint anónimo +
-    credenciales por defecto + aportadas) bajo un solo desplegable. La contraseña NUNCA se
-    escribe en el informe (se enmascara) NI va
+    credenciales por defecto + aportadas) bajo un solo desplegable. La contraseña sale en claro
+    en el informe por defecto (enmascarable con --hide-secrets) pero NUNCA va
     en el argv del subproceso (nxc soporta -p <fichero>: se escribe a un temporal 0600 y
     se borra al terminar — a diferencia de DEFAULT_CREDS, aquí es una contraseña REAL del
     operador y `ps aux`/`/proc/<pid>/cmdline` la expondría mientras nxc corre).
 
     `is_hash` (--hash/-H, pass-the-hash) cambia -p por -H: nxc no admite ahí el truco de
     fichero (va literal en el argv mientras nxc corre — inevitable, es el propio interfaz
-    de nxc), pero SÍ se enmascara igual que la contraseña en lo que queda guardado
-    (informe/commands.log): un hash NTLM es tan reutilizable como la contraseña en claro
-    (pass-the-hash no necesita crackeo), así que el informe no debe conservarlo en claro.
+    de nxc), pero se enmascara igual que la contraseña con --hide-secrets en lo que queda
+    guardado (informe/commands.log): un hash NTLM es tan reutilizable como la contraseña en
+    claro (pass-the-hash no necesita crackeo), así que se trata igual.
 
     `domain`: dominio AD ya resuelto (discover_domains, calculado pronto por run_one para
     esto — ver main()) o None si aún no se conoce. Solo lo usa la rama LDAP de _creds_enum,
@@ -9157,31 +9164,35 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                         os.unlink(sec_file.name)
                     except OSError:
                         pass
-            # La CREDENCIAL aportada se MUESTRA en el hallazgo (contraseña O hash): es input del
-            # propio operador y el sentido de esta fase es ver CUÁL de las probadas funciona —
-            # enmascarar el hash dejaba el hallazgo inservible («mssqlsvc:***» no dice cuál era, y
-            # un PtH se identifica por el hash igual que una cred por la contraseña). Pedido en
-            # vivo ("se esconde el hash"). La salida cruda del paso sí sigue enmascarando el hash
-            # (safe_out, más abajo) por higiene del volcado, pero el hallazgo lo enseña.
+            # La CREDENCIAL aportada se MUESTRA SIEMPRE en el hallazgo (contraseña O hash,
+            # pase lo que pase con --hide-secrets): es input del propio operador y el sentido
+            # de esta fase es ver CUÁL de las probadas funciona — enmascarar el hash dejaba el
+            # hallazgo inservible («mssqlsvc:***» no dice cuál era, y un PtH se identifica por
+            # el hash igual que una cred por la contraseña). Pedido en vivo ("se esconde el
+            # hash"). El cmd/salida crudos de abajo sí respetan SHOW_SECRETS/--hide-secrets.
             masked = f"{u}:{'∅' if p == '' else p}"
-            # El COMANDO guardado enmascara SIEMPRE el secreto (contraseña O hash) con '***' — antes
-            # la rama no-hash metía la contraseña EN CLARO en el cmd via shlex.quote(p), así que un
-            # intento FALLIDO (sin hallazgo que lo muestre) dejaba la contraseña en el cmd de
-            # findings.json/report, violando el docstring ('la contraseña NUNCA se escribe en el
-            # informe') — confirmado en un findings.json real (#52). El HALLAZGO sí muestra la cred
-            # (masked), que es el sentido de esta fase; la fuga era solo en el cmd/salida crudos.
+            # El COMANDO guardado respeta SHOW_SECRETS/--hide-secrets para el secreto (contraseña
+            # O hash) — antes SIEMPRE lo enmascaraba con '***' incondicionalmente, y antes de eso
+            # la rama no-hash metía la contraseña EN CLARO en el cmd via shlex.quote(p) sin pasar
+            # por ningún flag, así que un intento FALLIDO (sin hallazgo que lo muestre) dejaba la
+            # contraseña en el cmd de findings.json/report de forma no controlable — confirmado en
+            # un findings.json real (#52). El HALLAZGO sí muestra la cred (masked) siempre, que es
+            # el sentido de esta fase; esto solo gobierna el cmd/salida crudos.
             shown_sec = ("-H " + _sec_disp(p)) if is_hash else ("-p " + _sec_disp(p))
             shown = f"{nxc} {np} {ip} -u {shlex.quote(u)} {shown_sec}"
             if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
                 shown += " --local-auth"
             if port and dp and port != dp:
                 shown += f" --port {port}"
-            # La salida cruda enmascara el secreto para hash Y contraseña (antes solo para hash): la
-            # línea de éxito de nxc trae 'DOMINIO\\user:password' en claro, que acababa en el report.
+            # La salida cruda respeta SHOW_SECRETS/--hide-secrets para hash Y contraseña (antes
+            # solo para hash): la línea de éxito de nxc trae 'DOMINIO\\user:password' en claro,
+            # que por defecto se deja (es tu propio input) pero puede acabar en un report que
+            # compartas — de ahí --hide-secrets.
             safe_out = _mask_out(out, p)
-            # El NOTE del paso (parte del registro crudo) enmascara el secreto; solo el HALLAZGO
-            # muestra la cred en claro (masked). Antes el note llevaba 'CT059:charlie1' y filtraba la
-            # contraseña incluso en intentos fallidos (sin hallazgo), igual que el cmd/salida (#52).
+            # El NOTE del paso (parte del registro crudo) respeta SHOW_SECRETS/--hide-secrets;
+            # el HALLAZGO siempre muestra la cred en claro (masked) pase lo que pase. Antes el
+            # note llevaba 'CT059:charlie1' sin pasar por ningún flag, incluso en intentos
+            # fallidos (sin hallazgo), igual que el cmd/salida (#52).
             masked_step = _cred_note(u, p)
             ok = _nxc_ok(out)
             _step(res, shown, ok, safe_out,
@@ -11206,7 +11217,13 @@ def selftest():
     _wo_cmds = _acl_abuse_cmds(["WriteOwner"], "Domain Admins", "CT059", "charlie1", False, "inlanefreight.local", "172.16.7.3")
     assert len(_wo_cmds) == 3 and "set owner" in _wo_cmds[0]   # owner → genericAll → addmem
     _h_cmds = _acl_abuse_cmds(["GenericAll"], "Domain Admins", "CT059", "ignored", True, "inlanefreight.local", "172.16.7.3")
-    assert "-p ':***'" in _h_cmds[0]   # PtH: bloodyAD -p :hash (enmascarado)
+    assert "-p :ignored" in _h_cmds[0]   # PtH: bloodyAD -p :hash, en claro por defecto
+    globals()["SHOW_SECRETS"] = False
+    try:
+        assert "-p ':***'" in _acl_abuse_cmds(["GenericAll"], "Domain Admins", "CT059", "ignored", True,
+                                              "inlanefreight.local", "172.16.7.3")[0]   # --hide-secrets: enmascarado
+    finally:
+        globals()["SHOW_SECRETS"] = True
 
     # _acl_abuse_cmds con kind="account": el objetivo es una CUENTA (p. ej. 'Administrator'),
     # no un grupo → el paso final es 'set password', NUNCA 'add groupMember' — caso real: el
@@ -11275,7 +11292,7 @@ def selftest():
     assert "WriteProperty" in _parse_daclread_rights(_dacl_wp_sing), _parse_daclread_rights(_dacl_wp_sing)
 
     # BUG: impacket-secretsdump del hallazgo DCSync usa el formato correcto en pass-the-hash.
-    # Antes siempre decía 'user:***@ip', inválido con -H. Hash → '-hashes :***' + 'user@ip'.
+    # Antes siempre decía 'user:***@ip', inválido con -H. Hash → '-hashes :<hash>' + 'user@ip'.
     _real_rcr_acl2 = _run_capture_retry
 
     def _fake_daclread_dcsync_hash(cmd, timeout=None, quiet=False, **kw):
@@ -11294,9 +11311,9 @@ def selftest():
     finally:
         globals()["_run_capture_retry"] = _real_rcr_acl2
     _acl_h_next = " ".join(_acl_h["next"])
-    assert "-hashes :***" in _acl_h_next, _acl_h_next
+    assert "-hashes :aad3...:abcd1234" in _acl_h_next, _acl_h_next   # en claro por defecto
     assert "CT059@172.16.7.3" in _acl_h_next, _acl_h_next
-    assert "CT059:***@172.16.7.3" not in _acl_h_next, _acl_h_next   # formato viejo (incorrecto con hash) ya no sale
+    assert "CT059:aad3...:abcd1234@172.16.7.3" not in _acl_h_next, _acl_h_next   # formato viejo (incorrecto con hash) ya no sale
 
     # BUG: GenericAll sobre el DOMINIO raíz (sin ACE con GUID DCSync) también implica DCSync — la
     # primera pasada con RIGHTS=DCSync no lo detecta (filtra por GUID), la 2a sin filtro sí. Caso real.
@@ -12041,7 +12058,7 @@ def selftest():
     assert _read_ad_users(None) == []
 
     # _spray_phase: rocía ad_users.txt con kerbrute passwordspray --safe; un acierto → hallazgo
-    # crítico y la contraseña ENMASCARADA (***) en el paso guardado. kerbrute/run_capture mockeados.
+    # crítico y la contraseña en claro (por defecto) en el paso guardado. kerbrute/run_capture mockeados.
     _real_kbbin_s, _real_rc_s = _kerbrute_bin, run_capture
     _spray_dir = Path(tempfile.mkdtemp())
     (_spray_dir / "ad_users.txt").write_text("administrator\njon\n")
@@ -12063,7 +12080,7 @@ def selftest():
         globals()["SPRAY_PASSWORDS"] = _real_spray_pw
     assert _sp is not None
     assert any(s == "critica" and "VÁLIDA" in t and "jon" in t for s, t in _sp["findings"])
-    assert "Welcome1" not in _sp["steps"][0]["output"] and "***" in _sp["steps"][0]["cmd"]
+    assert "Welcome1" in _sp["steps"][0]["output"] and "Welcome1" in _sp["steps"][0]["cmd"]   # en claro por defecto
     assert _sp_nodc is None   # spraying por Kerberos solo contra un DC
     # #35: un ABORT por BLOQUEO ('USER LOCKED OUT') se reporta alta/BLOQUEO; un ABORT por red/realm
     # ('Can't talk to KDC. Aborting...') NO es bloqueo → media, sin decir 'cuentas bloqueadas'.
@@ -12738,10 +12755,11 @@ def selftest():
     # _dump_sam_lsa: mockeando nxc_bin/run_capture con esas MISMAS salidas reales, comprueba
     # que llama a 'nxc smb ip -u ... -p ... --sam', '--lsa' y '-M lsassy' (sin --local-auth:
     # reutiliza tal cual la autenticación que ya dio Pwn3d!), que la contraseña del operador
-    # queda enmascarada en el output guardado pero el hash/secreto DESCUBIERTO no (es la
-    # entrega), y que las severidades son las esperadas (cuenta con hash vacío y LSA en texto
-    # claro → crítica; hash NTLM normal → alta). Sin sesión activa en este fixture → lsassy
-    # responde "No credentials found" (sin acierto, ni ruido en el pool).
+    # sale en claro en el output guardado por defecto (enmascarable con --hide-secrets) y que
+    # el hash/secreto DESCUBIERTO siempre sale en claro (es la entrega, no se enmascara nunca),
+    # y que las severidades son las esperadas (cuenta con hash vacío y LSA en texto claro →
+    # crítica; hash NTLM normal → alta). Sin sesión activa en este fixture → lsassy responde
+    # "No credentials found" (sin acierto, ni ruido en el pool).
     _real_nxc_bin3, _real_run_capture3 = nxc_bin, run_capture
     _dump_cmds = []
 
@@ -12764,8 +12782,20 @@ def selftest():
     assert len(_dump_cmds) == 3 and all("--local-auth" not in c for c in _dump_cmds)   # --sam/--lsa/-M lsassy
     assert all("HTB_@cademy_stdnt!" not in " ".join(c) for c in _dump_cmds)   # la contraseña nunca va en el argv
     _dsteps_out = " ".join(s["output"] for s in _dres["steps"])
-    assert "HTB_@cademy_stdnt!" not in _dsteps_out   # la contraseña del operador, enmascarada
+    assert "HTB_@cademy_stdnt!" in _dsteps_out   # la contraseña del operador, en claro por defecto
     assert "3c0e5d303ec84884ad5c3b7876a06ea6" in _dsteps_out and "Password123" in _dsteps_out   # el hash/secreto DESCUBIERTO, en claro (es la entrega)
+    globals()["SHOW_SECRETS"] = False
+    _dump_cmds_hidden = []
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_run_capture
+    try:
+        _dres_hidden = _fp("reuse", "test", [445])
+        _dump_sam_lsa(_dres_hidden, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!")
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+        globals()["SHOW_SECRETS"] = True
+    _dsteps_out_hidden = " ".join(s["output"] for s in _dres_hidden["steps"])
+    assert "HTB_@cademy_stdnt!" not in _dsteps_out_hidden   # --hide-secrets: la contraseña del operador, enmascarada
+    assert "3c0e5d303ec84884ad5c3b7876a06ea6" in _dsteps_out_hidden   # el hash/secreto DESCUBIERTO sigue en claro (--hide-secrets no lo toca)
     _dfindings = {(s, t) for s, t in _dres["findings"]}
     assert any(s == "critica" and "Administrator" in t and "VACÍA" in t for s, t in _dfindings)
     assert any(s == "alta" and "bob" in t and "3c0e5d303ec84884ad5c3b7876a06ea6" in t for s, t in _dfindings)
@@ -12987,24 +13017,24 @@ def selftest():
     _fill_cred_placeholder([_fc_noop])
     assert _fc_noop["next"] == ["evil-winrm -i 10.0.0.1 -u USER -p PASS"]
 
-    # --show-password (SHOW_SECRETS): por defecto el secreto APORTADO se enmascara ('***') en las
-    # vistas previas de comando; con el flag se muestra en claro (para copiar-pegar). Los hallazgos
-    # de credencial VÁLIDA y los quick-wins ya salen en claro de todos modos (botín, no input).
-    assert SHOW_SECRETS is False                                   # default seguro
-    assert _sec_disp("charlie1") == "'***'" and _sec_disp("") == "''"
-    assert _sec_disp("h", is_hash=True) == "':***'"
-    assert _cred_note("CT059", "charlie1") == "CT059:***" and _cred_note("CT059", "") == "CT059:∅"
-    assert _url_sec("charlie1", False) == "***" and _url_sec("h", True) == "" and _url_sec("", False) == ""
-    assert _env_pw_note("MYSQL_PWD", "charlie1") == "  (MYSQL_PWD=***)" and _env_pw_note("MYSQL_PWD", "") == ""
-    globals()["SHOW_SECRETS"] = True
+    # --hide-secrets: por defecto el secreto APORTADO se muestra en claro ('***' solo con el
+    # flag) en las vistas previas de comando. Los hallazgos de credencial VÁLIDA y los quick-wins
+    # ya salen en claro de todos modos (botín, no input) y --hide-secrets no los toca.
+    assert SHOW_SECRETS is True                                    # default: en claro
+    assert _sec_disp("charlie1") == "charlie1" and _sec_disp("p a") == "'p a'"
+    assert _sec_disp("h", is_hash=True) == ":h"        # bloodyAD pass-the-hash '-p :hash' (shlex no cita ':h')
+    assert _cred_note("CT059", "charlie1") == "CT059:charlie1"
+    assert _url_sec("charlie1", False) == "charlie1" and _url_sec("h", True) == ""
+    assert _env_pw_note("MYSQL_PWD", "charlie1") == "  (MYSQL_PWD=charlie1)"
+    globals()["SHOW_SECRETS"] = False
     try:
-        assert _sec_disp("charlie1") == "charlie1" and _sec_disp("p a") == "'p a'"
-        assert _sec_disp("h", is_hash=True) == ":h"        # bloodyAD pass-the-hash '-p :hash' (shlex no cita ':h')
-        assert _cred_note("CT059", "charlie1") == "CT059:charlie1"
-        assert _url_sec("charlie1", False) == "charlie1" and _url_sec("h", True) == ""
-        assert _env_pw_note("MYSQL_PWD", "charlie1") == "  (MYSQL_PWD=charlie1)"
+        assert _sec_disp("charlie1") == "'***'" and _sec_disp("") == "''"
+        assert _sec_disp("h", is_hash=True) == "':***'"
+        assert _cred_note("CT059", "charlie1") == "CT059:***" and _cred_note("CT059", "") == "CT059:∅"
+        assert _url_sec("charlie1", False) == "***" and _url_sec("h", True) == "" and _url_sec("", False) == ""
+        assert _env_pw_note("MYSQL_PWD", "charlie1") == "  (MYSQL_PWD=***)" and _env_pw_note("MYSQL_PWD", "") == ""
     finally:
-        globals()["SHOW_SECRETS"] = False
+        globals()["SHOW_SECRETS"] = True
 
     # fp_mssql: los next-steps usan el placeholder USER:'PASS' (rellenable), NO 'sa:'/'Administrator'
     # fijos — así una credencial válida descubierta rellena el comando del quick-win (bug reportado
@@ -13090,16 +13120,27 @@ def selftest():
     assert any("hallazgo justo antes de reventar" in t for r in _pcc_results for _, t in r["findings"])
     assert (_pcc_base / "error.log").exists()
 
-    # #52: la ruta 1-a-1 NO filtra la contraseña en claro al cmd/salida guardados (ni en un intento
-    # FALLIDO, que no genera hallazgo que la muestre). Antes el cmd llevaba '-p charlie1' y la salida
-    # cruda 'CT059:charlie1', violando el docstring — confirmado en un findings.json real.
+    # #52: la ruta 1-a-1 respeta SHOW_SECRETS/--hide-secrets en el cmd/salida guardados, incluso en
+    # un intento FALLIDO (que no genera hallazgo que la muestre). Antes el cmd SIEMPRE llevaba
+    # '-p charlie1' y la salida cruda 'CT059:charlie1' en claro pase lo que pase, violando el
+    # docstring de _sec_disp/_mask_out — confirmado en un findings.json real. Por defecto
+    # (SHOW_SECRETS=True) sí sale en claro a propósito; con --hide-secrets debe desaparecer.
     globals()["nxc_bin"] = lambda: "FAKE_NXC"
     globals()["run_capture"] = lambda cmd, timeout=None, **kw: (1, "SMB 1.2.3.4 445 WIN [-] WIN\\CT059:charlie1 STATUS_LOGON_FAILURE")
     try:
         _leak = provided_creds_check("1.2.3.4", [{"port": 445, "name": "microsoft-ds"}], [("CT059", "charlie1")])
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
-    assert "charlie1" not in json.dumps(_leak, ensure_ascii=False), "contraseña en claro filtrada al footprint (#52)"
+    assert "charlie1" in json.dumps(_leak, ensure_ascii=False)   # en claro por defecto (es tu propio input)
+    globals()["nxc_bin"] = lambda: "FAKE_NXC"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (1, "SMB 1.2.3.4 445 WIN [-] WIN\\CT059:charlie1 STATUS_LOGON_FAILURE")
+    globals()["SHOW_SECRETS"] = False
+    try:
+        _leak_hidden = provided_creds_check("1.2.3.4", [{"port": 445, "name": "microsoft-ds"}], [("CT059", "charlie1")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+        globals()["SHOW_SECRETS"] = True
+    assert "charlie1" not in json.dumps(_leak_hidden, ensure_ascii=False), "contraseña en claro filtrada al footprint con --hide-secrets (#52)"
 
     # --local-auth en provided_creds_check: se añade en protocolos NTLM (smb, aquí) cuando
     # se pide, y se EXCLUYE a propósito en ssh (nxc no distingue dominio/local ahí — ver
@@ -13125,8 +13166,9 @@ def selftest():
 
     # provided_creds_check en modo bulk: nxc/run_capture mockeados (sin red) — comprueba
     # que escribe las DOS listas a fichero, pasa --continue-on-success (+--no-bruteforce
-    # si se pide), pide quiet=True (no inunda la terminal), enmascara la contraseña en el
-    # output guardado, y que los hallazgos (incluido Pwn3d!) salen con la severidad
+    # si se pide), pide quiet=True (no inunda la terminal), deja la contraseña en claro en el
+    # output guardado por defecto (--hide-secrets la enmascara), y que los hallazgos (incluido
+    # Pwn3d!) salen con la severidad
     # correcta — sin esto no hay forma de probar la rama bulk sin un nxc/objetivo real.
     # El propio Pwn3d! de "alice" encadena un volcado SAM/LSA automático (2 pasos más) Y la
     # nueva enumeración CON la credencial (_creds_enum: --shares/--users/--pass-pol/--rid-brute,
@@ -13174,7 +13216,7 @@ def selftest():
     assert _quiet is True and "--continue-on-success" in _cmd and "--no-bruteforce" not in _cmd
     assert _timeout and _timeout > 0
     _bstep = _bres[0]["steps"][0]
-    assert "Summer2024" not in _bstep["output"] and "***" in _bstep["output"]   # contraseña enmascarada
+    assert "Summer2024" in _bstep["output"]   # contraseña en claro por defecto (--hide-secrets la enmascara)
     _bfindings = {(s, t) for s, t in _bres[0]["findings"]}
     assert any(s == "critica" and "alice:Summer2024" in t and "Pwn3d!" in t for s, t in _bfindings)   # ganadora en CLARO (botín)
     # el gap que motivó el fix: el spray (-U/-P) también dispara _creds_enum para la credencial
@@ -13285,7 +13327,7 @@ def selftest():
         assert _hydra_bulk(_rf, "ftp", "10.0.0.1", 2121, 21, ["robin"], ["s3cr3t"], False, "FAKE_NXC", False) == \
             [{"user": "robin", "password": "s3cr3t", "pwn3d": False}]
         assert _rf["steps"][0]["cmd"].startswith("hydra ")
-        assert "s3cr3t" not in _rf["steps"][0]["output"] and "***" in _rf["steps"][0]["output"]
+        assert "s3cr3t" in _rf["steps"][0]["output"]   # en claro por defecto (--hide-secrets la enmascara)
         # (b) SSH solo-publickey y SIN hits: hydra 'method reply' → sin hits, hallazgo info
         globals()["run_capture"] = lambda cmd, timeout=None, quiet=False, **kw: (
             1, "[ERROR] target ssh://10.0.0.1:22/ does not support password authentication (method reply 4).\n")
@@ -13667,7 +13709,7 @@ def selftest():
     assert "Secret123" in " ".join(_certipy_cmds[0])   # certipy no admite -p por fichero: va literal en el argv REAL…
     _cfind = next(r for r in _cres if r["proto"] == "reuse-ldap")
     _cstep = next(s for s in _cfind["steps"] if "certipy find" in s["cmd"])
-    assert "Secret123" not in _cstep["cmd"] and "***" in _cstep["cmd"]   # …pero el comando GUARDADO/mostrado sí lo enmascara
+    assert "Secret123" in _cstep["cmd"]   # el comando GUARDADO/mostrado también lo muestra por defecto (--hide-secrets lo enmascara)
     assert any(sev == "critica" and "ESC1" in t for sev, t in _cfind["findings"])
     assert any("certipy req" in n and "ESC1" in n for n in _cfind["next"])   # sugerencia MANUAL, nunca ejecutado
 
@@ -13703,7 +13745,7 @@ def selftest():
     assert "add-computer" in _esc1_maq_next[0] and "Domain Computers" in _esc1_maq_next[0]
     assert "-sid DOMAIN_SID-500" in _esc1_maq_next[0]
     assert "DELETE=True" in _esc1_maq_next[0]
-    assert "Secret123" not in _esc1_maq_next[0]   # el secreto nunca en un next-step
+    assert "Secret123" in _esc1_maq_next[0]   # la credencial del operador, en claro por defecto (--hide-secrets la enmascara)
     assert not any("TEMPLATE_DENIED" in n for n in _cfind["next"])   # el fixture SOLO-ESC1 de arriba no la dispara (sin MAQ)
 
     # Sugerencias nuevas de _creds_enum (LDAP) tras MAQ>0 / trust padre-hijo / DCSync: addcomputer.py+
@@ -13740,7 +13782,7 @@ def selftest():
     assert any("dacledit.py" in n and "DC=child,DC=corp,DC=local" in n for n in _chfind["next"])
     assert any("-M badsuccessor" in n and "Windows Server 2025" in n for n in _chfind["next"])
     assert any("ticketer.py" in n and "16e26ba33e455a8c338142af8d89ffbc" in n and "DOMAIN_SID" in n for n in _chfind["next"])
-    assert all("Password123" not in n for n in _chfind["next"])   # el secreto nunca va en texto plano en un next-step
+    assert any("Password123" in n for n in _chfind["next"])   # dacledit.py la lleva en la URL, en claro por defecto
 
     # Mismo escenario pero con is_hash=True: addcomputer.py/rbcd.py/dacledit.py deben llevar
     # '-hashes ***' — bug real encontrado por inspección: con is_hash=True, el ':' del ident queda
@@ -13763,7 +13805,7 @@ def selftest():
     assert any("rbcd.py" in n and "-hashes ***" in n for n in _chfind_h["next"])
     assert any("dacledit.py" in n and "-hashes ***" in n for n in _chfind_h["next"])
     assert not any("raiseChild.py" in n for n in _chfind_h["next"])   # sec_file no existe con is_hash=True → no sale
-    assert all("8846f7eaee8fb117ad06bdd830b7586c" not in n for n in _chfind_h["next"])   # el hash real nunca en texto plano
+    assert any("8846f7eaee8fb117ad06bdd830b7586c" in n for n in _chfind_h["next"])   # -M badsuccessor lleva shown_auth, en claro por defecto
 
     # pre2k: cuentas de equipo pre-creadas (ldapsearch con userAccountControl=4128, mismo bind
     # que los trusts) → hallazgo 'alta' con los nombres + sugerencia MANUAL '-M pre2k' (palantir
@@ -13793,7 +13835,7 @@ def selftest():
     _p2find = next(r for r in _p2res if r["proto"] == "reuse-ldap")
     assert any(s == "alta" and "pre-creada" in t and "LEGACY01$" in t for s, t in _p2find["findings"])
     assert any("-M pre2k" in n and "1 cuenta" in n for n in _p2find["next"])
-    assert all("Password123" not in n for n in _p2find["next"])
+    assert any("Password123" in n for n in _p2find["next"])   # dacledit.py la lleva en la URL, en claro por defecto
 
     # _parse_ldap_pre2k en frío (sin red): [] si no hay ningún bloque con sAMAccountName.
     assert _parse_ldap_pre2k("dn: CN=x,DC=y\ntrustPartner: z\n\n") == []
@@ -13830,9 +13872,9 @@ def selftest():
     # impacket-GetUserSPNs (-request, sin wordlist) en vez de nxc --asreproast/--kerberoasting
     # (pedido explícito del operador, 09-nov: primero AS-REP, luego "kerberoasting que sea con
     # impacket-getuserspn") — mismo patrón que certipy: identidad+contraseña van LITERALES en
-    # el argv real (impacket no admite -p por fichero), pero el comando GUARDADO/mostrado
-    # enmascara la contraseña; sin dominio se deja como sugerencia manual con el placeholder
-    # "DOMINIO", nunca se ejecuta.
+    # el argv real (impacket no admite -p por fichero); el comando GUARDADO/mostrado respeta
+    # SHOW_SECRETS/--hide-secrets para la contraseña; sin dominio se deja como sugerencia manual
+    # con el placeholder "DOMINIO", nunca se ejecuta.
     _real_impacket_suggest = globals()["_impacket_suggest_bin"]
     _getnp_cmds, _getspn_cmds = [], []
 
@@ -13873,9 +13915,9 @@ def selftest():
     assert any(a.endswith("kerb.txt") for a in _getspn_cmds[0])        # ya no 'kerb_nxc.txt' (no lo escribe nxc)
     _gfind = next(r for r in _gres if r["proto"] == "reuse-ldap")
     _gstep = next(s for s in _gfind["steps"] if "FAKE_GETNPUSERS" in s["cmd"])
-    assert "Secret123" not in _gstep["cmd"] and "***" in _gstep["cmd"]  # comando GUARDADO/mostrado enmascara la contraseña
+    assert "Secret123" in _gstep["cmd"]  # comando GUARDADO/mostrado en claro por defecto (--hide-secrets lo enmascara)
     _kstep = next(s for s in _gfind["steps"] if "FAKE_GETUSERSPNS" in s["cmd"])
-    assert "Secret123" not in _kstep["cmd"] and "***" in _kstep["cmd"]
+    assert "Secret123" in _kstep["cmd"]
     assert any(sev == "alta" and "2 hash(es) de AS-REP" in t for sev, t in _gfind["findings"])
     assert any(sev == "alta" and "1 hash(es) de Kerberoast" in t for sev, t in _gfind["findings"])
 
@@ -13929,11 +13971,10 @@ def selftest():
     _dbfindings = {(s, t) for r in _dbres for s, t in r["findings"]}
     assert any(s == "alta" and "MYSQL" in t and "válida" in t for s, t in _dbfindings)
     assert any(s == "alta" and "POSTGRES" in t and "válida" in t for s, t in _dbfindings)
-    # la contraseña NUNCA en el argv (va por variable de entorno MYSQL_PWD/PGPASSWORD) ni en el
-    # comando guardado (se enmascara igual que el resto de la Fase 5d)
-    for _r in _dbres:
-        for _st in _r["steps"]:
-            assert "goodpw" not in _st["cmd"]
+    # la contraseña NUNCA en el argv (va por variable de entorno MYSQL_PWD/PGPASSWORD); en el
+    # comando GUARDADO sale en claro por defecto (nota '(MYSQL_PWD=...)'), igual que el resto
+    # de la Fase 5d — enmascarable con --hide-secrets.
+    assert any("goodpw" in _st["cmd"] for _r in _dbres for _st in _r["steps"])
     # pass-the-hash (-H) no aplica a auth de BD: ni lo intenta, deja dicho por qué
     globals()["have"] = lambda name: name in ("mysql", "psql")
     globals()["run_capture"] = _fake_db_rc
@@ -13962,9 +14003,10 @@ def selftest():
 
     # _creds_enum en pass-the-hash (-H): la enum usa -H <hash> (no -p). En el ARGV (mientras
     # nxc corre de verdad) el hash va literal — nxc no admite ahí el truco de fichero que SÍ
-    # tiene -p, así que es inevitable, igual que si lo escribieras tú a mano. Pero en lo que
-    # queda GUARDADO (el comando MOSTRADO en steps/informe) se enmascara igual que una
-    # contraseña: un hash NTLM es tan reutilizable como la contraseña en claro.
+    # tiene -p, así que es inevitable, igual que si lo escribieras tú a mano. En lo que queda
+    # GUARDADO (el comando MOSTRADO en steps/informe) se trata igual que una contraseña
+    # (en claro por defecto, enmascarable con --hide-secrets): un hash NTLM es tan
+    # reutilizable como la contraseña en claro.
     _enr_cmds2 = []
 
     def _fake_enrich_rc2(cmd, timeout=None, quiet=False, **kw):
@@ -13985,8 +14027,7 @@ def selftest():
     assert "-H" in _sh and "-p" not in _sh                                # pass-the-hash: -H, no -p
     assert "31d6cfe0d16ae931b73c59d7e0c089c0" in _sh                      # el argv SÍ lo lleva (nxc lo exige literal — inevitable)
     _hcmds_shown = " ".join(s["cmd"] for s in _hres[0]["steps"])
-    assert "31d6cfe0d16ae931b73c59d7e0c089c0" not in _hcmds_shown         # pero el comando GUARDADO (lo que ve el informe) lo enmascara
-    assert "'***'" in _hcmds_shown
+    assert "31d6cfe0d16ae931b73c59d7e0c089c0" in _hcmds_shown             # y el comando GUARDADO (lo que ve el informe) también lo muestra por defecto
     # El HALLAZGO sí muestra el hash aportado: es input del operador y sirve para ver CUÁL cred
     # funcionó (pedido en vivo, "se esconde el hash" — antes salía «admin:***», inservible).
     _hfind = " ".join(t for _s, t in _hres[0]["findings"])
@@ -17540,53 +17581,64 @@ def _load_rc_args(path=None):
 
 def main():
     ap = argparse.ArgumentParser(description="palantir — recon guiado por Nmap (Kali).")
-    ap.add_argument("target", nargs="?",
+    g_objetivo = ap.add_argument_group("Objetivo y salida")
+    g_fuzzing = ap.add_argument_group("Wordlists y fuzzing web")
+    g_dominio = ap.add_argument_group("Dominio / AD / DNS")
+    g_enumad = ap.add_argument_group("Enumeracion de usuarios AD, SNMP y password spraying")
+    g_escaneo = ap.add_argument_group("Escaneo (nmap, puertos, red, pivoting)")
+    g_creds = ap.add_argument_group("Credenciales (Fase 5d)")
+    g_spider = ap.add_argument_group("SMB spidering de contenido")
+    g_tools = ap.add_argument_group("Herramientas y preflight")
+    g_lentas = ap.add_argument_group("Fases opcionales lentas/ruidosas (opt-in u opt-out)")
+    g_informe = ap.add_argument_group("Informe y pruebas internas")
+
+    g_objetivo.add_argument("target", nargs="?",
                     help="Objetivo(s): IP, CIDR (10.10.10.0/24), rango (10.10.10.1-20), "
                          "hostname, o varios separados por coma/espacio.")
-    ap.add_argument("--targets", metavar="FICHERO",
+    g_objetivo.add_argument("--targets", metavar="FICHERO",
                     help="Fichero con objetivos (uno por línea; admite IP/CIDR/rango/hostname, '#' comenta).")
-    ap.add_argument("-o", "--outdir", default=str(default_outdir_home() / "htb"),
+    g_objetivo.add_argument("-o", "--outdir", default=str(default_outdir_home() / "htb"),
                     help="Carpeta base de resultados (def. ~/htb del usuario real, no /root bajo sudo).")
-    ap.add_argument("-w", "--wordlist", nargs="+", metavar="WL",
+    g_fuzzing.add_argument("-w", "--wordlist", nargs="+", metavar="WL",
                     help="Una o varias wordlists para ffuf (gana al --profile).")
-    ap.add_argument("--profile", choices=WORDLIST_PROFILES, default="medium",
+    g_fuzzing.add_argument("--profile", choices=WORDLIST_PROFILES, default="medium",
                     help="Tamaño de la wordlist de fuzzing web: quick (rápida), medium (equilibrada, def.), "
                          "big (exhaustiva). La gana -w/--wordlist si la pasas.")
-    ap.add_argument("--no-big-wordlist", action="store_true",
+    g_fuzzing.add_argument("--no-big-wordlist", action="store_true",
                     help="No añadas dirb/big.txt (~20k líneas) a la(s) wordlist(s) elegida(s) — por defecto "
                          "se suma siempre sea cual sea --profile/-w. Para objetivos reales (no labs) donde "
                          "cada puerto extra multiplica el tiempo y la wordlist pequeña ya basta de primeras.")
-    ap.add_argument("--ext", help="Fuerza extensiones; si no, se deducen del servicio.")
-    ap.add_argument("--vhost", metavar="DOMINIO",
+    g_fuzzing.add_argument("--ext", help="Fuerza extensiones; si no, se deducen del servicio.")
+    g_dominio.add_argument("--vhost", metavar="DOMINIO",
                     help="Fuerza vhost fuzzing + AXFR DNS (si no, se autodescubre el dominio). "
                          "Alias: -D/--domain (mismo campo).")
-    ap.add_argument("-D", "--domain", metavar="DOMINIO", dest="domain", default=None,
+    g_dominio.add_argument("-D", "--domain", metavar="DOMINIO", dest="domain", default=None,
                     help="Alias de --vhost pensado para boxes de solo-DNS/AD: fija el dominio para el "
                          "AXFR del apex + brute de subzonas, WHOIS y crt.sh (y el vhost fuzzing si hay web). "
                          "Úsalo cuando el enunciado te da el dominio (p. ej. inlanefreight.htb) y no hay "
                          "web/cert que lo filtre. Si pones --vhost y -D/--domain a la vez, deben coincidir "
                          "(si no, error: son el mismo campo).")
-    ap.add_argument("--vhost-wordlist", metavar="FICHERO",
+    g_dominio.add_argument("--vhost-wordlist", metavar="FICHERO",
                     help="Wordlist de subdominios para el vhost fuzzing (def.: la de subdominios de seclists).")
-    ap.add_argument("--vhost-names", metavar="LISTA",
+    g_dominio.add_argument("--vhost-names", metavar="LISTA",
                     help="Nombres de vhost YA CONOCIDOS, separados por coma (p. ej. "
                          "'app.inlanefreight.local,dev.inlanefreight.local' — el enunciado del lab te los da). "
                          "Se saltan el fuzzing por diccionario de la Fase 7 (también el de --vhost, si lo pasas "
                          "a la vez — --vhost solo queda para el AXFR/WHOIS) y van derechos a confirmarse/"
                          "fingerprintearse (whatweb con el Host: correcto, cada vhost puede servir contenido "
                          "distinto — versión de Apache, CMS, SO).")
-    ap.add_argument("--snmp-wordlist", metavar="FICHERO",
+    g_enumad.add_argument("--snmp-wordlist", metavar="FICHERO",
                     help="Wordlist de community strings para el brute SNMP con onesixtyone (def.: la de "
                          "seclists). Si 'public' no responde, palantir prueba esta lista y, con la community "
                          "que encuentre, hace el walk a los OIDs jugosos automáticamente.")
-    ap.add_argument("--userenum-wordlist", metavar="FICHERO",
+    g_enumad.add_argument("--userenum-wordlist", metavar="FICHERO",
                     help="Wordlist de usuarios para el kerbrute userenum de la Fase 5 (enum de usuarios AD "
                          "por Kerberos pre-auth; NO bloquea cuentas). Sin esto, en un DC con dominio conocido "
                          "palantir usa una lista PEQUEÑA de seclists automáticamente (segundos); pásale una "
                          "grande (p. ej. xato-10M) si quieres barrer a fondo (tardará).")
-    ap.add_argument("--no-userenum", action="store_true",
+    g_enumad.add_argument("--no-userenum", action="store_true",
                     help="No ejecutar el kerbrute userenum automático de la Fase 5 (solo lo deja como sugerencia).")
-    ap.add_argument("--spray", metavar="PASS",
+    g_enumad.add_argument("--spray", metavar="PASS",
                     help="Password spraying AUTOMÁTICO contra los usuarios AD que palantir descubra EN VIVO "
                          "(kerbrute userenum + enum SMB/LDAP → ad_users.txt): rocía ESTA contraseña contra "
                          "todos ellos con 'kerbrute passwordspray --safe'. NO hace falta -u: los usuarios los "
@@ -17594,16 +17646,16 @@ def main():
                          "Primavera2025'). OJO: una pre-auth fallida SÍ cuenta como login fallido y PUEDE "
                          "bloquear cuentas — --safe aborta en cuanto detecta un bloqueo, y palantir avisa antes; "
                          "aun así es un paso ACTIVO (solo contra un DC con dominio resuelto).")
-    ap.add_argument("--top", action="store_true", help="Solo top-1000 puertos (más rápido).")
-    ap.add_argument("--port", metavar="PUERTOS",
+    g_escaneo.add_argument("--top", action="store_true", help="Solo top-1000 puertos (más rápido).")
+    g_escaneo.add_argument("--port", metavar="PUERTOS",
                     help="Restringe TODO el escaneo a estos puertos (coma: 80,443,38490) en vez de "
                          "barrer -p-/--top-ports — útil cuando ya sabes el puerto (p. ej. labs de HTB "
                          "Academy con un puerto aleatorio dado para Virtual Hosts). Ignora --top. "
                          "Sin alias corto a propósito: -p ya es de --pass, confundirlos bajo presión "
                          "de examen cambia 'qué puertos escaneo' por 'con qué contraseña pruebo'.")
-    ap.add_argument("--min-rate", type=int, default=5000,
+    g_escaneo.add_argument("--min-rate", type=int, default=5000,
                     help="Paquetes/segundo mínimos de nmap. Más alto = más rápido y más ruidoso (def. 5000).")
-    ap.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+    g_escaneo.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
                     help="Objetivos a escanear EN PARALELO (def. 1 = secuencial). Útil para "
                          "barrer un /24 o una lista grande sin esperar host a host. Cada objetivo "
                          "corre en su hilo, escribe su propio report.html/commands.log y sus líneas "
@@ -17614,35 +17666,35 @@ def main():
                          "Al terminar se actualiza además <outdir>/index.html con el link a cada "
                          "report.html que haya en <outdir> (acumulativo entre sesiones, no solo los "
                          "de este run).")
-    ap.add_argument("--no-sweep", dest="sweep", action="store_false",
+    g_escaneo.add_argument("--no-sweep", dest="sweep", action="store_false",
                     help="No hacer el ping-sweep previo (nmap -sn) en CIDR/rangos: escanea TODAS las IPs "
                          "del rango aunque no respondan. Úsalo si los hosts bloquean ICMP y el sweep "
                          "te deja fuera objetivos vivos. Por defecto el sweep está ON y poda los muertos "
                          "(salvo con --tunnel, donde se desactiva solo: ICMP no atraviesa un pivot/SOCKS).")
     ap.set_defaults(sweep=True)
-    ap.add_argument("--aggressive", dest="aggressive", action="store_true",
+    g_escaneo.add_argument("--aggressive", dest="aggressive", action="store_true",
                     help="(ON por defecto) 2º nmap con scripts vuln + footprint profundo (enum4linux-ng, onesixtyone).")
-    ap.add_argument("--no-aggressive", dest="aggressive", action="store_false",
+    g_escaneo.add_argument("--no-aggressive", dest="aggressive", action="store_false",
                     help="Desactiva los scripts vuln y el footprint profundo (más rápido/silencioso).")
-    ap.add_argument("--udp", dest="udp", action="store_true",
+    g_escaneo.add_argument("--udp", dest="udp", action="store_true",
                     help="(ON por defecto si root) barrido UDP de los puertos clave (SNMP, IPMI…).")
-    ap.add_argument("--no-udp", dest="udp", action="store_false", help="Desactiva el barrido UDP.")
+    g_escaneo.add_argument("--no-udp", dest="udp", action="store_false", help="Desactiva el barrido UDP.")
     ap.set_defaults(aggressive=True, udp=True)
-    ap.add_argument("--stealth", action="store_true",
+    g_escaneo.add_argument("--stealth", action="store_true",
                     help="nmap -T2 -f + ffuf con menos hilos/delay/UA normal. Mucho más lento.")
-    ap.add_argument("--proxy", metavar="URL",
+    g_escaneo.add_argument("--proxy", metavar="URL",
                     help="Proxy para ffuf, p. ej. http://127.0.0.1:8080 (Burp) o socks5://host:puerto.")
-    ap.add_argument("--source-port", type=int, metavar="PUERTO",
+    g_escaneo.add_argument("--source-port", type=int, metavar="PUERTO",
                     help="Puerto de origen para nmap y el banner grabbing (evasión: firewalls que "
                          "confían en un puerto como 53/DNS). Puertos <1024 requieren root.")
-    ap.add_argument("--tcp-connect", "--connect", dest="connect", action="store_true",
+    g_escaneo.add_argument("--tcp-connect", "--connect", dest="connect", action="store_true",
                     help="Fuerza connect scan (nmap -sT) aunque haya root, en vez del SYN scan "
                          "(-sS) por defecto. Útil en WSL2 mirrored + VPN de HTB, donde los SYN raw "
                          "se pierden en el túnel y nmap ve 'host up' con 0 puertos (falso negativo). "
                          "Sin esto, palantir ya reintenta solo con -sT si el SYN no encuentra nada. "
                          "Ideal en ~/.palantirrc si tu setup lo necesita siempre. (--connect sigue "
                          "funcionando como alias, por compatibilidad.)")
-    ap.add_argument("--tunnel", "--pivoting", "--pivot", dest="tunnel", action="store_true",
+    g_escaneo.add_argument("--tunnel", "--pivoting", "--pivot", dest="tunnel", action="store_true",
                     help="Escaneo apto para PIVOTING / túnel (ligolo-ng, chisel, SOCKS, Meterpreter, "
                          "WSL2+VPN…). Fuerza connect scan (-sT) y cambia el timing de nmap a uno que NO "
                          "inunde el túnel: QUITA --min-rate (su ritmo fijo satura la pila TCP userland "
@@ -17653,120 +17705,121 @@ def main():
                          "RPC dinámicos altos de un DC); con --top haces solo el top-1000 (rápido). Mucho "
                          "más rápido que --stealth y sin perder el WinRM 5985 que desaparecía por un "
                          "ligolo-ng. UDP por túnel poco fiable. Ideal en ~/.palantirrc si siempre pivotas.")
-    ap.add_argument("--resume", action="store_true",
+    g_escaneo.add_argument("--resume", action="store_true",
                     help="Reutiliza los XML de nmap ya existentes (no re-escanea) Y, si los puertos/"
                          "servicios no cambiaron, el footprint/searchsploit/credenciales por defecto "
                          "del findings.json anterior (no los repite): solo relanza fuzzing/informes y, "
                          "sobre todo, las credenciales APORTADAS nuevas (-u/-p/-H/-U/-P), que nunca se "
                          "saltan. Útil para iterar rápido, p. ej. probar una credencial recién encontrada.")
-    ap.add_argument("--no-scripts", action="store_true",
+    g_escaneo.add_argument("--no-scripts", action="store_true",
                     help="No lanzar los scripts NSE de enumeración en la Fase 2 (solo -sV, más rápido/silencioso).")
-    ap.add_argument("--no-banner", action="store_true",
+    g_escaneo.add_argument("--no-banner", action="store_true",
                     help="Salta la Fase 4 (banner grabbing manual por socket de los puertos que nmap dejó como 'unknown').")
-    ap.add_argument("--no-footprint", action="store_true", help="Salta la Fase 5 (footprinting por protocolo).")
-    ap.add_argument("--no-searchsploit", action="store_true", help="Salta la Fase 5b (búsqueda de exploits con searchsploit).")
-    ap.add_argument("--default-creds", "--creds", dest="default_creds", action="store_true",
+    g_escaneo.add_argument("--no-footprint", action="store_true", help="Salta la Fase 5 (footprinting por protocolo).")
+    g_escaneo.add_argument("--no-searchsploit", action="store_true", help="Salta la Fase 5b (búsqueda de exploits con searchsploit).")
+    g_creds.add_argument("--default-creds", "--creds", dest="default_creds", action="store_true",
                     help="Modo enfocado: SOLO prueba credenciales por defecto (verificadas) de cada servicio; "
                          "omite footprint, searchsploit, fuzzing Y los scripts vuln de --aggressive "
                          "(equivale a sumarle --no-aggressive). Incompatible con --no-creds.")
-    ap.add_argument("--no-creds", action="store_true", help="No probar credenciales por defecto (salta la Fase 5c).")
-    ap.add_argument("--user", "-u", metavar="USER",
+    g_creds.add_argument("--no-creds", action="store_true", help="No probar credenciales por defecto (salta la Fase 5c).")
+    g_creds.add_argument("--user", "-u", metavar="USER",
                     help="Fase 5d: usuario a reutilizar contra TODOS los servicios detectados con nxc "
                          "(reutilización de credenciales). Se combina con --pass (o con --pass-list/-P).")
-    ap.add_argument("--pass", "-p", dest="password", metavar="PASS",
+    g_creds.add_argument("--pass", "-p", dest="password", metavar="PASS",
                     help="Fase 5d: contraseña para --user (si se omite, se prueba vacía). OJO: queda en el "
-                         "historial del shell y en 'ps'; en el informe va enmascarada.")
-    ap.add_argument("--hash", "-H", dest="hash", metavar="NTLM",
+                         "historial del shell y en 'ps'; en el informe sale en claro salvo --hide-secrets.")
+    g_creds.add_argument("--hash", "-H", dest="hash", metavar="NTLM",
                     help="Fase 5d: hash NTLM para PASS-THE-HASH en vez de contraseña (nxc -H). Formato "
                          "'NTHASH' o 'LMHASH:NTHASH'. Se usa con --user/-u (o --user-list/-U) y se prueba "
                          "contra cada servicio NTLM detectado (SMB/WinRM/RDP/WMI/MSSQL/LDAP) — con "
                          "--local-auth si la cuenta es local. Una credencial válida enumera el dominio igual "
                          "que --pass (shares/usuarios/grupos/roasting). Incompatible con --pass/--pass-list/"
                          "--creds-file.")
-    ap.add_argument("--user-list", "-U", metavar="FICHERO",
+    g_creds.add_argument("--user-list", "-U", metavar="FICHERO",
                     help="Fase 5d: fichero con un usuario por línea ('#' comenta). Sin --pass-list/-P, cada "
                          "usuario se prueba con --pass (o vacía si tampoco la das). CON --pass-list/-P a la "
                          "vez se CRUZAN las dos listas (todas las combinaciones usuario×contraseña) — eso ya "
                          "es password spraying de verdad, no el 1-intento-por-cuenta del resto de la Fase 5d; "
                          "con listas grandes palantir comprueba la política de bloqueo si puede y pide "
                          "confirmar. Ver --no-bruteforce para emparejar en vez de cruzar.")
-    ap.add_argument("--pass-list", "-P", metavar="FICHERO",
+    g_creds.add_argument("--pass-list", "-P", metavar="FICHERO",
                     help="Fase 5d: fichero con una contraseña por línea ('#' comenta). Sin --user-list/-U, se "
                          "prueban contra --user (hace falta un usuario, suelto o en lista). Ver --user-list "
                          "para el cruce de las dos listas y el aviso de spraying.")
-    ap.add_argument("--no-bruteforce", action="store_true",
+    g_creds.add_argument("--no-bruteforce", action="store_true",
                     help="Con --user-list/-U Y --pass-list/-P a la vez (las dos, de fichero): empareja línea "
                          "a línea (usuario[i] con contraseña[i]) en vez de cruzar TODAS las combinaciones — "
                          "N pares en vez de N×M, mucho menos ruido/riesgo de bloqueo. Pensado para "
                          "'contraseña = usuario': -U lista.txt -P lista.txt --no-bruteforce (el MISMO "
                          "fichero en los dos) prueba cada usuario con su propio nombre como contraseña. "
                          "Sin efecto si falta una de las dos listas.")
-    ap.add_argument("--creds-file", metavar="FICHERO",
+    g_creds.add_argument("--creds-file", metavar="FICHERO",
                     help="Fase 5d: fichero 'usuario:contraseña' (una por línea, '#' comenta) para probar "
                          "contra cada servicio detectado — p. ej. las credenciales que vayas recopilando por "
                          "el camino. Combínalo con --resume para reutilizar un escaneo ya hecho sin re-escanear. "
                          "Pares explícitos: a diferencia de --user-list/--pass-list, NO se cruza nada.")
-    ap.add_argument("--local-auth", action="store_true",
+    g_creds.add_argument("--local-auth", action="store_true",
                     help="Fase 5d: añade --local-auth a nxc (SMB/WinRM/RDP/WMI/MSSQL/LDAP) — hace falta cuando "
                          "el objetivo SÍ está unido a un dominio pero la credencial que pruebas es una cuenta "
                          "LOCAL de esa máquina (sin esto, nxc la valida contra el dominio y falla aunque sea "
                          "válida en local). En un Windows SUELTO (sin dominio) no hace falta: sin dominio, nxc "
                          "ya valida contra la SAM local por defecto. También se aplica al volcado automático "
                          "de SAM/LSA que dispara un (Pwn3d!) por SMB.")
-    ap.add_argument("--spider", action="store_true",
+    g_spider.add_argument("--spider", action="store_true",
                     help="SMB: spidering de CONTENIDO de los shares legibles con nxc (--spider SHARE "
                          "--content): busca secretos DENTRO de los ficheros, no solo por el nombre. Usa la "
                          "credencial aportada (-u/-p/-H) si la das, o la sesión anónima que haya entrado. "
                          "Lento en shares grandes — opt-in. Ver --pattern para afinar la búsqueda.")
-    ap.add_argument("--pattern", metavar="PATRON",
+    g_spider.add_argument("--pattern", metavar="PATRON",
                     help="Patrón(es) para --spider (nxc --pattern), separados por coma. Si no lo das, "
                          "--spider busca un regex de secretos por defecto (passw/secret/cred/claves). "
                          "Dar --pattern implica --spider.")
-    ap.add_argument("--show-password", "--show-secrets", dest="show_password", action="store_true",
-                    help="Muestra la contraseña/hash REAL que aportaste en las vistas previas de comando "
-                         "del informe (para copiar-pegar), en vez de enmascararla con '***'. Por defecto "
-                         "se enmascara: el informe (terminal + HTML/MD/JSON) se comparte y no debe llevar "
-                         "tus credenciales en claro de serie. (Las credenciales VÁLIDAS descubiertas y los "
-                         "quick-wins ya salen en claro de todos modos: son botín, no tu input.)")
-    ap.add_argument("--install-missing", action="store_true",
+    g_creds.add_argument("--hide-secrets", "--hide-passwords", dest="hide_secrets", action="store_true",
+                    help="Enmascara con '***' la contraseña/hash REAL que aportaste en las vistas previas "
+                         "de comando del informe. Por defecto se MUESTRA en claro (para copiar-pegar "
+                         "directo); usa este flag si el informe (terminal + HTML/MD/JSON) se va a "
+                         "compartir y no debe llevar tus credenciales de entrada. (Las credenciales "
+                         "VÁLIDAS descubiertas y los quick-wins siguen saliendo en claro de todos modos: "
+                         "son botín, no tu input.)")
+    g_tools.add_argument("--install-missing", action="store_true",
                     help="Instala las herramientas/wordlists que falten (sin preguntar): con apt las que "
                          "están en los repos, y con pip/pipx/npm o descargando un binario/fichero de "
                          "GitHub las que no (jsmith.txt, kerbrute, certipy, creds, adidnsdump, mongosh, "
                          "crt.sh — ver preflight()/_FETCHABLE_RESOURCES; siempre avisa primero qué va a "
                          "bajar y de dónde). SIN objetivo, actúa de instalador: comprueba TODO, instala y sale.")
-    ap.add_argument("--check-tools", action="store_true",
+    g_tools.add_argument("--check-tools", action="store_true",
                     help="Solo lista qué herramientas faltan y cómo instalarlas (no instala, no escanea) y sale.")
-    ap.add_argument("--no-preflight", action="store_true",
+    g_tools.add_argument("--no-preflight", action="store_true",
                     help="No comprobar al arrancar las herramientas que falten (continúa directamente).")
-    ap.add_argument("--add-hosts", action="store_true",
+    g_tools.add_argument("--add-hosts", action="store_true",
                     help="Añade los dominios/hostnames descubiertos a /etc/hosts sin preguntar (requiere root).")
-    ap.add_argument("--no-add-hosts", action="store_true",
+    g_tools.add_argument("--no-add-hosts", action="store_true",
                     help="No ofrecer añadir dominios a /etc/hosts.")
-    ap.add_argument("--no-fuzz", action="store_true",
+    g_lentas.add_argument("--no-fuzz", action="store_true",
                     help="Salta las Fases 5 y 6 (fuzzing de directorios y de vhosts con ffuf).")
-    ap.add_argument("--no-vhost-fuzz", action="store_true",
+    g_lentas.add_argument("--no-vhost-fuzz", action="store_true",
                     help="Salta SOLO la Fase 7 (vhost fuzzing por diccionario); mantiene la Fase 6 (fuzzing de "
                          "directorios). Para scopes de bug bounty donde los hostnames están tasados y el resto "
                          "de subdominios (p. ej. '*.dominio.com') está fuera de scope explícitamente.")
-    ap.add_argument("--nikto", action="store_true",
+    g_lentas.add_argument("--nikto", action="store_true",
                     help="Lanza nikto DE VERDAD contra cada servicio web (Fase 5), no solo lo sugiere. "
                          "OFF por defecto: es un escaneo completo de vulnerabilidades/config conocidas, "
                          "lento (varios minutos por servicio web) y ruidoso — opt-in a propósito.")
-    ap.add_argument("--cms-scan", action="store_true",
+    g_lentas.add_argument("--cms-scan", action="store_true",
                     help="Si whatweb detecta WordPress/Joomla, lanza el escáner dedicado (wpscan/joomscan: "
                          "plugins, temas, usuarios, vulnerabilidades conocidas). OFF por defecto: lento "
                          "(varios minutos) y más ruidoso que el fingerprint normal — opt-in a propósito.")
-    ap.add_argument("--crawl", action="store_true",
+    g_lentas.add_argument("--crawl", action="store_true",
                     help="Crawling real con katana contra cada servicio web: sigue enlaces/JS/formularios "
                          "DE VERDAD (no adivina rutas como el diccionario de ffuf). Acotado (profundidad 2, "
                          "máx. 60 páginas) para no dispararse. OFF por defecto — opt-in.")
-    ap.add_argument("--nuclei", action="store_true",
+    g_lentas.add_argument("--nuclei", action="store_true",
                     help="Lanza nuclei (ProjectDiscovery) contra cada servicio web: plantillas de la "
                          "comunidad para CVEs conocidos, exposiciones y malas configuraciones. Filtra la "
                          "salida a severidad low+ (descarta el ruido 'info' de detección de tecnología). "
                          "OFF por defecto: escaneo completo de plantillas, lento y ruidoso — opt-in.")
-    ap.add_argument("--no-html", action="store_true", help="No generar report.html / findings.json.")
-    ap.add_argument("--selftest", action="store_true",
+    g_informe.add_argument("--no-html", action="store_true", help="No generar report.html / findings.json.")
+    g_informe.add_argument("--selftest", action="store_true",
                     help="Ejecuta las pruebas internas (sin tocar la red) y sale.")
     rc_args = _load_rc_args()
     args = ap.parse_args(rc_args + sys.argv[1:])   # ~/.palantirrc primero → la CLI gana
@@ -17788,7 +17841,7 @@ def main():
 
     global RESUME, SNMP_WORDLIST, NIKTO, CMS_SCAN, CRAWL, CONNECT, NUCLEI, SPIDER, SPIDER_PATTERN, TUNNEL
     global USERENUM_WORDLIST, NO_USERENUM, SPRAY_PASSWORDS, SHOW_SECRETS
-    SHOW_SECRETS = args.show_password
+    SHOW_SECRETS = not args.hide_secrets
     RESUME = args.resume
     NIKTO = args.nikto
     CMS_SCAN = args.cms_scan

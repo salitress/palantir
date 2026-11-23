@@ -10,15 +10,20 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `--show-password` (`--show-secrets`): shows the **real** provided credential/hash in the report's
-  command previews (so they're copy-pasteable) instead of masking it with `***`. Default stays masked
-  — the report (terminal + HTML/MD/JSON) is shareable and shouldn't carry your credentials in clear by
-  default. Valid-credential **findings** and **Quick Wins** already show the discovered credential in
-  clear regardless (it's loot, not your input); this flag only controls the command previews that echo
-  the secret **you** supplied. Routed through four helpers (`_sec_disp`, `_cred_note`, `_url_sec`,
-  `_env_pw_note`) so every site — `nxc -p/-H`, `bloodyAD`, `secretsdump`, `impacket-mssqlclient`,
-  Kerberoast/AS-REP (`GetUserSPNs`/`GetNPUsers`), `dacledit`, `kerbrute passwordspray`, and the
-  `MYSQL_PWD`/`PGPASSWORD`/`REDISCLI_AUTH`/`IPMI_PASSWORD` env-var notes — behaves consistently.
+- The provided credential/hash now shows **in clear** by default in the report's command previews
+  (so they're copy-pasteable straight away) — `--hide-secrets` (`--hide-passwords`) masks it with
+  `***` instead, for when the report (terminal + HTML/MD/JSON) is going to be shared. Valid-credential
+  **findings** and **Quick Wins** always show the discovered credential in clear regardless (it's loot,
+  not your input) — `--hide-secrets` never touches those. Routed through four helpers (`_sec_disp`,
+  `_cred_note`, `_url_sec`, `_env_pw_note`) so every site — `nxc -p/-H`, `bloodyAD`, `secretsdump`,
+  `impacket-mssqlclient`, Kerberoast/AS-REP (`GetUserSPNs`/`GetNPUsers`), `dacledit`,
+  `kerbrute passwordspray`, and the `MYSQL_PWD`/`PGPASSWORD`/`REDISCLI_AUTH`/`IPMI_PASSWORD` env-var
+  notes — behaves consistently.
+
+- `--help` now groups its ~60 flags into labelled sections (target/output, web fuzzing, domain/AD/DNS,
+  user enumeration & spraying, scanning, credentials, SMB spidering, tools/preflight, slow opt-in
+  phases, report/tests) via `argparse` argument groups, instead of one long undifferentiated wall of
+  text.
 
 ### Fixed
 
