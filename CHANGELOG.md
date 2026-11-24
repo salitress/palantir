@@ -6,6 +6,62 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **OSCP-safe nxc modules now wired in across every protocol** (operator-asked: "audita todos los
+  módulos de nxc con todos sus protocolos; implementa los OSCP-safe, los no OSCP-safe implementalos
+  como manuales, y si puedes como el de backup_operator — comprobación no autoexplotable; si
+  cumple el estado, lo recomiendas en paso manual"). Every module added here is READ-ONLY per its
+  real source — no state mutation, no code execution, no coercion. Batched into one nxc call per
+  phase (`nxc ... -M a -M b -M c ...`) to share the SMB/LDAP/MSSQL connection and keep the
+  per-host cost sane. A small `_nxc_split_by_module` helper carves the batched output into per-
+  module sub-outputs using the module-name column (truncated to 11 chars + `...` for longer
+  names, exactly like `nxc/logger.py` does), so each module keeps its own parser.
+  - **SMB post-admin (two batches after the existing --sam/--lsa/-M lsassy/-M iis chain)**:
+    - Credential looters: `gpp_autologin`, `reg-winlogon`, `eventlog_creds`, `powershell_history`,
+      `veeam`, `mremoteng`, `rdcman`, `winscp`, `putty`, `keepass_discover` — every new credential
+      found goes into the reuse pool (same chain as --sam/--lsa/lsassy/iis).
+    - Postura detection: `runasppl`, `bitlocker`, `uac`, `install_elevated`, `ntlmv1`, `spooler`,
+      `printnightmare`, `remove-mic`, `enum_cve`, `enum_av`, `msol`.
+  - **LDAP creds-branch (batched `_creds_enum` add after get-desc-users, only on DC)**:
+    `dump-computers`, `get-info-users`, `get-userPassword`, `get-unixUserPassword`, `subnets`,
+    `gpp_privileges`.
+  - **SMB anon (batched, no creds)**: `enum_ca` (RPC anónimo → CAs ADCS, incl. ESC8 web
+    enrollment), `ioxidresolver` (interfaces adicionales del host multi-homed).
+  - **MSSQL post-auth (batched after sa/null login succeeds)**: `enum_logins`, `enum_links`,
+    `enum_impersonate`, `mssql_cbt`.
+
+- **Detections now propose non-OSCP-safe modules only when a precondition is actually met**
+  (same pattern as `backup_operator`: palantir detects via read-only means, then — only on a
+  confirmed state — proposes the active module as a MANUAL step bound to the finding with
+  `_attach_cmd`, never auto-run):
+  - `runasppl` = enabled → `-M nanodump` / `-M handlekatz` / `-M procdump` suggested as lsassy
+    fallbacks (they drop a binary; palantir won't).
+  - `keepass_discover` reports KeePass running → `-M keepass_trigger` suggested (writes a
+    malicious trigger into KeePass's config — active state change, never auto-run).
+  - `install_elevated` = Enabled (both HKLM+HKCU) → `msfvenom … .msi + msiexec /quiet /i` steps
+    suggested for the local privesc.
+  - `spooler` = enabled → `coercer` / `-M coerce_plus LISTENER=…` suggested as NTLM coercion
+    vectors; severity is `media` when SMB signing is also disabled (ready-to-use relay), else
+    `info`.
+  - `printnightmare` vulnerable → `ly4k/PrintNightmare` suggested.
+  - MSSQL `enum_impersonate` hits → `-M mssql_priv -o IMPERSONATE=…` suggested (the module
+    activates xp_cmdshell and runs commands — never auto-run); `enum_links` hits → manual
+    `EXECUTE AT [link]` recipe.
+  - MSSQL `mssql_cbt` reports CBT not active → NTLM-relay-to-MSSQL surface flagged.
+
+### OSCP-safe audit (already correct)
+
+- Verified every previously integrated nxc module is detection/read-only per its real source
+  (nxc/modules/*): `ms17-010`, `smbghost`, `webdav`, `zerologon` (2000 Netlogon auth attempts
+  with zero challenge, no password reset — the actual exploit lives in dirkjanm/CVE-2020-1472,
+  already surfaced as MANUAL), `nopac` (TGT-size comparison, no DA impersonation — the actual
+  exploit is Ridter/noPac, surfaced as MANUAL), `lsassy` (post-admin LSASS dump within OSCP
+  methodology), `iis`, `gpp_password`, `daclread`, `laps`, `maq`, `obsolete`, `get-desc-users`.
+  No existing integration needed to be moved to a manual-only path.
+
 ## [2.0.7] - 2026-11-24
 
 ### Added
