@@ -10,6 +10,19 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Kerberos userenum escalates to a second wordlist when jsmith.txt finds nobody**
+  (operator-asked, live run against a real DC: "si con jsmith.txt no encuentra users, probar con
+  otra wordlist del mismo repo"): the automatic `kerbrute userenum` pass only ever tried
+  jsmith.txt, and on a 0-user result just stopped — no fallback. Now, when the automatic
+  (non-`--userenum-wordlist`) jsmith.txt pass finds zero users and isn't a timeout/partial run, it
+  retries once with `awesome-mix-vol1.txt` (same repo, insidetrust/statistically-likely-usernames
+  — its own README recommends this exact list first when the real username format is unknown, since
+  it interleaves several formats instead of betting on one). If it isn't installed yet, it's added
+  to `--install-missing`/`_FETCHABLE_RESOURCES` (same system-path/sudo-install pattern as
+  jsmith.txt, now shared via `_install_system_wordlist`) and left as a manual next-step suggestion
+  with the real raw-githubusercontent URL, same as jsmith.txt's own bootstrap message. An operator
+  who brought their own `--userenum-wordlist` is never escalated — that's already their call.
+
 - **RDP CredSSP false-negative from nxc's aardwolf flagged, not silently dropped**
   (operator-reported, confirmed against a real Windows Server 2016 lab with `xfreerdp`): nxc
   doesn't use FreeRDP for RDP — it uses aardwolf, its own pure-Python RDP/CredSSP
@@ -54,6 +67,22 @@ this project follows [Semantic Versioning](https://semver.org/).
   RSAT note.
 
 ### Fixed
+
+- **SMBGhost quick win showed an unrelated command, and never said what to do once confirmed
+  vulnerable** (operator-reported, live run with a real confirmed-vulnerable DC): the finding's
+  own CVE (CVE-2020-0796) never appeared in its one next-step's text (the repo is just named
+  "SMBGhost"), so Quick Wins' CVE-matching (`_cmds_for`) failed to recognize it as the targeted
+  command and fell back to "first N of the footprint" — which happened to include an unrelated
+  `nxc smb ... --rid-brute` suggestion from a completely different finding in the same
+  footprint-dict. Now uses `_attach_cmd` (the same explicit-binding mechanism Zerologon/ACL
+  findings already use) so Quick Wins can never attach the wrong command here. Separately, the
+  next-step's own text was wrong: it claimed `ly4k/SMBGhost` also ships an LPE PoC (`checker.py`)
+  and "RCE notes" — checked the real repo, it's *only* the scanner, nothing else, which is exactly
+  why the report never said what to do after confirming "vulnerable". Added the two real PoCs
+  (verified by reading each repo, not guessed): `chompie1337/SMBGhost_RCE_Poc` for unauthenticated
+  RCE (the author's own README warns it's a demo PoC that "sometimes BSODs", not reliable) and
+  `danigargu/CVE-2020-0796` for local LPE to SYSTEM (a Visual Studio project — needs code
+  execution on the Windows host already, it's not a remote script).
 
 - **`--resume` always re-ran ffuf in full** (operator-reported): directory/vhost fuzzing (up to
   600s per wordlist) was the one thing in the entire `--resume` path that never reused anything —

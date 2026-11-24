@@ -2320,6 +2320,18 @@ _SMALL_USERLISTS = (
     "/usr/share/seclists/Usernames/top-usernames-shortlist.txt",
     "/usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt",
 )
+# awesome-mix-vol1.txt: del MISMO repo que jsmith.txt (insidetrust/statistically-likely-
+# usernames) — según su propio README es la lista recomendada cuando el formato real de
+# usuario es desconocido: mezcla varios formatos (john.smith, jsmith, jjs + cuentas de
+# servicio/test) en ~25 800 líneas, en vez de apostar por un único formato como jsmith.txt.
+# Se usa como ESCALADO automático de kerbrute userenum (operator-asked, "si con jsmith.txt
+# no encuentra users, probar con otra wordlist del mismo repo") SOLO cuando jsmith.txt no dio
+# NINGÚN usuario válido — ver _kerbrute_userenum. Mismo mecanismo de instalación que
+# jsmith.txt (_install_awesome_mix1 / _FETCHABLE_RESOURCES / --install-missing).
+_AWESOME_MIX_USERLISTS = (
+    "/usr/share/wordlists/statistically-likely-usernames/awesome-mix-vol1.txt",
+    "/usr/share/seclists/Usernames/statistically-likely-usernames/awesome-mix-vol1.txt",
+)
 
 
 def _userenum_wordlist(arg=None):
@@ -2329,7 +2341,9 @@ def _userenum_wordlist(arg=None):
     _JSMITH_USERLISTS; ~48 000 líneas, unos minutos contra Kerberos, no segundos pero lejísimos
     de las horas de una xato-10M) y, si el operador no la instaló, cae a la shortlist genérica
     de seclists (administrator/guest/…). None si no hay ninguna → se deja como sugerencia
-    manual. Ver _kerbrute_timeout: el cap de tiempo depende de CUÁL de las dos se use."""
+    manual. Ver _kerbrute_timeout: el cap de tiempo depende de CUÁL de las dos se use. El
+    escalado a awesome-mix-vol1.txt cuando jsmith.txt no da nada NO pasa por aquí — ver
+    _awesome_mix_wordlist / _kerbrute_userenum."""
     if arg:
         return arg if Path(arg).is_file() else None
     for c in _JSMITH_USERLISTS + _SMALL_USERLISTS:
@@ -2338,17 +2352,32 @@ def _userenum_wordlist(arg=None):
     return None
 
 
+def _awesome_mix_wordlist():
+    """awesome-mix-vol1.txt si está instalada (ver _AWESOME_MIX_USERLISTS), si no None — la
+    misma lógica de instalación opcional que _userenum_wordlist pero SOLO se consulta como
+    escalado (nunca como primera opción automática: jsmith.txt sigue siendo el formato más
+    común, ver el propio README del repo)."""
+    for c in _AWESOME_MIX_USERLISTS:
+        if Path(c).is_file():
+            return c
+    return None
+
+
 def _kerbrute_timeout(wl):
     """Cap de tiempo para `kerbrute userenum` según la lista que de verdad se vaya a usar, no
     solo "¿el operador pasó --userenum-wordlist?": 10 min para la shortlist genérica
-    automática (sobra, es minúscula); 30 min para jsmith.txt automática (~48 000 líneas: unos
-    minutos en un DC normal, pero este margen aguanta un DC lento o con latencia de VPN sin
-    cortarla en seco); 2 h si el operador trajo su propia lista con --userenum-wordlist (puede
-    ser una xato-10M de verdad — ahí sí puede tardar horas). Puro → testeable sin red."""
+    automática (sobra, es minúscula); 15 min para awesome-mix-vol1.txt (~25 800 líneas,
+    proporcional al margen de jsmith.txt para algo más o menos la mitad de líneas); 30 min
+    para jsmith.txt automática (~48 000 líneas: unos minutos en un DC normal, pero este margen
+    aguanta un DC lento o con latencia de VPN sin cortarla en seco); 2 h si el operador trajo
+    su propia lista con --userenum-wordlist (puede ser una xato-10M de verdad — ahí sí puede
+    tardar horas). Puro → testeable sin red."""
     if USERENUM_WORDLIST:
         return 7200
     if wl in _JSMITH_USERLISTS:
         return 1800
+    if wl in _AWESOME_MIX_USERLISTS:
+        return 900
     return 600
 
 
@@ -3230,14 +3259,37 @@ def fp_smb(ip, ports, services, host, deep, base=None):
         _step(res, f"{nxc} smb {ip} -u '' -p '' -M smbghost", vulngh, outgh,
               note="CVE-2020-0796 (SMBGhost): ¿dialecto SMB 3.1.1 con compresión activada? Comprobación de solo lectura, SIN credenciales")
         if vulngh:
-            res["findings"].append(("critica",
+            _ghost_txt = (
                 "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — POTENCIALMENTE VULNERABLE "
                 "(dialecto 3.1.1 + compresión activada, comprobado sin credenciales): RCE sin autenticar "
-                "(wormable) o LPE local"))
-            res["next"].append(
-                "git clone https://github.com/ly4k/SMBGhost && python3 SMBGhost/scanner.py "
-                f"{ip}   # confirma antes de explotar — el repo también trae un PoC de LPE local "
-                "(checker.py) y notas del RCE (más inestable); paso MANUAL")
+                "(wormable) o LPE local")
+            res["findings"].append(("critica", _ghost_txt))
+            # Bug real reportado (operador): el quick win de este hallazgo enseñaba un 'nxc smb
+            # --users --groups --pass-pol --rid-brute' sin relación, porque el CVE del hallazgo
+            # (CVE-2020-0796) no aparecía en el texto del propio next-step de abajo — el
+            # emparejado por CVE de _cmds_for fallaba y caía al heurístico genérico de "primeros N
+            # del footprint", que mezclaba next-steps de OTROS hallazgos (ver _cmds_for). Con
+            # _attach_cmd, quick_wins usa SIEMPRE estos comandos, nunca el heurístico.
+            # Segundo bug real corregido aquí: ly4k/SMBGhost (confirmado leyendo su repo real) es
+            # SOLO el scanner (scanner.py + un .pcap de ejemplo) — NO trae 'checker.py' ni ningún
+            # PoC de LPE/RCE como afirmaba este texto antes, así que el informe nunca decía qué
+            # hacer DESPUÉS de confirmar "vulnerable" (reportado en vivo: "no dice que hacer
+            # despues si es vulnerable"). Los PoCs reales (confirmados leyendo cada repo, no
+            # adivinados): RCE sin autenticar → chompie1337/SMBGhost_RCE_Poc (el propio autor
+            # avisa en su README: "a veces hace BSOD", pensado solo como demostración, nada
+            # fiable); LPE local (SYSTEM) → danigargu/CVE-2020-0796 (proyecto de Visual Studio:
+            # hace falta YA tener ejecución en el Windows para compilarlo ahí, no es un script
+            # que se lance en remoto desde Linux).
+            _attach_cmd(res, _ghost_txt, [
+                f"git clone https://github.com/ly4k/SMBGhost && python3 SMBGhost/scanner.py {ip}   "
+                "# confirma antes de explotar (repo de SOLO el scanner, sin PoC); paso MANUAL",
+                "git clone https://github.com/chompie1337/SMBGhost_RCE_Poc && cd SMBGhost_RCE_Poc && "
+                f"python3 exploit.py -ip {ip}   # RCE sin autenticar — PoC de demostración del propio "
+                "autor ('a veces hace BSOD', nada fiable): rellena USER_PAYLOAD en exploit.py (máx 600 "
+                "bytes) antes de lanzarlo",
+                "git clone https://github.com/danigargu/CVE-2020-0796   # LPE local a SYSTEM — necesitas YA "
+                "tener ejecución en el Windows: compílalo ahí (proyecto de Visual Studio, cve-2020-0796-local.sln)",
+            ])
 
         rc, outwd = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "webdav"], timeout=30)
         webdav_on = "WebClient Service enabled on" in (outwd or "")
@@ -5310,36 +5362,16 @@ def _merge_write_ad_users(base, users):
     return merged
 
 
-def _kerbrute_userenum(res, ip, domain, base):
-    """Fase 5: enum de usuarios AD por Kerberos con kerbrute, de verdad (no solo sugerido)
-    — es justo el fallback que saca usuarios cuando la superficie anónima (SMB null/LDAP
-    anónimo) está capada, el caso típico de un DC endurecido. SOLO LECTURA y SIN riesgo de
-    bloqueo: `kerbrute userenum` manda un AS-REQ por nombre y mira si el KDC responde
-    'principal desconocido' o 'requiere pre-auth' — NO prueba contraseñas, NO incrementa
-    badPwdCount, NO bloquea cuentas (a diferencia de passwordspray). Necesita el dominio AD
-    (FQDN) y una wordlist; en automático prueba jsmith.txt (nombres de empleado realistas,
-    minutos) si está instalada, si no cae a una shortlist genérica (segundos) — ver
-    _userenum_wordlist. Con --userenum-wordlist se le pasa una grande a conciencia. Los
-    usuarios hallados se vuelcan a <base>/ad_users.txt (listos para AS-REP roast / spray) y los
-    '(sin pre-auth)' se marcan como AS-REP roastables (hash crackeable sin credenciales).
-    Devuelve True si ya encoló la sugerencia de AS-REP roast (hubo usuarios) — el llamante
-    (fp_kerberos) la usa para NO repetirla en su propio bloque de next-steps genérico (antes
-    salía DOS VECES, con distinta coletilla, cuando SÍ había usuarios: visto en vivo)."""
+def _kerbrute_run_pass(res, kb, ip, domain, wl, base):
+    """Un pase de `kerbrute userenum` con la wordlist `wl` YA resuelta: lo ejecuta, parsea
+    usuarios/cuentas sin pre-auth/hashes AS-REP/cobertura, y anota todo en `res` (steps +
+    findings + next + <base>/ad_users.txt). Extraído de _kerbrute_userenum para poder
+    llamarlo una SEGUNDA vez con otra wordlist si la primera no dio ningún usuario (ver
+    ahí) sin duplicar los ~50 líneas de parseo/reporting. Devuelve (usuarios_hallados,
+    pase_parcial) — `partial` también lo necesita el llamante para decidir si escalar (un
+    timeout no es 'esta lista no tenía al usuario', es 'no se llegó a probar la lista
+    entera', así que no tiene sentido escalar a OTRA lista todavía más grande)."""
     import tempfile
-    kb = _kerbrute_bin()
-    if not kb:
-        res["missing"].append("kerbrute")
-        return False
-    if NO_USERENUM:
-        res["next"].append(f"kerbrute userenum -d {domain} --dc {ip} <wordlist>   # (--no-userenum: no lo lancé) enum de usuarios por Kerberos, no bloquea cuentas")
-        return False
-    wl = _userenum_wordlist(USERENUM_WORDLIST)
-    if not wl:
-        res["next"].append(f"kerbrute userenum -d {domain} --dc {ip} jsmith.txt   # enum de usuarios por Kerberos con nombres de empleado realistas: "
-                            "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/jsmith.txt "
-                            "— guárdala en /usr/share/wordlists/statistically-likely-usernames/jsmith.txt y la próxima vez la uso solo, sin --userenum-wordlist")
-        return False
-    info(f"Kerberos: enum de usuarios con kerbrute ({Path(wl).name}) — no bloquea cuentas, puede tardar según la lista")
     kb_timeout = _kerbrute_timeout(wl)   # depende de CUÁL lista se use, no solo de si es --userenum-wordlist (ver _kerbrute_timeout)
     outf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".kerb"); outf.close()
     try:
@@ -5362,7 +5394,7 @@ def _kerbrute_userenum(res, ip, domain, base):
           note="enum de usuarios AD por Kerberos pre-auth (solo lectura, no bloquea cuentas)"
                + (" — CORTADO por timeout: lista PARCIAL" if partial else ""))
     if users:
-        res["findings"].append(("alta", f"Kerberos: {len(users)} usuario(s) AD válidos por kerbrute"
+        res["findings"].append(("alta", f"Kerberos: {len(users)} usuario(s) AD válidos por kerbrute ({Path(wl).name})"
                                 + (f" (→ {base / 'ad_users.txt'})" if base else "") + ": "
                                 + ", ".join(users[:20]) + (" …" if len(users) > 20 else "") + psfx))
         if base:
@@ -5391,8 +5423,66 @@ def _kerbrute_userenum(res, ip, domain, base):
     # que el operador sepa si la lista fue amplia o mínima.
     cov = _parse_kerbrute_coverage(out)
     if cov and not partial:
-        res["findings"].append(("info", f"Kerberos: kerbrute probó {cov[0]} nombre(s) de la lista, {cov[1]} válido(s) "
+        res["findings"].append(("info", f"Kerberos: kerbrute probó {cov[0]} nombre(s) de la lista ({Path(wl).name}), {cov[1]} válido(s) "
                                 f"— si fueron pocos, relanza con --userenum-wordlist (lista más amplia)"))
+    return bool(users), partial
+
+
+def _kerbrute_userenum(res, ip, domain, base):
+    """Fase 5: enum de usuarios AD por Kerberos con kerbrute, de verdad (no solo sugerido)
+    — es justo el fallback que saca usuarios cuando la superficie anónima (SMB null/LDAP
+    anónimo) está capada, el caso típico de un DC endurecido. SOLO LECTURA y SIN riesgo de
+    bloqueo: `kerbrute userenum` manda un AS-REQ por nombre y mira si el KDC responde
+    'principal desconocido' o 'requiere pre-auth' — NO prueba contraseñas, NO incrementa
+    badPwdCount, NO bloquea cuentas (a diferencia de passwordspray). Necesita el dominio AD
+    (FQDN) y una wordlist; en automático prueba jsmith.txt (nombres de empleado realistas,
+    minutos) si está instalada, si no cae a una shortlist genérica (segundos) — ver
+    _userenum_wordlist. Con --userenum-wordlist se le pasa una grande a conciencia.
+
+    Escalado automático (operator-asked: "si con jsmith.txt no encuentra users, probar con
+    otra wordlist del mismo repo"): SOLO si el pase con jsmith.txt fue el AUTOMÁTICO (sin
+    --userenum-wordlist: con una lista propia el operador ya decidió, no hay nada que
+    escalar), no dio NINGÚN usuario Y no quedó PARCIAL (un timeout no es "0 usuarios"), se
+    reintenta con awesome-mix-vol1.txt (mismo repo, mezcla de formatos — recomendada por su
+    propio README cuando el formato real es desconocido) SI está instalada; si no, se dejan
+    el nombre y la URL como sugerencia manual, igual que ya se hace cuando ni jsmith.txt
+    está instalada.
+
+    Los usuarios hallados (en cualquiera de los dos pases) se vuelcan a <base>/ad_users.txt
+    (listos para AS-REP roast / spray) y los '(sin pre-auth)' se marcan como AS-REP
+    roastables (hash crackeable sin credenciales). Devuelve True si ya encoló la sugerencia
+    de AS-REP roast (hubo usuarios, en el primer pase o en el escalado) — el llamante
+    (fp_kerberos) la usa para NO repetirla en su propio bloque de next-steps genérico (antes
+    salía DOS VECES, con distinta coletilla, cuando SÍ había usuarios: visto en vivo)."""
+    kb = _kerbrute_bin()
+    if not kb:
+        res["missing"].append("kerbrute")
+        return False
+    if NO_USERENUM:
+        res["next"].append(f"kerbrute userenum -d {domain} --dc {ip} <wordlist>   # (--no-userenum: no lo lancé) enum de usuarios por Kerberos, no bloquea cuentas")
+        return False
+    wl = _userenum_wordlist(USERENUM_WORDLIST)
+    if not wl:
+        res["next"].append(f"kerbrute userenum -d {domain} --dc {ip} jsmith.txt   # enum de usuarios por Kerberos con nombres de empleado realistas: "
+                            "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/jsmith.txt "
+                            "— guárdala en /usr/share/wordlists/statistically-likely-usernames/jsmith.txt y la próxima vez la uso solo, sin --userenum-wordlist")
+        return False
+    info(f"Kerberos: enum de usuarios con kerbrute ({Path(wl).name}) — no bloquea cuentas, puede tardar según la lista")
+    users, partial = _kerbrute_run_pass(res, kb, ip, domain, wl, base)
+    if not USERENUM_WORDLIST and not users and not partial and wl in _JSMITH_USERLISTS:
+        wl2 = _awesome_mix_wordlist()
+        if wl2:
+            info(f"Kerberos: {Path(wl).name} no dio ningún usuario válido — reintento con "
+                 f"{Path(wl2).name} (mezcla de formatos, recomendada por el propio README del "
+                 "repo cuando el formato real es desconocido)")
+            users2, _partial2 = _kerbrute_run_pass(res, kb, ip, domain, wl2, base)
+            users = users or users2
+        else:
+            res["next"].append(
+                f"kerbrute userenum -d {domain} --dc {ip} awesome-mix-vol1.txt   # {Path(wl).name} no dio "
+                "ningún usuario — prueba la mezcla de formatos del mismo repo: "
+                "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/awesome-mix-vol1.txt "
+                "— guárdala junto a jsmith.txt y la próxima vez la uso sola, sin --userenum-wordlist")
     return bool(users)
 
 
@@ -12523,7 +12613,37 @@ def selftest():
     assert any("ms17_010_eternalblue" in n for n in _vres["next"])
     assert any(s == "critica" and "SMBGhost" in t for s, t in _vres["findings"]), _vres["findings"]
     assert any("SMBGhost/scanner.py" in n for n in _vres["next"])
+    # Bug real corregido: ly4k/SMBGhost es SOLO el scanner (confirmado leyendo su repo real) — el
+    # informe debe decir qué hacer DESPUÉS de confirmar "vulnerable" (RCE real + LPE real), no
+    # solo repetir el propio scanner de confirmación con un comentario que mentía sobre su contenido.
+    assert any("chompie1337/SMBGhost_RCE_Poc" in n and "exploit.py -ip 10.0.0.1" in n for n in _vres["next"]), _vres["next"]
+    assert any("danigargu/CVE-2020-0796" in n for n in _vres["next"]), _vres["next"]
+    assert not any("checker.py" in n for n in _vres["next"]), _vres["next"]   # afirmación falsa, ya quitada
     assert any(s == "media" and "WebClient" in t for s, t in _vres["findings"]), _vres["findings"]
+    # _attach_cmd: el hallazgo de SMBGhost debe traer sus 3 comandos vinculados en _cmd_for (para
+    # que quick_wins los use SIEMPRE, nunca el heurístico de "primeros N del footprint" — ver el
+    # siguiente bloque de test, que reproduce el bug real reportado con quick_wins() de verdad).
+    _ghost_t = next(t for s, t in _vres["findings"] if s == "critica" and "SMBGhost" in t)
+    assert len(_vres.get("_cmd_for", {}).get(_ghost_t, [])) == 3, _vres.get("_cmd_for")
+
+    # Regresión (operador real, en vivo): el quick win de SMBGhost enseñaba un 'nxc smb ... --users
+    # --groups --pass-pol --rid-brute' SIN relación, porque el CVE del hallazgo no aparecía en el
+    # texto de su propio next-step (ly4k/SMBGhost no lo menciona) — _cmds_for caía al heurístico
+    # genérico de "primeros N del footprint" en vez de usar el comando vinculado. Con _attach_cmd,
+    # quick_wins() debe devolver EXACTAMENTE los 3 comandos de SMBGhost, nunca el de rid-brute
+    # aunque esté ANTES en next (misma posición que en el informe real que lo reportó).
+    _scanner_cmd = "git clone https://github.com/ly4k/SMBGhost && python3 SMBGhost/scanner.py 10.0.0.1   # confirma antes de explotar"
+    _rce_cmd = "git clone https://github.com/chompie1337/SMBGhost_RCE_Poc && cd SMBGhost_RCE_Poc && python3 exploit.py -ip 10.0.0.1"
+    _lpe_cmd = "git clone https://github.com/danigargu/CVE-2020-0796"
+    _unrelated_cmd = "nxc smb 10.0.0.1 -u USER -p PASS --users --groups --pass-pol --rid-brute   # enum AD con credenciales"
+    _gh_fp = {"proto": "smb", "title": "SMB", "ports": [445], "steps": [],
+              "findings": [("critica", _ghost_t)],
+              "next": [_scanner_cmd, _unrelated_cmd, _rce_cmd, _lpe_cmd],   # orden real: el genérico ANTES de los 2 últimos
+              "missing": [], "_cmd_for": {_ghost_t: [_scanner_cmd, _rce_cmd, _lpe_cmd]}}
+    _gh_wins = quick_wins([_gh_fp])
+    _gh_win = next(w for w in _gh_wins if w["title"] == _ghost_t)
+    assert _gh_win["cmds"] == [_scanner_cmd, _rce_cmd, _lpe_cmd], _gh_win["cmds"]
+    assert _gh_win["targeted"] is True, _gh_win
 
     # #24: 'INFECTED with DoublePulsar' dentro de un TRACEBACK de nxc (bug upstream: key.decode()
     # sobre un int) NO debe marcar 'YA INFECTADO' — es un crash, no una detección real. EternalBlue
@@ -16070,6 +16190,82 @@ def selftest():
                           [{"port": 88, "name": "kerberos-sec", "scripts": {}}], {}, False)
     assert _kb_cmds == [] and any("DOMINIO" in n for n in _kbres2["next"])
 
+    # Escalado automático jsmith.txt → awesome-mix-vol1.txt (operator-asked: "si con jsmith.txt
+    # no encuentra users, probar con otra wordlist del mismo repo"). Mockea _kerbrute_bin/
+    # _userenum_wordlist/_awesome_mix_wordlist/run_capture — sin red real.
+    _real_kbbin4 = globals()["_kerbrute_bin"]
+    _real_wl4 = globals()["_userenum_wordlist"]
+    _real_mix4 = globals()["_awesome_mix_wordlist"]
+    _real_rc4b = globals()["run_capture"]
+    _real_uw4 = globals()["USERENUM_WORDLIST"]
+
+    def _fake_esc_rc_ok(cmd, timeout=None, quiet=False, **kw):
+        if _JSMITH_USERLISTS[0] in cmd:
+            return 0, "Done! Tested 48705 usernames (0 valid) in 20 seconds"
+        return 0, ("[+] VALID USERNAME:\t svc_sql@corp.local\n"
+                   "Done! Tested 25784 usernames (1 valid) in 10 seconds")
+    globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
+    globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
+    globals()["_awesome_mix_wordlist"] = lambda: _AWESOME_MIX_USERLISTS[0]
+    globals()["run_capture"] = _fake_esc_rc_ok
+    globals()["USERENUM_WORDLIST"] = None
+    _esc_dir = Path(tempfile.mkdtemp())
+    _esc_res = _fp("kerberos", "Kerberos", [88])
+    try:
+        _esc_found = _kerbrute_userenum(_esc_res, "10.0.0.5", "corp.local", _esc_dir)
+    finally:
+        (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
+         globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (_real_kbbin4, _real_wl4, _real_mix4, _real_rc4b, _real_uw4)
+    assert _esc_found is True, _esc_res
+    assert sum(_JSMITH_USERLISTS[0] in c for s in _esc_res["steps"] for c in [s["cmd"]]) == 1
+    assert sum(_AWESOME_MIX_USERLISTS[0] in c for s in _esc_res["steps"] for c in [s["cmd"]]) == 1
+    assert any(s == "info" and "48705 nombre(s) de la lista (jsmith.txt), 0 válido(s)" in t for s, t in _esc_res["findings"]), _esc_res["findings"]
+    assert any(s == "alta" and "1 usuario(s) AD válidos por kerbrute (awesome-mix-vol1.txt)" in t for s, t in _esc_res["findings"]), _esc_res["findings"]
+    assert (_esc_dir / "ad_users.txt").read_text().strip() == "svc_sql"
+
+    # awesome-mix-vol1.txt NO instalada: 1 solo pase (jsmith, 0 usuarios) + sugerencia MANUAL con
+    # la URL real, SIN segundo pase de kerbrute.
+    _esc_cmds2 = []
+
+    def _fake_esc_rc_noinstall(cmd, timeout=None, quiet=False, **kw):
+        _esc_cmds2.append(cmd)
+        return 0, "Done! Tested 48705 usernames (0 valid) in 20 seconds"
+    globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
+    globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
+    globals()["_awesome_mix_wordlist"] = lambda: None
+    globals()["run_capture"] = _fake_esc_rc_noinstall
+    globals()["USERENUM_WORDLIST"] = None
+    _esc_res2 = _fp("kerberos", "Kerberos", [88])
+    try:
+        _esc_found2 = _kerbrute_userenum(_esc_res2, "10.0.0.5", "corp.local", None)
+    finally:
+        (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
+         globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (_real_kbbin4, _real_wl4, _real_mix4, _real_rc4b, _real_uw4)
+    assert _esc_found2 is False
+    assert len(_esc_cmds2) == 1, _esc_cmds2   # NO segundo pase: no está instalada
+    assert any("awesome-mix-vol1.txt" in n and "statistically-likely-usernames/master/awesome-mix-vol1.txt" in n
+               for n in _esc_res2["next"]), _esc_res2["next"]
+
+    # --userenum-wordlist (el operador trajo la suya): NUNCA escala, aunque dé 0 usuarios — ya
+    # decidió él qué lista usar.
+    _esc_cmds3 = []
+
+    def _fake_esc_rc_own(cmd, timeout=None, quiet=False, **kw):
+        _esc_cmds3.append(cmd)
+        return 0, "Done! Tested 10 usernames (0 valid) in 1 seconds"
+    globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
+    globals()["_userenum_wordlist"] = lambda arg=None: arg
+    globals()["_awesome_mix_wordlist"] = lambda: _AWESOME_MIX_USERLISTS[0]   # SÍ está instalada, pero no debe usarse
+    globals()["run_capture"] = _fake_esc_rc_own
+    globals()["USERENUM_WORDLIST"] = "/tmp/propia-del-operador.txt"
+    _esc_res3 = _fp("kerberos", "Kerberos", [88])
+    try:
+        _kerbrute_userenum(_esc_res3, "10.0.0.5", "corp.local", None)
+    finally:
+        (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
+         globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (_real_kbbin4, _real_wl4, _real_mix4, _real_rc4b, _real_uw4)
+    assert len(_esc_cmds3) == 1, _esc_cmds3   # 1 solo pase: --userenum-wordlist nunca escala
+
     # Cajas: ninguna fila debe descuadrar (ancho visible constante), ni siquiera
     # con una línea larguísima (se trunca) o en cada estilo.
     import io as _io, contextlib as _cl
@@ -16343,6 +16539,26 @@ def selftest():
             globals()["run_capture"] = _real_rc_js
             _ur.urlopen = _real_urlopen
 
+    # _install_awesome_mix1: comparte _install_system_wordlist con _install_jsmith (ya probado
+    # arriba a fondo) — solo hace falta confirmar que usa SU PROPIO destino
+    # (_AWESOME_MIX_USERLISTS[0], no el de jsmith.txt por un copy-paste) y su propia URL.
+    _real_mix_urls = tuple(_AWESOME_MIX_USERLISTS)
+    with _tf.TemporaryDirectory() as _md:
+        _mdest = Path(_md) / "usr-share-sim" / "awesome-mix-vol1.txt"
+        globals()["_AWESOME_MIX_USERLISTS"] = (str(_mdest),) + _real_mix_urls[1:]
+        _ur.urlopen = lambda req, timeout=None: _FakeResp(b"john.smith\njsmith\njjs\n")
+        try:
+            globals()["is_root"] = lambda: True
+            globals()["run_capture"] = _no_rc_expected   # rama root: no debe pasar por sudo
+            ok8, err8 = _install_awesome_mix1()
+            assert ok8 and err8 is None
+            assert _mdest.read_bytes() == b"john.smith\njsmith\njjs\n"
+        finally:
+            globals()["_AWESOME_MIX_USERLISTS"] = _real_mix_urls
+            globals()["is_root"] = _real_isroot
+            globals()["run_capture"] = _real_rc_js
+            _ur.urlopen = _real_urlopen
+
     # preflight(): con TOOL_PKGS/_FETCHABLE_RESOURCES de prueba (no se toca la red ni los
     # reales) — separa correctamente apt / descargable / puramente manual, y con
     # --install-missing SOLO descarga tras haber avisado (ya verificado arriba en la propia
@@ -16500,25 +16716,24 @@ def _install_dest_bin(name):
     return d / name, ids
 
 
-def _install_jsmith():
-    """jsmith.txt (insidetrust/statistically-likely-usernames) — un solo fichero de
-    texto, sin build ni dependencias. BUG real corregido aquí: el destino
-    (_JSMITH_USERLISTS[0]) es un path de SISTEMA bajo /usr/share, igual que seclists —
-    a diferencia de kerbrute/certipy/creds/adidnsdump/crt.sh (todos van al $HOME del
-    operador, nunca necesitan privilegio), escribir ahí SIN sudo da 'Permission denied'
-    a secas si quien lanza palantir no es root. Se descarga primero a un temporal (eso
-    SÍ, sin privilegio: cualquiera puede escribir en /tmp) y solo al final se coloca en
-    su sitio: directo si ya somos root, con 'sudo install' si no — mismo patrón que el
-    apt-get install de preflight() (un único sudo, consistente con cómo ya se instala
-    seclists). Ver _JSMITH_USERLISTS para quién la usa (kerbrute userenum, Fase 5)."""
+def _install_system_wordlist(url, dest):
+    """Descarga `url` (un solo fichero de texto, sin build ni dependencias) a `dest`, un
+    destino de SISTEMA bajo /usr/share, igual que seclists — a diferencia de kerbrute/
+    certipy/creds/adidnsdump/crt.sh (todos van al $HOME del operador, nunca necesitan
+    privilegio), escribir ahí SIN sudo da 'Permission denied' a secas si quien lanza
+    palantir no es root. Se descarga primero a un temporal (eso SÍ, sin privilegio:
+    cualquiera puede escribir en /tmp) y solo al final se coloca en su sitio: directo si
+    ya somos root, con 'sudo install' si no — mismo patrón que el apt-get install de
+    preflight() (un único sudo, consistente con cómo ya se instala seclists). Compartido
+    por _install_jsmith / _install_awesome_mix1 (mismo repo, mismo tipo de fichero, mismo
+    destino de sistema — BUG real corregido cuando esto solo existía para jsmith.txt: el
+    destino bajo /usr/share necesita sudo si quien lanza palantir no es root)."""
     import tempfile
-    dest = Path(_JSMITH_USERLISTS[0])
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsmith")
+    dest = Path(dest)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wordlist")
     tmp.close()
     try:
-        ok, errmsg = _download_file(
-            "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/jsmith.txt",
-            tmp.name)
+        ok, errmsg = _download_file(url, tmp.name)
         if not ok:
             return False, errmsg
         if is_root():
@@ -16533,6 +16748,25 @@ def _install_jsmith():
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+def _install_jsmith():
+    """jsmith.txt (insidetrust/statistically-likely-usernames) — ver
+    _install_system_wordlist para el patrón de instalación. Ver _JSMITH_USERLISTS para
+    quién la usa (kerbrute userenum, Fase 5)."""
+    return _install_system_wordlist(
+        "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/jsmith.txt",
+        _JSMITH_USERLISTS[0])
+
+
+def _install_awesome_mix1():
+    """awesome-mix-vol1.txt (mismo repo que jsmith.txt) — escalado automático de kerbrute
+    userenum cuando jsmith.txt no da ningún usuario (operator-asked; ver
+    _awesome_mix_wordlist / _kerbrute_userenum). Mismo patrón de instalación que
+    jsmith.txt — ver _install_system_wordlist."""
+    return _install_system_wordlist(
+        "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/awesome-mix-vol1.txt",
+        _AWESOME_MIX_USERLISTS[0])
 
 
 def _install_kerbrute():
@@ -16660,6 +16894,9 @@ def _install_crtsh():
 _FETCHABLE_RESOURCES = {
     "jsmith.txt": {"fetch": _install_jsmith,
                    "source": "insidetrust/statistically-likely-usernames (GitHub, un solo fichero)"},
+    "awesome-mix-vol1.txt": {"fetch": _install_awesome_mix1,
+                             "source": "insidetrust/statistically-likely-usernames (GitHub, un solo fichero — "
+                                       "mismo repo que jsmith.txt)"},
     "kerbrute":   {"fetch": _install_kerbrute,
                    "source": "binario precompilado de la última release de github.com/ropnop/kerbrute"},
     "certipy":    {"fetch": _install_certipy, "source": "paquete 'certipy-ad' de PyPI (pipx/pip)"},
@@ -16725,6 +16962,7 @@ TOOL_PKGS = {
     "bloodyAD":         (None, "AD: abuso de ACLs (meterse en Domain Admins por GenericAll/WriteDACL/WriteOwner, DCSync…) — comandos SUGERIDOS por la auditoría de ACLs de Fase 5d; palantir no lo ejecuta (no está en apt → pipx install bloodyAD)", ("creds",)),
     "seclists":         ("seclists", "wordlists de descubrimiento (directorios/ficheros web, subdominios DNS, community SNMP, usuarios) usadas en casi todas las fases", ("foot", "fuzz", "creds")),
     "jsmith.txt":       (None, "AD: wordlist de nombres de empleado realistas para el userenum de kerbrute (Fase 5) — no está en seclists ni en apt, ver _JSMITH_USERLISTS", ("foot",)),
+    "awesome-mix-vol1.txt": (None, "AD: wordlist de MÚLTIPLES formatos de usuario — escalado automático del userenum de kerbrute (Fase 5) cuando jsmith.txt no da ningún usuario — no está en seclists ni en apt, ver _AWESOME_MIX_USERLISTS", ("foot",)),
 }
 
 
@@ -16756,6 +16994,8 @@ def _tool_present(tool):
         return Path("/usr/share/seclists").is_dir()
     if tool == "jsmith.txt":
         return any(Path(p).is_file() for p in _JSMITH_USERLISTS)
+    if tool == "awesome-mix-vol1.txt":
+        return any(Path(p).is_file() for p in _AWESOME_MIX_USERLISTS)
     return have(tool)
 
 
