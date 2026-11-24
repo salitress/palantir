@@ -1042,7 +1042,7 @@ def _scan_meta_footprint(ip, missing=None, fase2_truncada=False):
     if not findings:
         return None
     return {"proto": "scan", "title": "Escaneo / cobertura", "ports": [], "steps": [],
-            "findings": findings, "next": [], "missing": [], "_phase": "scanmeta"}
+            "findings": findings, "next": [], "missing": [], "phase": "scanmeta"}
 
 
 def version_str(p):
@@ -2363,21 +2363,50 @@ def _awesome_mix_wordlist():
     return None
 
 
+# xato-net-10-million-usernames-dup.txt: viene YA con el paquete apt 'seclists' (mismo path que
+# ya usa _SMALL_USERLISTS) — no hace falta instalar nada aparte, a diferencia de jsmith.txt/
+# awesome-mix-vol1.txt. Pese al nombre "10 million", el fichero real son ~624 000 líneas
+# (contadas contra el repo real de SecLists); el que de verdad tiene ~8.3 millones es
+# xato-net-10-million-usernames.txt SIN '-dup', deliberadamente NO usado aquí por su tamaño —
+# sigue reservado para --userenum-wordlist a mano. Nombres de pila reales (no patrones
+# first.last como jsmith/awesome-mix) — el ÚLTIMO escalón automático de kerbrute userenum
+# (operator-asked, tras un caso real donde ni jsmith.txt ni awesome-mix-vol1.txt pillaron
+# nombres de pila sueltos tipo 'charlie'/'admin' que SÍ encontró esta lista a mano).
+_XATO_DUP_USERLISTS = (
+    "/usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt",
+    "/usr/share/wordlists/seclists/Usernames/xato-net-10-million-usernames-dup.txt",
+)
+
+
+def _xato_dup_wordlist():
+    """xato-net-10-million-usernames-dup.txt si está instalada (viene con el paquete apt
+    'seclists' — ver _XATO_DUP_USERLISTS), si no None. Último escalón de la cadena de
+    kerbrute userenum automática — ver _kerbrute_userenum."""
+    for c in _XATO_DUP_USERLISTS:
+        if Path(c).is_file():
+            return c
+    return None
+
+
 def _kerbrute_timeout(wl):
     """Cap de tiempo para `kerbrute userenum` según la lista que de verdad se vaya a usar, no
     solo "¿el operador pasó --userenum-wordlist?": 10 min para la shortlist genérica
     automática (sobra, es minúscula); 15 min para awesome-mix-vol1.txt (~25 800 líneas,
     proporcional al margen de jsmith.txt para algo más o menos la mitad de líneas); 30 min
     para jsmith.txt automática (~48 000 líneas: unos minutos en un DC normal, pero este margen
-    aguanta un DC lento o con latencia de VPN sin cortarla en seco); 2 h si el operador trajo
-    su propia lista con --userenum-wordlist (puede ser una xato-10M de verdad — ahí sí puede
-    tardar horas). Puro → testeable sin red."""
+    aguanta un DC lento o con latencia de VPN sin cortarla en seco); 1 h para
+    xato-net-10-million-usernames-dup.txt (~624 000 líneas — mucho más grande que las otras
+    dos, pero sigue siendo una lista de TAMAÑO CONOCIDO, no la xato de 8.3M reservada a
+    --userenum-wordlist); 2 h si el operador trajo su propia lista con --userenum-wordlist
+    (puede ser esa xato-10M de verdad — ahí sí puede tardar horas). Puro → testeable sin red."""
     if USERENUM_WORDLIST:
         return 7200
     if wl in _JSMITH_USERLISTS:
         return 1800
     if wl in _AWESOME_MIX_USERLISTS:
         return 900
+    if wl in _XATO_DUP_USERLISTS:
+        return 3600
     return 600
 
 
@@ -5428,6 +5457,31 @@ def _kerbrute_run_pass(res, kb, ip, domain, wl, base):
     return bool(users), partial
 
 
+def _kerbrute_escalate(res, kb, ip, domain, base, wl2, label, why, manual_url=None, manual_path=None):
+    """Un escalón de la cadena de kerbrute userenum (ver _kerbrute_userenum): si `wl2` (ya
+    resuelta por el llamante, p. ej. _awesome_mix_wordlist()/_xato_dup_wordlist()) está
+    instalada, lanza un pase más con ella y devuelve (usuarios, parcial) igual que
+    _kerbrute_run_pass; si no está instalada, deja una sugerencia MANUAL (con `manual_url` si
+    el recurso no viene por apt — jsmith.txt/awesome-mix-vol1.txt — o `manual_path` si ya
+    viene con un paquete apt como 'seclists') y devuelve ([], False). El 'False' de 'parcial'
+    aquí es deliberado: no haber podido intentar este escalón no es un resultado INCOMPLETO
+    que deba frenar al llamante de seguir probando el SIGUIENTE escalón de la cadena — solo
+    un timeout de un pase que SÍ llegó a correr debe frenarla (ver _kerbrute_userenum)."""
+    if not wl2:
+        if manual_url:
+            res["next"].append(
+                f"kerbrute userenum -d {domain} --dc {ip} {label}   # ningún formato anterior dio ningún "
+                f"usuario — prueba esta ({why}): {manual_url} — guárdala junto a jsmith.txt y la próxima "
+                "vez la uso sola, sin --userenum-wordlist")
+        else:
+            res["next"].append(
+                f"kerbrute userenum -d {domain} --dc {ip} {manual_path}   # ningún formato anterior dio "
+                f"ningún usuario — prueba esta lista ({why})")
+        return [], False
+    info(f"Kerberos: ningún formato anterior dio ningún usuario — reintento con {label} ({why})")
+    return _kerbrute_run_pass(res, kb, ip, domain, wl2, base)
+
+
 def _kerbrute_userenum(res, ip, domain, base):
     """Fase 5: enum de usuarios AD por Kerberos con kerbrute, de verdad (no solo sugerido)
     — es justo el fallback que saca usuarios cuando la superficie anónima (SMB null/LDAP
@@ -5439,19 +5493,27 @@ def _kerbrute_userenum(res, ip, domain, base):
     minutos) si está instalada, si no cae a una shortlist genérica (segundos) — ver
     _userenum_wordlist. Con --userenum-wordlist se le pasa una grande a conciencia.
 
-    Escalado automático (operator-asked: "si con jsmith.txt no encuentra users, probar con
-    otra wordlist del mismo repo"): SOLO si el pase con jsmith.txt fue el AUTOMÁTICO (sin
-    --userenum-wordlist: con una lista propia el operador ya decidió, no hay nada que
-    escalar), no dio NINGÚN usuario Y no quedó PARCIAL (un timeout no es "0 usuarios"), se
-    reintenta con awesome-mix-vol1.txt (mismo repo, mezcla de formatos — recomendada por su
-    propio README cuando el formato real es desconocido) SI está instalada; si no, se dejan
-    el nombre y la URL como sugerencia manual, igual que ya se hace cuando ni jsmith.txt
-    está instalada.
+    Escalado automático en CADENA (operator-asked: "si con jsmith.txt no encuentra users,
+    probar con otra wordlist del mismo repo" + "pon otro salto si con esos dos wordlist no
+    pilla nada a la de xato-net-10 million", tras un caso real donde ni jsmith.txt ni
+    awesome-mix-vol1.txt pillaron nombres de pila sueltos tipo 'charlie'/'admin' que sí
+    encontró xato-net-10-million-usernames-dup.txt a mano): SOLO si el pase con jsmith.txt
+    fue el AUTOMÁTICO (sin --userenum-wordlist: con una lista propia el operador ya decidió,
+    no hay nada que escalar) y no dio NINGÚN usuario Y no quedó PARCIAL (un timeout no es "0
+    usuarios"), se reintenta con awesome-mix-vol1.txt (mismo repo que jsmith.txt, mezcla de
+    formatos — recomendada por su propio README cuando el formato real es desconocido); si
+    ESE pase tampoco da nada (de nuevo, ni parcial), se reintenta con
+    xato-net-10-million-usernames-dup.txt (nombres de pila reales, no patrones de formato —
+    viene con el paquete apt 'seclists', no con un repo aparte). Cualquier escalón que no
+    esté instalado se deja como sugerencia MANUAL (con la URL si hace falta instalarlo, o el
+    path si ya viene con seclists) y la cadena sigue probando el siguiente escalón igual —
+    "no instalada" no es lo mismo que "instalada pero sin resultado parcial", así que no
+    frena el encadenado.
 
-    Los usuarios hallados (en cualquiera de los dos pases) se vuelcan a <base>/ad_users.txt
+    Los usuarios hallados (en cualquiera de los pases) se vuelcan a <base>/ad_users.txt
     (listos para AS-REP roast / spray) y los '(sin pre-auth)' se marcan como AS-REP
     roastables (hash crackeable sin credenciales). Devuelve True si ya encoló la sugerencia
-    de AS-REP roast (hubo usuarios, en el primer pase o en el escalado) — el llamante
+    de AS-REP roast (hubo usuarios, en cualquier pase de la cadena) — el llamante
     (fp_kerberos) la usa para NO repetirla en su propio bloque de next-steps genérico (antes
     salía DOS VECES, con distinta coletilla, cuando SÍ había usuarios: visto en vivo)."""
     kb = _kerbrute_bin()
@@ -5470,19 +5532,17 @@ def _kerbrute_userenum(res, ip, domain, base):
     info(f"Kerberos: enum de usuarios con kerbrute ({Path(wl).name}) — no bloquea cuentas, puede tardar según la lista")
     users, partial = _kerbrute_run_pass(res, kb, ip, domain, wl, base)
     if not USERENUM_WORDLIST and not users and not partial and wl in _JSMITH_USERLISTS:
-        wl2 = _awesome_mix_wordlist()
-        if wl2:
-            info(f"Kerberos: {Path(wl).name} no dio ningún usuario válido — reintento con "
-                 f"{Path(wl2).name} (mezcla de formatos, recomendada por el propio README del "
-                 "repo cuando el formato real es desconocido)")
-            users2, _partial2 = _kerbrute_run_pass(res, kb, ip, domain, wl2, base)
-            users = users or users2
-        else:
-            res["next"].append(
-                f"kerbrute userenum -d {domain} --dc {ip} awesome-mix-vol1.txt   # {Path(wl).name} no dio "
-                "ningún usuario — prueba la mezcla de formatos del mismo repo: "
-                "https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/awesome-mix-vol1.txt "
-                "— guárdala junto a jsmith.txt y la próxima vez la uso sola, sin --userenum-wordlist")
+        users2, partial2 = _kerbrute_escalate(
+            res, kb, ip, domain, base, _awesome_mix_wordlist(), "awesome-mix-vol1.txt",
+            "mezcla de formatos, recomendada por su propio README",
+            manual_url="https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/awesome-mix-vol1.txt")
+        users = users or users2
+        if not users and not partial2:
+            users3, _partial3 = _kerbrute_escalate(
+                res, kb, ip, domain, base, _xato_dup_wordlist(), "xato-net-10-million-usernames-dup.txt",
+                "nombres de pila reales, no patrones de formato — ya viene con el paquete apt 'seclists'",
+                manual_path="/usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt")
+            users = users or users3
     return bool(users)
 
 
@@ -9340,7 +9400,22 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
         ports = buckets[np]
         res = _fp("reuse-" + np, f"Credenciales aportadas — {np.upper()}", sorted({p["port"] for p in ports}))
         results.append(res)
-        port = ports[0]["port"]
+        # BUG real corregido aquí (operador real: charlie:charlie válida por SMB a mano contra
+        # 445 — confirmado con 'nxc smb IP -u charlie -p charlie --shares', shares incluidos —
+        # pero la Fase 5d la daba por inválida): 'ports[0]["port"]' tomaba el PRIMERO de la lista
+        # en el orden de descubrimiento, que con SMB casi siempre es 139 (netbios-ssn) ANTES que
+        # 445 (microsoft-ds) — nmap lista los puertos ascendiendo. Eso forzaba '--port 139' (ver
+        # más abajo, 'if port and dp and port != dp'), y 139 es SMB sobre NetBIOS, un framing de
+        # red DISTINTO al de 445 que aquí devolvió salida COMPLETAMENTE VACÍA (ni éxito ni
+        # STATUS_LOGON_FAILURE) — un login que SÍ es válido se perdía en silencio. El mecanismo
+        # de '--port' existe de verdad para el caso contrario (un host SOLO con 139, SIN 445 —
+        # ver el test de _nxc_confirm_smb unas líneas más abajo): ahí SÍ hace falta forzarlo,
+        # porque sin él nxc probaría 445 por defecto y ese puerto ni siquiera está abierto. La
+        # solución no es dejar de forzarlo nunca, es preferir el puerto POR DEFECTO de nxc
+        # (_NXC_DEFAULT_PORT) cuando esté de verdad entre los puertos detectados de este bucket,
+        # y solo caer al primero de la lista (el 139-only de antes) cuando no lo esté.
+        dp = _NXC_DEFAULT_PORT.get(np)
+        port = dp if dp is not None and any(p["port"] == dp for p in ports) else ports[0]["port"]
         # mysql/postgres: SOLO LECTURA vía el cliente CLI real (_db_cred_test), no por nxc (no
         # tiene módulo para ellos). Solo pares explícitos (--user/--pass/--creds-file) — el
         # modo spray (-U/-P) de más abajo es específico de nxc/hydra, no se soporta aquí todavía
@@ -9368,7 +9443,6 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                         res["findings"].append(("alta", f"{np.upper()}: credencial aportada válida — «{masked_real}»"))
                         _db_enum(res, np, ip, port, u, p, base)
             continue
-        dp = _NXC_DEFAULT_PORT.get(np)
         res_by_proto[np] = res
         proto_meta[np] = (port, dp)
         if np == "rdp":
@@ -11117,6 +11191,21 @@ def write_reports(base, ip, services, host, footprints, vulns, domains, web_hits
             # '_ldap_signing_disabled' aparecía en footprints[]). Los hallazgos/next derivados de
             # esa metadata ya están materializados en 'findings'/'next', así que --resume no pierde
             # nada. Se copia a dicts nuevos para no mutar los footprints vivos.
+            #
+            # BUG REAL corregido aquí (operador real, --resume tras aportar credenciales: un
+            # SMBGhost crítico + ADWS + Kerberos anónimo + LDAP signing del escaneo ORIGINAL
+            # desaparecían ENTEROS del informe, sin aviso): 'phase' (SIN guion bajo, a propósito
+            # — ver más abajo) es la única excepción real a la regla de arriba. run_one la usa
+            # para saber qué footprint cargado de un findings.json anterior pertenece a la fase
+            # "footprint"/"creds_default"/"creds_provided" (ver 'f.get("phase") == ...' ahí) y así
+            # reutilizarlo en --resume en vez de perderlo — es METADATA ESTRUCTURAL, no transitoria
+            # como '_cmd_for'/'_pending_kerbrute'. Antes se llamaba '_phase' (con guion bajo) y caía
+            # en el filtro 'not k.startswith("_")' de aquí abajo igual que el resto: se borraba
+            # SIEMPRE antes de escribir findings.json, así que el 'f.get("_phase") == "footprint"'
+            # de run_one NUNCA podía casar con nada cargado de disco — cada --resume creía estar
+            # reutilizando el footprint (footprint_ok=True, ni un aviso de fallo) pero en realidad
+            # lo vaciaba en silencio, siempre, no solo a veces. Por eso el nombre sin guion bajo:
+            # para que sobreviva este filtro sin necesitar un caso especial aquí.
             "footprints": [{k: v for k, v in fp.items() if not k.startswith("_")}
                            for fp in footprints],
             "vulns": vulns or [],
@@ -11338,7 +11427,7 @@ def selftest():
     # #2/#3: _scan_meta_footprint anota SIEMPRE el tipo de escaneo (info); 'flapping' y Fase 2
     # truncada solo cuando los hay. Todo SOLO LECTURA sobre lo que nmap ya reportó.
     _sm = _scan_meta_footprint("10.0.0.9", missing=[3389, 8080], fase2_truncada=True)
-    assert _sm and _sm["proto"] == "scan" and _sm["_phase"] == "scanmeta" and _sm["ports"] == []
+    assert _sm and _sm["proto"] == "scan" and _sm["phase"] == "scanmeta" and _sm["ports"] == []
     assert any(s == "info" and "tipo efectivo" in t for s, t in _sm["findings"])     # #3
     assert any("flapping" in t and "3389" in t and "8080" in t for _, t in _sm["findings"])  # #2
     assert any("INCOMPLETO" in t for _, t in _sm["findings"])                        # #1
@@ -13616,6 +13705,45 @@ def selftest():
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
         globals()["SHOW_SECRETS"] = True
     assert "charlie1" not in json.dumps(_leak_hidden, ensure_ascii=False), "contraseña en claro filtrada al footprint con --hide-secrets (#52)"
+
+    # Regresión REAL (operador real: 'nxc smb IP -u charlie -p charlie --shares' A MANO confirmó
+    # login y shares contra el 445, pero la Fase 5d la daba por inválida): con SMB en 139 Y 445
+    # (el caso normal — nmap lista 139 antes que 445, orden ascendente), el código tomaba
+    # 'ports[0]["port"]' SIN MIRAR cuál era el de nxc por defecto, y con 139 primero en la lista
+    # forzaba '--port 139' — SMB sobre NetBIOS, un framing distinto al de 445 que aquí no daba NI
+    # éxito NI STATUS_LOGON_FAILURE, salida vacía, credencial válida perdida en silencio. Ahora
+    # debe preferir 445 (el default de nxc para smb) en cuanto esté entre los puertos detectados,
+    # y NO añadir '--port' en absoluto (dp==port, ver 'if port and dp and port != dp').
+    _p139_cmds = []
+
+    def _fake_p139_rc(cmd, timeout=None, quiet=False, **kw):
+        _p139_cmds.append(cmd)
+        return 0, "SMB 10.0.0.1 445 DC01 [+] SOUPEDECODE.LOCAL\\charlie:charlie"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_p139_rc
+    try:
+        _p139_res = provided_creds_check("10.0.0.1",
+                                         [{"port": 139, "name": "netbios-ssn"}, {"port": 445, "name": "microsoft-ds"}],
+                                         [("charlie", "charlie")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert _p139_cmds and not any("--port" in c for c in _p139_cmds), _p139_cmds
+    assert any(s == "alta" and "charlie:charlie" in t for r in _p139_res for s, t in r["findings"]), _p139_res
+
+    # El mecanismo de '--port' SIGUE haciendo falta de verdad cuando el host es SOLO 139 (SIN
+    # 445 en absoluto) — sin él, nxc probaría 445 por defecto contra un puerto que ni está
+    # abierto. Mismo escenario que ya cubre _nxc_confirm_smb más abajo, pero aquí a través de
+    # provided_creds_check() (Fase 5d) de verdad.
+    _p139only_cmds = []
+
+    def _fake_p139only_rc(cmd, timeout=None, quiet=False, **kw):
+        _p139only_cmds.append(cmd)
+        return 0, "SMB 10.0.0.1 139 DC01 [+] SOUPEDECODE.LOCAL\\charlie:charlie"
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_p139only_rc
+    try:
+        provided_creds_check("10.0.0.1", [{"port": 139, "name": "netbios-ssn"}], [("charlie", "charlie")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
+    assert _p139only_cmds and all("--port" in c and "139" in c for c in _p139only_cmds), _p139only_cmds
 
     # --local-auth en provided_creds_check: se añade en protocolos NTLM (smb, aquí) cuando
     # se pide, y se EXCLUYE a propósito en ssh (nxc no distingue dominio/local ahí — ver
@@ -15994,6 +16122,31 @@ def selftest():
     (_lpf_dir / "findings.json").write_text(json.dumps({"ports": _svcs_a}), encoding="utf-8")
     assert _load_prev_findings(_lpf_dir)["ports"] == _svcs_a
 
+    # Regresión REAL (operador real, --resume tras aportar -u/-p): un SMBGhost crítico del
+    # escaneo ORIGINAL (footprint de Fase 5, SIN credenciales) desaparecía ENTERO del informe
+    # en el --resume siguiente — junto con TODO lo demás de esa fase (ADWS, Kerberos anónimo,
+    # LDAP signing…). Causa real: write_reports() escribía la metadata de fase bajo '_phase'
+    # (con guion bajo), y el propio filtro "no serializar claves que empiecen por '_'" de
+    # write_reports (unas líneas más arriba) la borraba ANTES de guardar — así que
+    # 'f.get("phase") == "footprint"' en run_one() NUNCA casaba con nada recién cargado de
+    # disco, y el footprint se vaciaba en silencio en CADA --resume, no como caso raro. Esto
+    # reproduce el ciclo completo real: write_reports() escribe → _load_prev_findings() relee →
+    # el MISMO filtro que usa run_one() para decidir qué reutilizar.
+    _ghost_fp_sim = {"proto": "smb", "title": "SMB", "ports": [445], "steps": [],
+                     "findings": [("critica", "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — "
+                                             "POTENCIALMENTE VULNERABLE")],
+                     "next": [], "missing": [], "phase": "footprint"}
+    _resume_svcs = [{"port": 445, "proto": "tcp", "name": "microsoft-ds", "product": "", "version": "",
+                      "extrainfo": "", "banner": "", "scripts": {}}]
+    _resume_dir = Path(tempfile.mkdtemp())
+    write_reports(_resume_dir, "10.0.0.1", _resume_svcs, {}, [_ghost_fp_sim], [], [], {}, [], None,
+                  phases_done=["footprint"])
+    _reloaded = _load_prev_findings(_resume_dir)
+    assert _reloaded is not None
+    _reused_footprint = [_norm_fp(f) for f in _reloaded.get("footprints", []) if f.get("phase") == "footprint"]
+    assert len(_reused_footprint) == 1, _reloaded.get("footprints")
+    assert any(s == "critica" and "SMBGhost" in t for s, t in _reused_footprint[0]["findings"]), _reused_footprint
+
     # ── Protocolos nuevos (finger / IPP-CUPS / X11 / git daemon): classify + parsers puros ──
     assert classify({"name": "finger", "port": 79}) == "finger"
     assert classify({"name": "", "port": 79}) == "finger"
@@ -16223,8 +16376,10 @@ def selftest():
     assert any(s == "alta" and "1 usuario(s) AD válidos por kerbrute (awesome-mix-vol1.txt)" in t for s, t in _esc_res["findings"]), _esc_res["findings"]
     assert (_esc_dir / "ad_users.txt").read_text().strip() == "svc_sql"
 
-    # awesome-mix-vol1.txt NO instalada: 1 solo pase (jsmith, 0 usuarios) + sugerencia MANUAL con
-    # la URL real, SIN segundo pase de kerbrute.
+    # awesome-mix-vol1.txt NI xato-dup instaladas: 1 solo pase (jsmith, 0 usuarios) + sugerencia
+    # MANUAL de CADA escalón, SIN segundo/tercer pase de kerbrute — "ningún escalón instalado"
+    # no debe lanzar nada, solo dejar las 2 sugerencias.
+    _real_xato4 = globals()["_xato_dup_wordlist"]
     _esc_cmds2 = []
 
     def _fake_esc_rc_noinstall(cmd, timeout=None, quiet=False, **kw):
@@ -16233,6 +16388,7 @@ def selftest():
     globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
     globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
     globals()["_awesome_mix_wordlist"] = lambda: None
+    globals()["_xato_dup_wordlist"] = lambda: None
     globals()["run_capture"] = _fake_esc_rc_noinstall
     globals()["USERENUM_WORDLIST"] = None
     _esc_res2 = _fp("kerberos", "Kerberos", [88])
@@ -16240,11 +16396,72 @@ def selftest():
         _esc_found2 = _kerbrute_userenum(_esc_res2, "10.0.0.5", "corp.local", None)
     finally:
         (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
-         globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (_real_kbbin4, _real_wl4, _real_mix4, _real_rc4b, _real_uw4)
+         globals()["_xato_dup_wordlist"], globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (
+            _real_kbbin4, _real_wl4, _real_mix4, _real_xato4, _real_rc4b, _real_uw4)
     assert _esc_found2 is False
-    assert len(_esc_cmds2) == 1, _esc_cmds2   # NO segundo pase: no está instalada
+    assert len(_esc_cmds2) == 1, _esc_cmds2   # NI segundo NI tercer pase: ninguno está instalado
     assert any("awesome-mix-vol1.txt" in n and "statistically-likely-usernames/master/awesome-mix-vol1.txt" in n
                for n in _esc_res2["next"]), _esc_res2["next"]
+    assert any("xato-net-10-million-usernames-dup.txt" in n and "seclists" in n for n in _esc_res2["next"]), _esc_res2["next"]
+
+    # Cadena completa: jsmith.txt (0) → awesome-mix-vol1.txt (0, NO parcial) → xato-dup (encuentra
+    # usuarios) — el caso real exacto que motivó el 3er escalón ("pon otro salto si con esos dos
+    # wordlist no pilla nada a la de xato-net-10 million").
+    _esc_cmds4 = []
+
+    def _fake_esc_rc_chain(cmd, timeout=None, quiet=False, **kw):
+        _esc_cmds4.append(cmd)
+        if _JSMITH_USERLISTS[0] in cmd or _AWESOME_MIX_USERLISTS[0] in cmd:
+            return 0, "Done! Tested 10000 usernames (0 valid) in 5 seconds"
+        return 0, ("[+] VALID USERNAME:\t charlie@soupedecode.local\n"
+                   "[+] VALID USERNAME:\t admin@soupedecode.local\n"
+                   "Done! Tested 624370 usernames (2 valid) in 230 seconds")
+    globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
+    globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
+    globals()["_awesome_mix_wordlist"] = lambda: _AWESOME_MIX_USERLISTS[0]
+    globals()["_xato_dup_wordlist"] = lambda: _XATO_DUP_USERLISTS[0]
+    globals()["run_capture"] = _fake_esc_rc_chain
+    globals()["USERENUM_WORDLIST"] = None
+    _esc_dir4 = Path(tempfile.mkdtemp())
+    _esc_res4 = _fp("kerberos", "Kerberos", [88])
+    try:
+        _esc_found4 = _kerbrute_userenum(_esc_res4, "10.0.0.5", "soupedecode.local", _esc_dir4)
+    finally:
+        (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
+         globals()["_xato_dup_wordlist"], globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (
+            _real_kbbin4, _real_wl4, _real_mix4, _real_xato4, _real_rc4b, _real_uw4)
+    assert _esc_found4 is True, _esc_res4
+    assert len(_esc_cmds4) == 3, _esc_cmds4   # los 3 escalones: jsmith, awesome-mix, xato-dup
+    assert sum(_XATO_DUP_USERLISTS[0] in c for s in _esc_res4["steps"] for c in [s["cmd"]]) == 1
+    assert any(s == "alta" and "2 usuario(s) AD válidos por kerbrute (xato-net-10-million-usernames-dup.txt)" in t
+               for s, t in _esc_res4["findings"]), _esc_res4["findings"]
+    assert sorted((_esc_dir4 / "ad_users.txt").read_text().split()) == ["admin", "charlie"]
+
+    # Si el 2º escalón (awesome-mix) se corta por TIMEOUT (parcial), la cadena NO debe seguir al
+    # 3º — un timeout no es "awesome-mix no tenía al usuario", es "no se llegó a probar entera":
+    # escalar más con ese resultado a medias sería decidir con información incompleta.
+    _esc_cmds5 = []
+
+    def _fake_esc_rc_partial(cmd, timeout=None, quiet=False, **kw):
+        _esc_cmds5.append(cmd)
+        if _JSMITH_USERLISTS[0] in cmd:
+            return 0, "Done! Tested 48705 usernames (0 valid) in 20 seconds"
+        return None, "Tested 9000 usernames so far"   # rc=None: run_capture cortó por timeout
+    globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
+    globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
+    globals()["_awesome_mix_wordlist"] = lambda: _AWESOME_MIX_USERLISTS[0]
+    globals()["_xato_dup_wordlist"] = lambda: _XATO_DUP_USERLISTS[0]   # instalada, pero NO debe tocarse
+    globals()["run_capture"] = _fake_esc_rc_partial
+    globals()["USERENUM_WORDLIST"] = None
+    _esc_res5 = _fp("kerberos", "Kerberos", [88])
+    try:
+        _kerbrute_userenum(_esc_res5, "10.0.0.5", "corp.local", None)
+    finally:
+        (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
+         globals()["_xato_dup_wordlist"], globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (
+            _real_kbbin4, _real_wl4, _real_mix4, _real_xato4, _real_rc4b, _real_uw4)
+    assert len(_esc_cmds5) == 2, _esc_cmds5   # jsmith + awesome-mix (parcial) — NUNCA xato-dup
+    assert not any(_XATO_DUP_USERLISTS[0] in c for c in _esc_cmds5), _esc_cmds5
 
     # --userenum-wordlist (el operador trajo la suya): NUNCA escala, aunque dé 0 usuarios — ya
     # decidió él qué lista usar.
@@ -17767,14 +17984,14 @@ def run_one(ip, name, args, folder=None):
     will_need_fresh_whatweb = NIKTO or NUCLEI or CMS_SCAN or CRAWL   # necesitan el whatweb_cache recién hecho de footprint_services, no el de un run viejo
     if ("footprint" in prev_phases and not will_need_fresh_whatweb
             and not args.no_footprint and not args.default_creds):
-        footprints = [_norm_fp(f) for f in prev.get("footprints", []) if f.get("_phase") == "footprint"]
+        footprints = [_norm_fp(f) for f in prev.get("footprints", []) if f.get("phase") == "footprint"]
         footprint_ok = True
     elif not args.no_footprint and not args.default_creds:
         try:
             footprints, whatweb_cache = footprint_services(ip, services, host, extra_dom, args.aggressive, webs_fp,
                                                             base=base, has_creds=bool(pcreds))
             for f in footprints:
-                f["_phase"] = "footprint"
+                f["phase"] = "footprint"
             footprint_ok = True
         except Exception as e:
             _phase_fail("footprinting", e, base)
@@ -17801,13 +18018,13 @@ def run_one(ip, name, args, folder=None):
             _phase_fail("searchsploit", e, base)
 
     if "creds_default" in prev_phases and not args.no_creds:
-        footprints += [_norm_fp(f) for f in prev.get("footprints", []) if f.get("_phase") == "creds_default"]
+        footprints += [_norm_fp(f) for f in prev.get("footprints", []) if f.get("phase") == "creds_default"]
         creds_default_ok = True
     elif not args.no_creds:
         try:
             cc = creds_check(ip, services, host, args.aggressive)
             for f in cc:
-                f["_phase"] = "creds_default"
+                f["phase"] = "creds_default"
             footprints += cc
             creds_default_ok = True
         except Exception as e:
@@ -17819,7 +18036,7 @@ def run_one(ip, name, args, folder=None):
     # run se fusiona con lo viejo del MISMO protocolo; un protocolo que este run no retesteó
     # (sin credenciales, o con un servicio que ya no está) se conserva tal cual.
     prev_creds_provided = {f["proto"]: _norm_fp(f) for f in (prev.get("footprints", []) if prev else [])
-                           if f.get("_phase") == "creds_provided"}
+                           if f.get("phase") == "creds_provided"}
     # ¿Algún --resume ANTERIOR ya dejó la lista COMPLETA de usuarios del dominio (con cualquier
     # credencial de esa ejecución, por LDAP o por SMB)? Si es así, ni hace falta volver a
     # lanzarla con la credencial NUEVA que este run esté probando — ver `known_ad_users` en
@@ -17862,7 +18079,7 @@ def run_one(ip, name, args, folder=None):
                                                 is_hash=bool(args.hash), base=base, domain=_early_ad_domain,
                                                 known_ad_users=_known_ad_users)
                 for f in newcreds:
-                    f["_phase"] = "creds_provided"
+                    f["phase"] = "creds_provided"
                 fresh_creds_provided += newcreds
             except Exception as e:
                 _phase_fail("credenciales aportadas", e, base)
@@ -17875,7 +18092,7 @@ def run_one(ip, name, args, folder=None):
                 try:
                     bs_creds = brutespray_extra_creds_check(ip, services, pcreds, bulk=bulk, base=base)
                     for f in bs_creds:
-                        f["_phase"] = "creds_provided"
+                        f["phase"] = "creds_provided"
                     fresh_creds_provided += bs_creds
                 except Exception as e:
                     _phase_fail("credenciales aportadas (brutespray)", e, base)
@@ -17991,7 +18208,7 @@ def run_one(ip, name, args, folder=None):
             ad_domain_for_spray = next((d for d in domains if base_domain(d) == d), None)
             spray_fp = _spray_phase(ip, ad_domain_for_spray, base, services)
             if spray_fp:
-                spray_fp["_phase"] = "spray"
+                spray_fp["phase"] = "spray"
                 footprints.append(spray_fp)
                 render_footprint([spray_fp])
         except Exception as e:

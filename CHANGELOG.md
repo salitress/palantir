@@ -10,18 +10,27 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Kerberos userenum escalates to a second wordlist when jsmith.txt finds nobody**
+- **Kerberos userenum escalates through a 3-tier wordlist chain when earlier ones find nobody**
   (operator-asked, live run against a real DC: "si con jsmith.txt no encuentra users, probar con
-  otra wordlist del mismo repo"): the automatic `kerbrute userenum` pass only ever tried
-  jsmith.txt, and on a 0-user result just stopped — no fallback. Now, when the automatic
-  (non-`--userenum-wordlist`) jsmith.txt pass finds zero users and isn't a timeout/partial run, it
-  retries once with `awesome-mix-vol1.txt` (same repo, insidetrust/statistically-likely-usernames
-  — its own README recommends this exact list first when the real username format is unknown, since
-  it interleaves several formats instead of betting on one). If it isn't installed yet, it's added
-  to `--install-missing`/`_FETCHABLE_RESOURCES` (same system-path/sudo-install pattern as
-  jsmith.txt, now shared via `_install_system_wordlist`) and left as a manual next-step suggestion
-  with the real raw-githubusercontent URL, same as jsmith.txt's own bootstrap message. An operator
-  who brought their own `--userenum-wordlist` is never escalated — that's already their call.
+  otra wordlist del mismo repo", then "pon otro salto si con esos dos wordlist no pilla nada a la
+  de xato-net-10 million"): the automatic `kerbrute userenum` pass only ever tried jsmith.txt, and
+  on a 0-user result just stopped — no fallback. The real case that motivated this: a DC
+  (`soupedecode.local`) using bare first names (`charlie`, `admin`) as usernames, a convention
+  neither jsmith.txt nor any `first.last`-style list covers, that only a real name wordlist
+  (`xato-net-10-million-usernames-dup.txt`) found. Now, when the automatic
+  (non-`--userenum-wordlist`) pass finds zero users and isn't a timeout/partial run, it escalates:
+  jsmith.txt → `awesome-mix-vol1.txt` (same repo, insidetrust/statistically-likely-usernames — its
+  own README recommends this list first when the real username format is unknown, since it
+  interleaves several formats instead of betting on one) → `xato-net-10-million-usernames-dup.txt`
+  (real first names, not format patterns — ships with the `seclists` apt package already, ~624k
+  lines despite the "10 million" name; the actual 8.3M-line file without `-dup` stays reserved for
+  manual `--userenum-wordlist`, it's too large to run automatically). Any tier that isn't installed
+  is left as a manual next-step suggestion instead of stopping the chain — jsmith.txt/
+  awesome-mix-vol1.txt get `--install-missing`/`_FETCHABLE_RESOURCES` entries (same system-path/
+  sudo-install pattern, shared via `_install_system_wordlist`); xato-dup needs nothing extra, it's
+  already covered by the existing `seclists` package. A timeout/partial pass at any tier stops the
+  chain right there — an incomplete result isn't grounds to escalate further. An operator who
+  brought their own `--userenum-wordlist` is never escalated — that's already their call.
 
 - **RDP CredSSP false-negative from nxc's aardwolf flagged, not silently dropped**
   (operator-reported, confirmed against a real Windows Server 2016 lab with `xfreerdp`): nxc
@@ -67,6 +76,35 @@ this project follows [Semantic Versioning](https://semver.org/).
   RSAT note.
 
 ### Fixed
+
+- **`--resume` silently dropped the ENTIRE Fase 5 footprint (SMBGhost, ADWS, anonymous Kerberos,
+  LDAP signing, everything) on every single run that also reused credentials-related phases**
+  (operator-reported, confirmed from a real results folder: a `critica` SMBGhost finding present
+  in the first scan's `report.html` was completely gone from the `--resume` run's `findings.json`
+  — `0 críticas` where there used to be `1`). Root cause: the per-footprint `"_phase"` key that
+  `--resume` uses to know which stored footprint belongs to "footprint"/"creds_default"/
+  "creds_provided" was itself stripped by `write_reports`'s own "don't serialize internal `_`-keys"
+  filter before ever reaching disk — so every reload of a previous `findings.json` found zero
+  footprints tagged with any phase, `--resume` believed it had "reused" the data (no error, no
+  warning, `footprint_ok = True`), and silently kept an empty list instead. This wasn't an edge
+  case: it happened on *every* `--resume` run that had ports/services unchanged, which is the
+  entire point of `--resume`. Renamed the key to `"phase"` (no underscore) specifically so it
+  survives serialization — it's structural metadata `--resume` depends on, not transient
+  bookkeeping like `_cmd_for`/`_pending_kerbrute`, which still get stripped as before. Added a
+  round-trip regression test (`write_reports` → `_load_prev_findings` → the exact reuse filter)
+  reproducing the SMBGhost-vanishing case directly.
+
+- **A valid SMB credential (`charlie:charlie`, confirmed by hand with `nxc smb ... --shares`) came
+  back invalid in Fase 5d when the host had both 139 and 445 open** (operator-reported, same real
+  DC): the port picked for the `nxc smb` call was simply `ports[0]["port"]` — whichever port
+  classified as "smb" sorted first, which for a normal nmap scan is 139 (netbios-ssn) before 445
+  (microsoft-ds). That forced `--port 139`, SMB-over-NetBIOS, a different wire framing from
+  445 that returned completely empty output here (neither success nor `STATUS_LOGON_FAILURE`) —
+  so a genuinely valid credential looked untested. The `--port` override itself is legitimate and
+  still needed for a *139-only* host (no 445 at all — nxc would otherwise default to 445 and fail
+  against a closed port, a real case this mechanism was built for); the fix is to prefer nxc's own
+  default port (445 for smb) whenever it's actually among the detected ports, and only fall back to
+  the first one found when it isn't.
 
 - **SMBGhost quick win showed an unrelated command, and never said what to do once confirmed
   vulnerable** (operator-reported, live run with a real confirmed-vulnerable DC): the finding's
