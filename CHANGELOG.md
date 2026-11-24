@@ -10,6 +10,15 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **IIS Application Pool credentials dumped after a Pwn3d! login, same chain as --sam/--lsa/
+  lsassy** (operator-asked: "he visto uno de iis también" — a broader request to audit and wire
+  in useful nxc modules across every protocol): `nxc smb ... -M iis` (checks
+  `appcmd.exe list apppool /@t:*` for cleartext app pool credentials, a classic IIS hygiene
+  failure) now runs right alongside the existing post-admin SMB chain. Fails clean when IIS isn't
+  installed, same cost profile as the other three. Parser built against the module's real source
+  (`nxc/modules/iis.py`) with the same discipline the lsassy fix below required: nxc's own
+  connection banner is skipped before matching a credential line.
+
 - **Three more privileged-group memberships now flag a critical finding, each tied to the right
   evidence** (operator-asked: "toda detección posible que la haga palantir", same pattern as
   Backup Operators): `_creds_enum`'s LDAP group check now also covers `Server Operators` (default
@@ -33,6 +42,19 @@ this project follows [Semantic Versioning](https://semver.org/).
   so it missed exactly the most common case, a real Domain Admin. Membership in either group now
   implies DCSync on its own and suggests `impacket-secretsdump -just-dc`, sharing the same finding
   marker as the ACE-based path so only one `DCSync viable` finding ever appears.
+
+- **SMBGhost finding treated "dialect 3.1.1 + compression" as proof of RCE, not just the
+  precondition for it** (operator-reported, live run: `nxc`/the ly4k scanner both flagged a real
+  Server 2022 (build 20348) target as "Potentially vulnerable", but the actual RCE PoC
+  (`chompie1337/SMBGhost_RCE_Poc`) failed clean with "physical read primitive failed" — the
+  target genuinely isn't vulnerable). Both checks only confirm the negotiated dialect and
+  compression capability — the scanner's own README says exactly that — never whether the
+  unpatched `srv2.sys` code is actually present. CVE-2020-0796 only ever affected build
+  18362/18363 (Windows 10 and Server, both 1903/1909); any other build, older or newer, still
+  advertises compression over the wire without the vulnerable code. The finding now cross-checks
+  the detected build (`_detect_win_build`, already used elsewhere to downgrade stale-OS exploit
+  matches) and drops from `critica` to `media` with an explicit caveat when the build falls
+  outside that range — an unknown build still defaults to `critica`, unchanged from before.
 
 ## [2.0.6] - 2026-11-24
 
