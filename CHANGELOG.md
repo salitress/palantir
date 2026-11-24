@@ -6,6 +6,25 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Backup Operators membership now flags a critical privesc path, with a manual-only
+  next-step** (operator-reported live: `nxc smb ... -M backup_operator` dumped SAM/SECURITY/
+  SYSTEM for a credential that wasn't a Domain Admin, which palantir never flagged or even
+  checked for): `backup_operator` (NetExec, mpgn_x64) abuses `SeBackupPrivilege` to dump local
+  secrets via RemoteRegistry without needing admin rights — nxc doesn't mark this `(Pwn3d!)`
+  since that only fires for actual local-admin-equivalent group membership, so the path was
+  invisible. The LDAP credentialed enum (`_creds_enum`) now also queries `--groups "Backup
+  Operators"` (same read-only mechanism already used for Domain/Enterprise Admins) and, when the
+  credential in hand is among the members, raises a `critica` finding. The module itself is
+  *never* run automatically: reading its real source shows it also attempts automatic
+  pass-the-hash against the DC and a full NTDS dump — genuine active exploitation, not a
+  read-only check like `smbghost`/`zerologon`, so (per the operator's own question — "¿esto
+  cuenta como auto-explotación? para ver si es OSCP-safe") it's left as a manual next-step only,
+  same treatment as Zerologon's real exploit.
+
 ## [2.0.5] - 2026-11-24
 
 ### Added

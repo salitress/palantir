@@ -8180,7 +8180,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # existe en el dominio raíz del bosque: en un dominio hijo nxc dice 'not found' y
             # _parse_nxc_group_members lo descarta (sin ruido).
             if is_dc:
-                for grp in ("Domain Admins", "Enterprise Admins"):
+                for grp in ("Domain Admins", "Enterprise Admins", "Backup Operators"):
                     rc, out = _run_capture_retry([nxc, "ldap", ip] + A() + ["--groups", grp], timeout=90, quiet=True)
                     members = _parse_nxc_group_members(out)
                     _step(res, f'{nxc} ldap {ip} {shown_auth} --groups {shlex.quote(grp)}', bool(members), mask(out),
@@ -8190,6 +8190,34 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                                   f"AD (cred {u}): '{grp}' — {len(members)} miembro(s): "
                                   + ", ".join(members[:15]) + (" …" if len(members) > 15 else ""),
                                   f"miembros {grp}", seen)
+                        # Backup Operators + SeBackupPrivilege (operator-asked: "¿este módulo cuenta
+                        # como auto-explotación? para ver si es OSCP-safe"): si la credencial APORTADA
+                        # está entre los miembros, hay una vía de privesc tan directa como un Pwn3d!
+                        # pero por un camino DISTINTO — nxc NO la marca Pwn3d!/admin_privs por esto
+                        # (eso exige grupo local Administrators o equivalente), así que sin este
+                        # chequeo pasaba inadvertida. El módulo 'backup_operator' de nxc (mpgn_x64,
+                        # netexec/nxc/modules/backup_operator.py — confirmado leyendo su código
+                        # fuente real) SÍ la explota solo: dispara RemoteRegistry, vuelca
+                        # SAM/SECURITY/SYSTEM a SYSVOL y ADEMÁS intenta pass-the-hash automático +
+                        # NTDS dump COMPLETO contra el DC — es explotación activa de verdad (no un
+                        # check de solo lectura como smbghost/zerologon), así que SÍ cuenta como
+                        # auto-explotación y NO es OSCP-safe lanzarlo solo: palantir NUNCA lo
+                        # ejecuta, se deja como next-step MANUAL (mismo trato que
+                        # cve-2020-1472-exploit.py para Zerologon).
+                        if grp == "Backup Operators" and any(m.lower() == u.lower() for m in members):
+                            _add_once(res, "critica",
+                                      f"AD (cred {u}): la credencial aportada es MIEMBRO de 'Backup Operators' — "
+                                      "SeBackupPrivilege permite volcar SAM/SECURITY/SYSTEM remotos sin ser admin "
+                                      "de dominio (nxc no lo marca Pwn3d! por esto, pero es una vía de privesc "
+                                      "tan directa como esa)",
+                                      f"backup_operator {u}", seen)
+                            _bo_shown_sec = ("-H " if is_hash else "-p ") + _sec_disp(secret)
+                            res["next"].append(
+                                f"nxc smb {ip} -u {shlex.quote(u)} {_bo_shown_sec} -M backup_operator   # confirmado "
+                                "MIEMBRO de 'Backup Operators' arriba — vuelca SAM/SECURITY/SYSTEM Y ADEMÁS intenta "
+                                "pass-the-hash automático + NTDS dump COMPLETO contra el DC (deja ficheros "
+                                "temporales en SYSVOL, el propio módulo intenta borrarlos al final) — paso ACTIVO "
+                                "de alto impacto, palantir nunca lo encadena solo")
                 # MachineAccountQuota: ¿cuántas cuentas de equipo puede unir al dominio ESTA
                 # cuenta (o cualquier otra, ya que es el valor del atributo del dominio, no por
                 # usuario)? MAQ>0 es la precondición de noPac/RBCD/Shadow Credentials — todos
@@ -13139,6 +13167,58 @@ def selftest():
     finally:
         globals()["run_capture"] = _real_rc_ce
     assert not any("PSO" in t or "SO obsoleto" in t for _s, t in _ceres3["findings"])
+
+    # Backup Operators + SeBackupPrivilege (operator-asked, caso real: zximena448 con 'nxc smb IP
+    # -u zximena448 -p internet -M backup_operator' volcó SAM/SECURITY/SYSTEM sin ser admin de
+    # dominio — palantir no lo detectaba). Si la credencial aportada está entre los miembros:
+    # hallazgo CRÍTICA + next-step MANUAL con '-M backup_operator'; nunca ejecutado por palantir
+    # (confirmado leyendo el código fuente real del módulo: intenta pass-the-hash + NTDS dump
+    # automático, es explotación activa, no un check de solo lectura).
+    def _fake_ce_bkop(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, ""
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "MachineAccountQuota: 10"
+        if "--groups" in cmd and cmd[-1] == "Backup Operators":
+            return 0, "LDAP 10.0.0.1 389 DC01 zximena448"
+        if "--groups" in cmd and cmd[-1] == "Domain Admins":
+            return 0, "LDAP 10.0.0.1 389 DC01 Administrator\nLDAP 10.0.0.1 389 DC01 admin"
+        if "--groups" in cmd and cmd[-1] == "Enterprise Admins":
+            return 0, "LDAP 10.0.0.1 389 DC01 Administrator"
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_bkop
+    _ceres_bkop = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_bkop, "FAKE_NXC", "ldap", "10.0.0.1", "zximena448", "internet", False, False, True,
+                   389, 389, None, domain="soupedecode.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert any(s == "critica" and "MIEMBRO de 'Backup Operators'" in t and "zximena448" in t
+               for s, t in _ceres_bkop["findings"]), _ceres_bkop["findings"]
+    assert any("nxc smb 10.0.0.1 -u zximena448 -p internet -M backup_operator" in n for n in _ceres_bkop["next"]), _ceres_bkop["next"]
+    # el finding genérico de membresía sigue saliendo igual (no lo pisa el nuevo)
+    assert any(s == "alta" and "'Backup Operators' — 1 miembro(s): zximena448" in t for s, t in _ceres_bkop["findings"]), _ceres_bkop["findings"]
+
+    # Si la credencial aportada NO está entre los miembros de Backup Operators (otro usuario sí lo
+    # está), NO debe salir el hallazgo crítico ni el next-step — solo el genérico de membresía.
+    def _fake_ce_bkop_other(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, ""
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "MachineAccountQuota: 10"
+        if "--groups" in cmd and cmd[-1] == "Backup Operators":
+            return 0, "LDAP 10.0.0.1 389 DC01 otrousuario"
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_bkop_other
+    _ceres_bkop2 = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_bkop2, "FAKE_NXC", "ldap", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   389, 389, None, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert not any("MIEMBRO de 'Backup Operators'" in t for _s, t in _ceres_bkop2["findings"]), _ceres_bkop2["findings"]
+    assert not any("backup_operator" in n for n in _ceres_bkop2["next"]), _ceres_bkop2["next"]
+    assert any(s == "alta" and "'Backup Operators' — 1 miembro(s): otrousuario" in t for s, t in _ceres_bkop2["findings"])
 
     # LDAP primero (_CREDS_PROTO_PRIORITY la pone antes que SMB): si YA sacó la lista COMPLETA
     # de usuarios del dominio, SMB se la ahorra (--users/--rid-brute, mucho más lentos contra un
