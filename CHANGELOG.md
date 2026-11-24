@@ -6,6 +6,63 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **SSH now gets the same post-auth enumeration SMB/LDAP already had — Linux was the weakest
+  covered area** (operator-prompted: audit real CTF/OSCP Linux privesc writeups and close the
+  gap). Confirmed by reading `creds_check`/`_reuse_chain`: a valid SSH credential (default
+  creds, a spray hit, or `-u`/`-p`) only ever produced a "credential válida" finding and
+  stopped — no `sudo -l`, no SUID/SGID, no capabilities, no cron — while the exact same moment
+  for SMB/LDAP already chains `--shares`/`--users`/`--pass-pol`/AS-REP/Kerberoast. New
+  `_ssh_post_enum`: ONE extra read-only SSH connection (via `sshpass`+`ssh`, never nxc's own ssh
+  module — it's paramiko-based and has a known, unfixed banner/reset bug, see
+  `_parse_nxc_bulk_successes`) that runs `id`/`groups`/`uname`/`sudo -l`/SUID+SGID find/
+  `getcap -r /`/crontab in one batched call. The password never touches the target's argv or
+  disk (SSH login via a 0600 temp file through `sshpass -f`; `sudo -l`'s own password goes over
+  the already-authenticated SSH stdin via `sudo -S`, never `echo`'d into the remote command).
+  Same stop-at-detection philosophy as the existing `backup_operator` check: a finding is only
+  ever a detected state + a manual GTFOBins/docker/lxd next-step — nothing here is executed on
+  the target. Flags: `docker`/`lxd`/`lxc` group membership (root-equivalent), `sudo -l` showing
+  `NOPASSWD: ALL` or `ALL` (password required, but it's the one we already have), specific
+  NOPASSWD binaries (common ones get an inline GTFOBins one-liner; the rest get the exact
+  GTFOBins page link), SUID/SGID binaries outside a stock-distro baseline, dangerous
+  capabilities (`cap_setuid`, `cap_sys_admin`, …), and non-empty root cron entries. Wired into
+  both the default-creds phase (`cc_ssh`) and the reuse/spray/explicit-creds phase (5d) — pass-
+  the-hash is skipped (SSH has no NTLM to replay).
+
+- **Kernel/sudo/polkit version checks over the same SSH connection, now that it's open anyway**
+  — `uname -r`/`sudo -V`/`pkexec --version` are read-only data nmap could never see (it's not
+  on the wire). Kernel version goes to `linux-exploit-suggester.sh -k <version>` run ENTIRELY
+  LOCALLY (never on the target — confirmed against its real source: `-k` skips package-list
+  collection and just matches a version string against its curated kernel-CVE database); sudo
+  and polkit versions go through the exact same offline `searchsploit` already used for
+  nmap-detected service versions (Fase 5b) — this is literally how Baron Samedit
+  (CVE-2021-3156) and PwnKit (CVE-2021-4034) surface in practice. Same rule as everywhere else:
+  a CVE match is a finding + a manual next-step (download/compile/verify by hand), nothing is
+  ever auto-exploited.
+
+- **Unconstrained delegation detection (AD)** — found this was referenced-but-unchecked while
+  auditing the existing ACL/pre2k/trusts LDAP queries: a non-DC computer with
+  `TRUSTED_FOR_DELEGATION` set lets anyone who authenticates against it (coerced via
+  PrinterBug/PetitPotam, which palantir already flags separately via the Spooler check) have
+  their TGT captured there — a well-known precondition chain across AD writeups of any
+  difficulty. New `_parse_unconstrained_delegation` + one more `ldapsearch` call alongside the
+  existing pre2k one (same authenticated bind, `(userAccountControl:1.2.840.113556.1.4.803:=
+  524288)`, DCs excluded via `primaryGroupID=516` since unconstrained delegation on a DC itself
+  is normal, not a finding) — read-only, flags the computer name(s), suggests `Rubeus.exe
+  monitor` as the manual follow-up.
+
+- **Shadow Credentials suggested alongside a plain password reset for ACL abuse on an account**
+  — research across several recent AD writeups (Certified/Logging/TombWatcher-style ACL-abuse
+  chains) confirms Shadow Credentials (`certipy shadow auto`, via `msDS-KeyCredentialLink`) is
+  now the more commonly used path, not just a plain `set password`: it's the ONLY option when
+  the high-value account is a gMSA/computer (its password is KDS-managed, can't be set via
+  LDAP) or has `Smart card is required` (breaks password auth, not PKINIT). Palantir already
+  detects GenericAll/GenericWrite/etc. on high-value accounts (`_surface_acl_abuse`) — this adds
+  the certipy alternative next to the existing bloodyAD one, same detected ACL, no new query.
+
 ## [2.1.2] - 2026-11-25
 
 ### Fixed

