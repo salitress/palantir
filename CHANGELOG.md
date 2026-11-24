@@ -10,6 +10,21 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **RDP CredSSP false-negative from nxc's aardwolf flagged, not silently dropped**
+  (operator-reported, confirmed against a real Windows Server 2016 lab with `xfreerdp`): nxc
+  doesn't use FreeRDP for RDP — it uses aardwolf, its own pure-Python RDP/CredSSP
+  reimplementation, considerably less mature than FreeRDP against "legacy" CredSSP/TLS
+  negotiation (Windows Server 2016 and older, or NLA disabled). The failure happens during the
+  CredSSP public-key verification step of the handshake, *before* the server ever checks the
+  password — so a correct credential (`wade:parzival`, confirmed valid by the lab itself and by a
+  real `xfreerdp` login) came back as `CredSSP - Server verification failed!`, while the same
+  credential with a wrong case (`Parzival`) correctly reached `STATUS_LOGON_FAILURE`. Both the
+  main one-shot `-u`/`-p`/`-H` credential path and the cross-protocol reuse loop
+  (`_reuse_chain`/retroalimentación) now recognize this specific error and add a `media` finding +
+  an `xfreerdp ... /cert-ignore` next-step to verify by hand, instead of treating it as a plain
+  invalid-credential result (which would silently drop a *valid* RDP credential from the
+  reuse pool).
+
 - **ffuf hits now generate a real finding**, not just a passive table row (operator-reported): a
   discovered route (e.g. a single non-trivial `/retro` on an otherwise bare site) used to only
   fill the "Fuzzing web/vhosts" table — invisible to Quick Wins / Hallazgos accionables. Each

@@ -2438,6 +2438,22 @@ def _nxc_login_ok(out):
     return _nxc_ok(out) and "(Guest)" not in out
 
 
+# nxc NO usa FreeRDP para RDP: usa aardwolf, su propia reimplementación de RDP/CredSSP en Python
+# puro, bastante menos madura que FreeRDP contra la negociación CredSSP/TLS "legacy" de Windows
+# Server 2016 y anteriores (o con NLA desactivada). El fallo ocurre en el paso de verificación de
+# clave pública del handshake CredSSP, ANTES de que el servidor llegue a comprobar la contraseña
+# — determinista por el error mostrado, pero NO fiable como señal de "credencial mala". Caso real
+# (operador): 'wade:parzival' (correcta, confirmada con xfreerdp y por el propio lab) dio este
+# error con nxc; la misma credencial en mayúscula (incorrecta) sí llegó a STATUS_LOGON_FAILURE.
+_RDP_CREDSSP_FAIL_RX = re.compile(r"CredSSP\b.*[Ss]erver verification failed", re.I)
+
+
+def _rdp_credssp_indeterminate(np, out):
+    """¿Esta salida de nxc es el fallo de verificación CredSSP de aardwolf, no un rechazo real de
+    la credencial? Solo aplica a RDP (otros protocolos no pasan por aardwolf). Puro → testeable."""
+    return np == "rdp" and bool(_RDP_CREDSSP_FAIL_RX.search(out or ""))
+
+
 def _nxc_has_data(out):
     """¿Una enumeración de nxc (--users/--rid-brute/--pass-pol/--groups…) devolvió DATOS
     de verdad, o solo el banner [*] y la línea de login [+]? Un '[+]' NO es un dato: un DC
@@ -9073,6 +9089,15 @@ def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enrich
                 cred_disp = f"{u}:{secret}" if secret else f"{u}:∅"   # botín descubierto → en claro
                 _step(res, shown, ok or pwn, safe_out,
                       note=f"RETROALIMENTACIÓN: credencial de «{u}» descubierta en otro servicio, reprobada por {np.upper()} (1 intento)")
+                if not (ok or pwn) and _rdp_credssp_indeterminate(np, safe_out):
+                    res["findings"].append(("media",
+                        f"RDP: nxc (CredSSP/aardwolf) no completó el handshake reprobando «{cred_disp}» por "
+                        "retroalimentación — 'CredSSP - Server verification failed' pasa ANTES de comprobar la "
+                        "contraseña (bug conocido de aardwolf contra RDP legacy: Windows Server 2016/2012 o NLA "
+                        "desactivada) — NO la des por inválida sin comprobarlo a mano."))
+                    res["next"].append(
+                        f"xfreerdp /v:{ip} /u:{u} {'/pth:' + _sec_disp(secret, True) if ch else '/p:' + _sec_disp(secret)} "
+                        "/cert-ignore   # verifica a mano: nxc (aardwolf) puede dar un falso negativo CredSSP contra RDP legacy")
                 if not (ok or pwn):
                     continue
                 progressed = True
@@ -9371,6 +9396,17 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             ok = _nxc_ok(out)
             _step(res, shown, ok, safe_out,
                   note=f"probar la credencial aportada «{masked_step}» por {np.upper()} ({'pass-the-hash' if is_hash else 'reutilización'}, 1 intento)")
+            if not ok and _rdp_credssp_indeterminate(np, out):
+                xf_auth = f"/pth:{_sec_disp(p, True)}" if is_hash else f"/p:{_sec_disp(p)}"
+                res["findings"].append(("media",
+                    f"RDP: nxc (CredSSP/aardwolf) no completó el handshake con «{masked}» — "
+                    "'CredSSP - Server verification failed' ocurre ANTES de que el servidor llegue a "
+                    "comprobar la contraseña (bug conocido de aardwolf, la reimplementación RDP en "
+                    "Python puro de nxc, contra CredSSP/TLS legacy: Windows Server 2016/2012 o NLA "
+                    "desactivada) — NO la des por inválida sin comprobarlo a mano."))
+                res["next"].append(
+                    f"xfreerdp /v:{ip} /u:{u} {xf_auth} /cert-ignore   # verifica a mano: nxc (aardwolf) "
+                    "puede dar un falso negativo CredSSP contra RDP legacy (FreeRDP sí lo maneja bien)")
             pwn = bool(re.search(r"\(Pwn3d!\)", out))
             tried.add((u, p, is_hash, np))
             if ok or pwn:   # credencial válida → al pool de retroalimentación
@@ -11832,6 +11868,39 @@ def selftest():
     assert _nxc_login_ok("SMB x 445 WIN [+] WIN\\u:p") is True
     assert _nxc_login_ok("SMB x 445 WIN [+] WIN\\u:p (Guest)") is False
     assert _nxc_login_ok("SMB x 445 WIN [-] WIN\\u:p STATUS_LOGON_FAILURE") is False
+    # _rdp_credssp_indeterminate: nxc usa aardwolf (reimplementación RDP/CredSSP en Python puro)
+    # para RDP, no FreeRDP — contra CredSSP/TLS legacy (Windows Server 2016/2012, NLA desactivada)
+    # falla verificando el servidor ANTES de comprobar la contraseña. Caso real: 'wade:parzival'
+    # (correcta, confirmada con xfreerdp) dio este error con nxc; NO es un rechazo de credencial.
+    assert _rdp_credssp_indeterminate("rdp", "RDP x 3389 X [-] CredSSP - Server verification failed!") is True
+    assert _rdp_credssp_indeterminate("rdp", "RDP x 3389 X [-] STATUS_LOGON_FAILURE") is False   # rechazo normal
+    assert _rdp_credssp_indeterminate("smb", "CredSSP - Server verification failed!") is False   # solo aplica a RDP
+    assert _rdp_credssp_indeterminate("rdp", "") is False
+    # provided_creds_check (1-a-1): el CredSSP de aardwolf por RDP genera un hallazgo 'media' +
+    # next-step de verificación manual con xfreerdp, en vez de descartar la credencial en silencio
+    # como si fuera un rechazo real (antes: ok=False y punto, sin ninguna señal distinta).
+    _real_nxc_bin_rdp, _real_rc_rdp = nxc_bin, run_capture
+    globals()["nxc_bin"] = lambda: "FAKE_NXC"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (
+        1, "RDP         10.0.0.1  3389   WIN         [-] WIN\\wade:parzival CredSSP - Server verification failed!")
+    try:
+        _rdp_res = provided_creds_check("10.0.0.1", [{"port": 3389, "name": "ms-wbt-server"}], [("wade", "parzival")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin_rdp, _real_rc_rdp
+    _rdp_fp = next(r for r in _rdp_res if r["proto"] == "reuse-rdp")
+    assert any(s == "media" and "CredSSP" in t and "aardwolf" in t for s, t in _rdp_fp["findings"])
+    assert any("xfreerdp" in n and "/u:wade" in n and "/p:parzival" in n for n in _rdp_fp["next"])
+    assert not any("credencial aportada válida" in t for _s, t in _rdp_fp["findings"])   # NUNCA se afirma válida sin confirmarlo
+    # un rechazo RDP normal (STATUS_LOGON_FAILURE) NO dispara el aviso de CredSSP
+    globals()["nxc_bin"] = lambda: "FAKE_NXC"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (
+        1, "RDP         10.0.0.1  3389   WIN         [-] WIN\\wade:Parzival STATUS_LOGON_FAILURE")
+    try:
+        _rdp_res2 = provided_creds_check("10.0.0.1", [{"port": 3389, "name": "ms-wbt-server"}], [("wade", "Parzival")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxc_bin_rdp, _real_rc_rdp
+    _rdp_fp2 = next(r for r in _rdp_res2 if r["proto"] == "reuse-rdp")
+    assert not any("CredSSP" in t for _s, t in _rdp_fp2["findings"])
     # #46: _cc_nxc — una credencial REAL por defecto mapeada a guest se anota como guest-mapping
     # (media), NO como 'credencial por defecto válida', y no cuenta como hit.
     globals()["run_capture"] = lambda *a, **kw: (0, "SMB 10.0.0.1 445 WIN [+] WIN\\administrator:Password123 (Guest)")
