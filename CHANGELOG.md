@@ -6,6 +6,21 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Three more privileged-group memberships now flag a critical finding, each tied to the right
+  evidence** (operator-asked: "toda detección posible que la haga palantir", same pattern as
+  Backup Operators): `_creds_enum`'s LDAP group check now also covers `Server Operators` (default
+  ACLs on `HKLM\SYSTEM\CurrentControlSet\Services\*` let it reconfigure an existing service's
+  binary and start it as SYSTEM — a manual `impacket-services` config/change/start/restore
+  sequence is suggested, bound to the finding with `_attach_cmd` so Quick Wins can't attach an
+  unrelated command), `Print Operators` (`SeLoadDriverPrivilege` — loading a vulnerable signed
+  kernel driver; no reliable single Linux command exists for this, so the finding names the real
+  technique instead of inventing one) and `DnsAdmins` (`ServerLevelPluginDll` against the DC's DNS
+  service — needs `dnscmd.exe`/RSAT, same story: no Linux one-liner, named honestly as such).
+
 ## [2.0.6] - 2026-11-24
 
 ### Added
