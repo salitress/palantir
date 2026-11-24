@@ -10,32 +10,80 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **LFI confirmado a partir de parámetros vistos DENTRO de un .js** (`--crawl`, operator-reported
-  against a real THM box): katana (`-jc`) no ejecuta JavaScript, así que un string literal como
-  `n.p="http://host/index.php?referer="` (base de una URL construida en runtime, p. ej. para un
-  tracking pixel) nunca se visita por sí solo como URL en el crawling — antes solo era visible
-  leyendo el `.js` a mano. Ahora, para cada `.js` ya descargado (reutilizando el mismo `_http_get`
-  que saca emails/comentarios HTML), se extraen los pares `(script, parámetro)` referenciados y se
-  prueba cada uno con un GET de solo lectura (ruta absoluta `/etc/passwd` y, si no, un traversal
-  relativo clásico), exigiendo la firma REAL de `/etc/passwd` en la respuesta antes de dar nada por
-  confirmado (nunca un simple 200). Si el `.js` cita un host de TERCEROS (un CDN, un tracker...), el
-  host se descarta y solo se prueba la ruta contra el objetivo que se está escaneando — nunca un
-  dominio ajeno solo porque aparezca citado dentro del JS. Acotado a 20 candidatos.
+- **ffuf hits now generate a real finding**, not just a passive table row (operator-reported): a
+  discovered route (e.g. a single non-trivial `/retro` on an otherwise bare site) used to only
+  fill the "Fuzzing web/vhosts" table — invisible to Quick Wins / Hallazgos accionables. Each
+  fuzzed port now gets an `info` summary (count + top-5 by response size) plus a `media` finding
+  for any hit that looks sensitive (`.git`, `.env`, `backup`, `/api/`, `admin`, `config`, `.sql`,
+  `.bak` — same regex katana's crawling already used for its own URLs, now shared as
+  `_SENSITIVE_PATH_RX`).
 
-- The provided credential/hash now shows **in clear** by default in the report's command previews
-  (so they're copy-pasteable straight away) — `--hide-secrets` (`--hide-passwords`) masks it with
-  `***` instead, for when the report (terminal + HTML/MD/JSON) is going to be shared. Valid-credential
-  **findings** and **Quick Wins** always show the discovered credential in clear regardless (it's loot,
-  not your input) — `--hide-secrets` never touches those. Routed through four helpers (`_sec_disp`,
-  `_cred_note`, `_url_sec`, `_env_pw_note`) so every site — `nxc -p/-H`, `bloodyAD`, `secretsdump`,
-  `impacket-mssqlclient`, Kerberoast/AS-REP (`GetUserSPNs`/`GetNPUsers`), `dacledit`,
-  `kerbrute passwordspray`, and the `MYSQL_PWD`/`PGPASSWORD`/`REDISCLI_AUTH`/`IPMI_PASSWORD` env-var
-  notes — behaves consistently.
+- **TFTP: actually runs `nmap --script tftp-enum`** (operator-reported): TFTP has no directory
+  listing, so without a known filename there was nothing to read blind — the footprint used to
+  just shrug with a manual placeholder suggestion. `tftp-enum` solves exactly that (tries a list of
+  common router/PXE/VoIP filenames + Cisco's `A.B.C.X-confg` variants) and was never wired in
+  anywhere: the generic UDP sweep is deliberately script-less for speed, and the TCP-focused
+  NSE deep/vuln scans don't cover UDP 69. Now run as its own bounded, read-only step (like
+  `fp_oracle`'s `tnscmd10g` call); any files found become an `alta` finding with a `tftp -c get
+  <file>` next-step per file.
 
-- `--help` now groups its ~60 flags into labelled sections (target/output, web fuzzing, domain/AD/DNS,
-  user enumeration & spraying, scanning, credentials, SMB spidering, tools/preflight, slow opt-in
-  phases, report/tests) via `argparse` argument groups, instead of one long undifferentiated wall of
-  text.
+### Fixed
+
+- **A CSS-hiding HTML comment was flagged as a suspicious comment** (operator-reported): the
+  classic `<style><!-- selector { prop: value; } --></style>` trick (hiding CSS from ancient
+  browsers) produces a real HTML comment whose content is just CSS — zero security value, pure
+  noise, and in one real case it was ranked as Quick Win #1 ahead of actual findings. A comment
+  containing at least one complete CSS rule (`{ prop: value; }`) is now excluded from the
+  email/comment extraction used by katana's crawling.
+
+## [2.0.3] - 2026-11-23
+
+### Added
+
+- **LFI confirmed from parameters referenced INSIDE a `.js`** (`--crawl`, operator-reported
+  against a real THM box): katana (`-jc`) doesn't execute JavaScript, so a string literal like
+  `n.p="http://host/index.php?referer="` (the base of a URL built at runtime, e.g. for a tracking
+  pixel) never gets visited by itself as a crawled URL — before, it was only visible by reading the
+  `.js` by hand. Now, for every `.js` already downloaded (reusing the same `_http_get` call that
+  pulls emails/HTML comments), the `(script, parameter)` pairs it references are extracted and each
+  is tried with a read-only GET (absolute `/etc/passwd` first, then a classic relative traversal),
+  requiring the REAL `/etc/passwd` signature in the response before confirming anything (never just
+  a 200). If the `.js` cites a THIRD-PARTY host (a CDN, a tracker...), the host is discarded and
+  only the path is tried against the target actually being scanned — never someone else's domain.
+  Capped at 20 candidates.
+
+## [2.0.2] - 2026-11-23
+
+### Changed
+
+- **Inverts `--show-password`/`--show-secrets`** (added yesterday in 2.0.1): the credential/hash
+  you supply now shows **in clear by default** in the report's command previews (ready to
+  copy-paste — it's your own pentest credential, not someone else's secret). The new flag is
+  **`--hide-secrets`** (alias `--hide-passwords`): masks with `***` when the report (terminal +
+  HTML/MD/JSON) is going to be shared. Valid-credential **findings** and **Quick Wins** always show
+  the discovered credential in clear regardless (it's loot, not your input) — `--hide-secrets`
+  never touches those.
+
+### Improved
+
+- **`--help` now groups its ~60 flags into labelled sections** (target/output, web fuzzing,
+  domain/AD/DNS, user enumeration & spraying, scanning, credentials, SMB spidering, tools/preflight,
+  slow opt-in phases, report/tests) via `argparse` argument groups, instead of one long
+  undifferentiated wall of text.
+
+## [2.0.1] - 2026-11-22
+
+### Added
+
+- `--show-password` (`--show-secrets`): shows the **real** provided credential/hash in the report's
+  command previews (so they're copy-pasteable) instead of masking it with `***`. Default stays masked
+  — the report (terminal + HTML/MD/JSON) is shareable and shouldn't carry your credentials in clear by
+  default. Valid-credential **findings** and **Quick Wins** already show the discovered credential in
+  clear regardless (it's loot, not your input); this flag only controls the command previews that echo
+  the secret **you** supplied. Routed through four helpers (`_sec_disp`, `_cred_note`, `_url_sec`,
+  `_env_pw_note`) so every site — `nxc -p/-H`, `bloodyAD`, `secretsdump`, `impacket-mssqlclient`,
+  Kerberoast/AS-REP (`GetUserSPNs`/`GetNPUsers`), `dacledit`, `kerbrute passwordspray`, and the
+  `MYSQL_PWD`/`PGPASSWORD`/`REDISCLI_AUTH`/`IPMI_PASSWORD` env-var notes — behaves consistently.
 
 ### Fixed
 

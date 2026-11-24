@@ -1536,6 +1536,34 @@ def fuzz_dirs(ip, p, wordlists, ext, webdir, stealth=False, proxy=None, hostname
     return list(hits.values())
 
 
+# Compartida con el bloque de katana (fp_web_slow): una ruta/URL con pinta de admin/backup/
+# API/control de versiones vale la pena mirarla primero, tanto si la encontró el crawling real
+# como el diccionario de ffuf.
+_SENSITIVE_PATH_RX = re.compile(r"(?i)(\.git|\.env\b|backup|/api/|admin|config|\.sql\b|\.bak\b)")
+
+
+def _ffuf_hit_findings(port, hits, max_list=5):
+    """Hallazgos a partir de los hits de ffuf de un puerto: antes solo se enseñaban en la tabla
+    pasiva de 'Fuzzing web/vhosts' del informe (sin severidad, invisible para Quick Wins /
+    Hallazgos accionables) — caso real: ffuf encontró '/retro' (única ruta no trivial del sitio
+    entero) y el informe no lo destacaba en ningún sitio por el que se empieza a mirar. Un 'info'
+    resumen (como ya hace katana con sus URLs) + un 'media' aparte si alguna ruta tiene pinta
+    sensible (mismo criterio que katana: _SENSITIVE_PATH_RX). Puro, testeable sin red. [] sin hits."""
+    if not hits:
+        return []
+    out = []
+    top = sorted(hits, key=lambda h: -(h.get("length") or 0))[:max_list]
+    paths_s = ", ".join(f"/{h['path']} ({h['status']})" for h in top)
+    out.append(("info", f"ffuf {port}: {len(hits)} ruta(s)/fichero(s) descubiertos por diccionario — {paths_s}"
+                         + (" …" if len(hits) > max_list else "")))
+    interesting = [h for h in hits if _SENSITIVE_PATH_RX.search(h.get("path") or "")]
+    if interesting:
+        int_s = ", ".join(f"/{h['path']}" for h in interesting[:max_list])
+        out.append(("media", f"ffuf {port}: {len(interesting)} ruta(s) con pinta interesante — {int_s}"
+                             + (" …" if len(interesting) > max_list else "")))
+    return out
+
+
 def _vhost_sig(ip, p, host, max_bytes=65536):
     """Firma (status, len, muestra) de la respuesta web para un `Host` dado. Distingue
     un vhost real del catch-all/comodín (responde IGUAL a cualquier Host). Comparable
@@ -3896,6 +3924,47 @@ def fp_oracle(ip, ports, services, host, deep):
     return res
 
 
+def _parse_tftp_enum(out):
+    """Ficheros encontrados por el NSE tftp-enum (UDP 69). Formato real (doc del propio script,
+    nmap/scripts/tftp-enum.nse): tras la cabecera '| tftp-enum:', una línea por fichero hallado,
+    indentada 2 espacios, con '|' en las intermedias y '|_' en la última:
+        | tftp-enum:
+        |   bootrom.ld
+        |_  pxelinux.0
+    Puro, testeable sin red. [] si no hay bloque 'tftp-enum' o no encontró nada."""
+    m = re.search(r"\|\s*tftp-enum:\s*\n((?:\|.*\n?)*)", out or "")
+    if not m:
+        return []
+    return [mm.group(1).strip() for ln in m.group(1).splitlines()
+            if (mm := re.match(r"^\|_?\s+(\S.*)$", ln))]
+
+
+def fp_tftp(ip, ports, services, host, deep):
+    """TFTP no tiene listado de directorio — sin un nombre de fichero conocido no hay nada que
+    leer a ciegas con un GET suelto. El NSE tftp-enum resuelve justo ese problema: prueba una
+    lista de nombres comunes (routers/PXE/VoIP: bootrom.ld, pxelinux.0...) MÁS las variantes
+    Cisco 'A.B.C.X-confg' (X de 0 a 255) para la IP del objetivo — nunca lo lanzaba nadie aquí
+    porque el barrido UDP genérico es deliberadamente sin --script (rápido, para TODOS los
+    puertos UDP a la vez) y la Fase 2/2b de scripts NSE solo cubre TCP. Se lanza aparte, acotado,
+    solo lectura (ningún fichero se escribe en el objetivo, solo se intenta un GET de cada uno)."""
+    res = fp_generic("tftp", "TFTP", ip, ports, services, host, ("tftp",), [])
+    cmd = ["nmap", "-sU", "-Pn", "-n", "-p", "69", "--script", "tftp-enum", ip]
+    rc, out = run_capture(cmd, timeout=180, quiet=True)
+    found = _parse_tftp_enum(out)
+    _step(res, shlex.join(cmd), bool(found), out,
+          note="tftp-enum: nombres de fichero comunes (routers/PXE/VoIP) + 'A.B.C.X-confg' de Cisco — TFTP no tiene listado de directorio")
+    if found:
+        res["findings"].append(("alta",
+            f"TFTP: {len(found)} fichero(s) encontrado(s) por nombre común — " +
+            ", ".join(found[:10]) + (" …" if len(found) > 10 else "")))
+        for f in found[:10]:
+            res["next"].append(f"tftp {ip} -c get {f}")
+    else:
+        res["next"].append(
+            f"tftp {ip} -c get <fichero>   # tftp-enum no encontró nada por nombre común; sin un nombre conocido hay poco más que leer a ciegas")
+    return res
+
+
 def fp_ldap(ip, ports, services, host, deep, base=None):
     """LDAP: prueba bind con credenciales por defecto (null → guest → Administrator,
     sin contraseña). Un bind que entre suele volcar usuarios, grupos y política del
@@ -4441,6 +4510,13 @@ def _parse_creds_search(out):
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 _HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.S)
+# El truco clásico de ocultar CSS de navegadores viejísimos ('<style><!-- selector {
+# prop:valor; } --></style>') deja un comentario HTML "de verdad" cuyo contenido es solo
+# CSS — cero valor de seguridad (no es un TODO/credencial/nota de desarrollador). Sin
+# filtrarlo, cualquier web con ese patrón generaba un hallazgo 'alta' de puro ruido (caso
+# real: 'body { color:#000000; ... } #container { ... }' marcado como comentario HTML
+# sospechoso, encima elegido como Quick Win #1 por delante de hallazgos de verdad).
+_CSS_RULE_RX = re.compile(r"\{[^{}]*:[^{}]*;[^{}]*\}")
 
 
 def _extract_emails_comments(body):
@@ -4448,9 +4524,11 @@ def _extract_emails_comments(body):
     ReconSpider (Scrapy, del módulo Crawling de HTB Academy) separa en 'emails'/
     'comments' de su results.json — aquí sin esa dependencia, con dos regex sobre
     el body que ya trae `_http_get`. `re.S` para que el comentario cace aunque
-    ocupe varias líneas."""
+    ocupe varias líneas. Un comentario que es solo CSS (ver _CSS_RULE_RX) se descarta:
+    no aporta nada de seguridad y genera falsos positivos 'alta' de pura plantilla vieja."""
     emails = sorted(set(_EMAIL_RE.findall(body or "")))
     comments = [c.strip() for c in _HTML_COMMENT_RE.findall(body or "") if c.strip()]
+    comments = [c for c in comments if not _CSS_RULE_RX.search(c)]
     return emails, comments
 
 
@@ -5007,7 +5085,7 @@ def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
             if crawled["urls"]:
                 js = sum(1 for u in crawled["urls"] if u.split("?")[0].endswith(".js"))
                 res["findings"].append(("info", f"Katana {port}: {len(crawled['urls'])} URL(s)/endpoint(s) reales descubiertos ({js} .js) — ver detalle en los pasos"))
-                sensitive = [u for u in crawled["urls"] if re.search(r"(?i)(\.git|\.env\b|backup|/api/|admin|config|\.sql\b|\.bak\b)", u)]
+                sensitive = [u for u in crawled["urls"] if _SENSITIVE_PATH_RX.search(u)]
                 if sensitive:
                     res["findings"].append(("media", f"Katana {port}: {len(sensitive)} URL(s) con pinta interesante — {', '.join(sensitive[:5])}"))
                 if crawled["forms"]:
@@ -5829,9 +5907,7 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
             elif proto == "gitdaemon":
                 out.append(fp_gitdaemon(ip, ports, services, host, deep))
             elif proto == "tftp":
-                out.append(fp_generic("tftp", "TFTP", ip, ports, services, host, ("tftp",), [
-                    f"tftp {ip} -c get <fichero>   # sin nombre conocido hay poco que leer a ciegas",
-                ]))
+                out.append(fp_tftp(ip, ports, services, host, deep))
             elif proto == "ntp":
                 out.append(fp_generic("ntp", "NTP", ip, ports, services, host, ("ntp",), [
                     f"ntpq -c readvar {ip}   # versión/stratum (monlist queda fuera: es vector de amplificación)",
@@ -11172,6 +11248,21 @@ def selftest():
         globals()["run"], globals()["TUNNEL"] = _real_run_ff, _real_tunnel_ff
     assert _ff_cmd["cmd"][_ff_cmd["cmd"].index("-t") + 1] == "8", _ff_cmd["cmd"]
     assert "40" not in _ff_cmd["cmd"], _ff_cmd["cmd"]
+    # _ffuf_hit_findings: antes los hits de ffuf solo rellenaban la tabla pasiva de 'Fuzzing
+    # web/vhosts' (sin severidad, invisible en Quick Wins/Hallazgos accionables) — caso real:
+    # ffuf encontró '/retro' (la única ruta no trivial de todo el sitio) y no se destacaba en
+    # ningún sitio por el que se empieza a mirar. Ahora sale como hallazgo 'info' (+'media' si
+    # alguna ruta tiene pinta sensible).
+    assert _ffuf_hit_findings(80, []) == []
+    _ffh = _ffuf_hit_findings(80, [{"path": "retro", "status": 301, "length": 154}])
+    assert _ffh == [("info", "ffuf 80: 1 ruta(s)/fichero(s) descubiertos por diccionario — /retro (301)")]
+    _ffh2 = _ffuf_hit_findings(80, [
+        {"path": "images", "status": 200, "length": 500},
+        {"path": "admin", "status": 200, "length": 300},
+        {"path": ".git/HEAD", "status": 200, "length": 23},
+    ])
+    assert _ffh2[0][0] == "info" and "3 ruta(s)/fichero(s)" in _ffh2[0][1]
+    assert _ffh2[1] == ("media", "ffuf 80: 2 ruta(s) con pinta interesante — /admin, /.git/HEAD")
     # detección de IIS para el mini-recon web
     assert _is_iis(fake(product="Microsoft IIS httpd", version="10.0"))
     assert _is_iis(fake(name="http", **{"http-headers": "X-Powered-By: ASP.NET"}))
@@ -11180,6 +11271,41 @@ def selftest():
     assert not _is_iis(fake(product="Microsoft HTTPAPI httpd", version="2.0"))  # HTTPAPI NO es IIS
     nse = _nse_for(ports, host, ("smb", "nbstat"))
     assert any("smb-enum-shares" in lbl for lbl, _ in nse)
+
+    # tftp-enum: TFTP no tiene listado de directorio, así que sin nombre conocido no había nada
+    # que leer a ciegas — el NSE tftp-enum resuelve justo eso probando una lista de nombres
+    # comunes, y antes nadie lo lanzaba (el barrido UDP genérico va deliberadamente sin --script).
+    # Formato real documentado en el propio script (nmap/scripts/tftp-enum.nse, @output).
+    assert _parse_tftp_enum(
+        "PORT   STATE SERVICE REASON\n69/udp open  tftp    script-set\n"
+        "| tftp-enum:\n|   bootrom.ld\n|_  pxelinux.0\n"
+    ) == ["bootrom.ld", "pxelinux.0"]
+    assert _parse_tftp_enum("69/udp open  tftp    script-set\n") == []   # sin bloque tftp-enum
+    assert _parse_tftp_enum("") == []
+    _real_rc_tftp = run_capture
+    _tftp_cmds = []
+
+    def _fake_tftp_rc(cmd, timeout=None, quiet=False, **kw):
+        _tftp_cmds.append(cmd)
+        return 0, "| tftp-enum:\n|   bootrom.ld\n|_  pxelinux.0\n"
+
+    globals()["run_capture"] = _fake_tftp_rc
+    try:
+        _tftp_fp = fp_tftp("10.0.0.1", [{"port": 69, "state": "open"}], [], {}, False)
+    finally:
+        globals()["run_capture"] = _real_rc_tftp
+    assert _tftp_cmds == [["nmap", "-sU", "-Pn", "-n", "-p", "69", "--script", "tftp-enum", "10.0.0.1"]]
+    assert any(s == "alta" and "bootrom.ld" in t and "pxelinux.0" in t for s, t in _tftp_fp["findings"])
+    assert "tftp 10.0.0.1 -c get bootrom.ld" in _tftp_fp["next"]
+    assert "tftp 10.0.0.1 -c get pxelinux.0" in _tftp_fp["next"]
+    # sin ningún fichero encontrado → sin hallazgo, sugerencia manual (no afirma nada que no sepa)
+    globals()["run_capture"] = lambda cmd, timeout=None, quiet=False, **kw: (0, "69/udp open  tftp    script-set\n")
+    try:
+        _tftp_fp2 = fp_tftp("10.0.0.1", [{"port": 69, "state": "open"}], [], {}, False)
+    finally:
+        globals()["run_capture"] = _real_rc_tftp
+    assert _tftp_fp2["findings"] == []
+    assert any("tftp-enum no encontró nada" in n for n in _tftp_fp2["next"])
 
     # Nuevos protocolos + motor de credenciales por defecto (Fase 5c), sin tocar la red
     assert classify(fake(name="postgresql", port=5432)) == "postgres"
@@ -14509,6 +14635,16 @@ def selftest():
     assert _extract_emails_comments("<!--\n  multilinea\n  de verdad\n-->")[1] == ["multilinea\n  de verdad"]
     assert _extract_emails_comments("sin nada de esto") == ([], [])
     assert _extract_emails_comments("a@b.com y a@b.com repetido")[0] == ["a@b.com"]  # dedup
+    # Caso real: el truco de ocultar CSS de navegadores viejos en un comentario HTML
+    # ('<style><!-- selector { prop:valor; } --></style>') NO debe contar como comentario
+    # sospechoso — cero valor de seguridad, puro ruido 'alta' (y encima ganaba el Quick Win #1).
+    assert _extract_emails_comments(
+        "<!-- body { color:#000000; background-color:#0072C6; margin:0; } "
+        "#container { margin-left:auto; margin-right:auto; text-align:center; } -->"
+    )[1] == []
+    # un comentario normal que MENCIONA llaves sin ser una regla CSS completa sigue contando
+    assert _extract_emails_comments("<!-- TODO: fix the {placeholder} before prod -->")[1] == \
+        ["TODO: fix the {placeholder} before prod"]
     # --crawl: parámetros (script, param) vistos DENTRO de un .js — katana (-jc) no ejecuta JS,
     # así que un string literal como 'index.php?referer=' (base de una URL de tracking construida
     # en runtime) nunca se visita por sí solo como URL en el crawling. Caso real: exactamente este
@@ -17507,6 +17643,11 @@ def run_one(ip, name, args, folder=None):
                 # Un puerto web = una tarea. El lock protege web_hits + el refresco del
                 # informe en vivo cuando varios puertos se fuzzean a la vez (ver abajo).
                 fuzz_lock = threading.Lock()
+                # Hallazgos de ffuf → el footprint 'web' de CADA puerto (mismo lookup que ya usa
+                # footprint_web_slow para katana/nikto/nuclei), para que entren en Quick Wins/
+                # Hallazgos accionables igual que cualquier otro hallazgo — antes ffuf solo
+                # rellenaba la tabla pasiva de 'Fuzzing web/vhosts', invisible ahí.
+                by_port_web = {fpr["ports"][0]: fpr for fpr in footprints if fpr["proto"] == "web"}
 
                 def _fuzz_one_port(p):
                     e = ext if ext is not None else guess_extensions(p, whatweb_cache.get(p["port"], ""))
@@ -17515,6 +17656,9 @@ def run_one(ip, name, args, folder=None):
                                       hostname=extra_dom)
                     with fuzz_lock:                      # salida + web_hits + informe, atómico por puerto
                         web_hits[p["port"]] = hits
+                        wfpr = by_port_web.get(p["port"])
+                        if wfpr is not None:
+                            wfpr["findings"].extend(_ffuf_hit_findings(p["port"], hits))
                         _write_report(preliminary=True, quiet=True)   # informe en vivo: crece con cada puerto
                         info(f"{tag} — {sanitize(version_str(p)) or p['name'] or '?'}  (-e {e})")
                         if hits:
