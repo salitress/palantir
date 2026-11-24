@@ -25,6 +25,40 @@ this project follows [Semantic Versioning](https://semver.org/).
   cuenta como auto-explotación? para ver si es OSCP-safe") it's left as a manual next-step only,
   same treatment as Zerologon's real exploit.
 
+- **Pass-the-hash now fills in a real shell command, not just the Pwn3d! finding**
+  (operator-reported, live run: Administrator confirmed admin by LDAP/SMB/WinRM/WMI via `-H`
+  after a backup_operator→DCSync chain, but the report gave zero connect commands — no
+  evil-winrm, no wmiexec, no xfreerdp): `_stash_valid_cred` discarded *any* hash credential
+  outright, because the existing `USER`/`PASS` next-step templates don't support `-H`. Added a
+  parallel hash-only stash and matching templates (`-u USER -H HASH` for evil-winrm/`nxc smb -x`,
+  `/u:USER /pth:HASH` for xfreerdp, `-hashes :HASH DOMINIO/USER@` for impacket-wmiexec — the only
+  one with the hash and the identity in separate parts of the command) so a pass-the-hash
+  credential gets the same auto-filled, copy-pasteable shell command a password one already did.
+
+### Fixed
+
+- **A corrupted credential could snowball into dozens of duplicate Quick Wins** (operator-reported,
+  live run: Quick Wins filled with near-identical entries like `Administrator:HASH:(Pwn3d!)`,
+  `...:(Pwn3d!):STATUS_LOGON_FAILURE`, `...:STATUS_LOGON_FAILURE:STATUS_LOGON_FAILURE`, growing
+  one token longer each time): `_parse_lsassy`'s credential regex didn't distinguish nxc's own
+  connection banner line (always printed first, `[+] domain\user:hash (Pwn3d!)` or, on failure,
+  `[-] domain\user:secret STATUS_LOGON_FAILURE`) from a genuine lsassy-module credential line
+  (which never carries a `[...]` marker — confirmed against nxc's real source,
+  `print_credentials()` uses `context.log.highlight()`, no status prefix). Against the banner
+  line, the regex read `Administrator:HASH` as "user" and `(Pwn3d!)` as "secret" — that garbage
+  went into the credential-reuse pool, `_reuse_chain` retried it (failing, correctly), nxc printed
+  *another* banner carrying that same corrupted identity, and the next parse pass read it as yet
+  another "new" credential, appending one more status token each round. Fixed by skipping any
+  `[...]`-prefixed line before attempting the credential match; hardened `_parse_nxc_lsa`'s
+  equivalent (but narrower) guard the same way.
+
+- **Quick Wins header count never matched what was actually shown, with no explanation** (same
+  report: "pone que había 32 quick wins pero salen menos" — mostly an artifact of the bug above
+  inflating the real count, but the underlying mismatch is real on its own): all three renderers
+  cap the Quick Wins list (12 in terminal/HTML, 15 in Markdown) but the header always showed the
+  *untruncated* total, and only the terminal view said anything about the difference. HTML and
+  Markdown now add the same "… y N más" notice the terminal already had.
+
 ## [2.0.5] - 2026-11-24
 
 ### Added
