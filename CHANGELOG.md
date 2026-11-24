@@ -29,6 +29,15 @@ this project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`--resume` always re-ran ffuf in full** (operator-reported): directory/vhost fuzzing (up to
+  600s per wordlist) was the one thing in the entire `--resume` path that never reused anything —
+  every nmap scan, the footprint, searchsploit and default-creds were all skipped on an unchanged
+  target, but ffuf always ran from scratch. Directory fuzzing (`fuzz_dirs`, used by both Fase 6 and
+  the per-vhost Fase 7b) now reuses the `.json` from a previous run for the same port+wordlist, same
+  criterion as nmap's XML reuse (a corrupt/truncated file still re-runs). Deliberately *not* applied
+  to `fuzz_vhost`: it retries with `-fs` when the first attempt (`-ac`) returns `[]` (a catch-all
+  that filtered everything), and caching that `[]` would have eaten the retry.
+
 - **A CSS-hiding HTML comment was flagged as a suspicious comment** (operator-reported): the
   classic `<style><!-- selector { prop: value; } --></style>` trick (hiding CSS from ancient
   browsers) produces a real HTML comment whose content is just CSS — zero security value, pure

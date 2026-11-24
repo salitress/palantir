@@ -1478,6 +1478,19 @@ _STEALTH_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
 
+def _parse_ffuf_json(text):
+    """La lista 'results' de un JSON de ffuf ya en memoria, o None si no es JSON válido o no
+    trae 'results' como lista (fichero corrupto/truncado, o de una versión muy vieja de ffuf).
+    Puro, testeable sin disco — usado tanto para leer la salida recién generada como, con
+    --resume, un fichero .json de un run anterior (ver fuzz_dirs)."""
+    try:
+        d = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    r = d.get("results")
+    return r if isinstance(r, list) else None
+
+
 def run_ffuf(url, wordlist, outfile, scheme, extra, stealth=False, proxy=None, fs=None):
     """Lanza ffuf con salida JSON y devuelve la lista de results (o []).
     `fs`: si se da, filtra por tamaño exacto (`-fs <fs>`) en vez de autocalibrar (`-ac`)
@@ -1502,8 +1515,8 @@ def run_ffuf(url, wordlist, outfile, scheme, extra, stealth=False, proxy=None, f
         cmd.append("-k")
     run(cmd, timeout=2100 if (stealth or TUNNEL) else 900, outfile=outfile, quiet_stdout=True)
     try:
-        return json.loads(Path(outfile).read_text()).get("results", [])
-    except (OSError, json.JSONDecodeError):
+        return _parse_ffuf_json(Path(outfile).read_text()) or []
+    except OSError:
         return []
 
 
@@ -1522,7 +1535,23 @@ def fuzz_dirs(ip, p, wordlists, ext, webdir, stealth=False, proxy=None, hostname
     hits = {}
     for wl in wordlists:
         outfile = webdir / f"ffuf_{p['port']}_{otag}_{Path(wl).stem}.json"
-        for r in run_ffuf(url, wl, outfile, scheme, extra, stealth=stealth, proxy=proxy):
+        # --resume: ffuf es la fase más lenta de todo el run (hasta 600s POR wordlist) y antes
+        # se relanzaba SIEMPRE entera, sin importar que el .json de un run anterior para este
+        # MISMO puerto/wordlist ya existiera — el único sitio de todo --resume que no reutilizaba
+        # nada (reportado en vivo). Mismo criterio que _nmap_run con los XML: solo se reutiliza si
+        # el fichero existe Y parsea de verdad; uno corrupto/truncado relanza ffuf de cero. Solo
+        # aquí (fuzz_dirs), NO en fuzz_vhost: ese reintenta con -fs si el primer intento (-ac) dio
+        # [] (comodín que filtró TODO) — cachear un [] ahí se comería ese reintento.
+        cached = None
+        if RESUME and outfile.is_file():
+            try:
+                cached = _parse_ffuf_json(outfile.read_text())
+            except OSError:
+                cached = None
+            if cached is not None:
+                print(f"{C_GREY}    $ [--resume] reutilizo el ffuf existente: {outfile}{C_RESET}", flush=True)
+        results = cached if cached is not None else run_ffuf(url, wl, outfile, scheme, extra, stealth=stealth, proxy=proxy)
+        for r in results:
             path = r.get("input", {}).get("FUZZ")
             if path is None:
                 continue
@@ -11248,6 +11277,47 @@ def selftest():
         globals()["run"], globals()["TUNNEL"] = _real_run_ff, _real_tunnel_ff
     assert _ff_cmd["cmd"][_ff_cmd["cmd"].index("-t") + 1] == "8", _ff_cmd["cmd"]
     assert "40" not in _ff_cmd["cmd"], _ff_cmd["cmd"]
+    # --resume: ffuf reutiliza el .json de un run anterior para el MISMO puerto/wordlist — antes
+    # era lo ÚNICO de --resume que SIEMPRE se relanzaba entero, aunque nada hubiera cambiado
+    # (reportado en vivo: hasta 600s por wordlist tirados). Mismo criterio que los XML de nmap.
+    assert _parse_ffuf_json('{"results": [{"input": {"FUZZ": "admin"}, "status": 200, "length": 10}]}') == \
+        [{"input": {"FUZZ": "admin"}, "status": 200, "length": 10}]
+    assert _parse_ffuf_json("no es json") is None
+    assert _parse_ffuf_json('{"sin_results": true}') is None
+    _fd_dir = Path(tempfile.mkdtemp())
+    _fd_wl = _fd_dir / "miwordlist.txt"
+    _fd_wl.write_text("admin\n")
+    _fd_cached = _fd_dir / "ffuf_80_root_miwordlist.json"
+    _fd_cached.write_text(json.dumps({"results": [{"input": {"FUZZ": "admin"}, "status": 200, "length": 123}]}))
+    _real_run_ffuf, _rf_calls = run_ffuf, []
+    globals()["run_ffuf"] = lambda *a, **kw: (_rf_calls.append(a), [])[1]
+    globals()["RESUME"] = True
+    try:
+        _fd_hits = fuzz_dirs("10.0.0.1", {"port": 80, "tunnel": "", "name": "http"}, [str(_fd_wl)], None, _fd_dir)
+    finally:
+        globals()["run_ffuf"], globals()["RESUME"] = _real_run_ffuf, False
+    assert _rf_calls == []                              # NO relanza ffuf: reutiliza el .json
+    assert _fd_hits == [{"path": "admin", "status": 200, "length": 123}]
+    # fichero corrupto/truncado → SÍ relanza (nunca se queda sin datos por un .json a medias)
+    _fd_cached.write_text("{ json roto")
+    globals()["run_ffuf"] = lambda *a, **kw: (_rf_calls.append(a), [{"input": {"FUZZ": "x"}, "status": 200, "length": 1}])[1]
+    globals()["RESUME"] = True
+    try:
+        _fd_hits2 = fuzz_dirs("10.0.0.1", {"port": 80, "tunnel": "", "name": "http"}, [str(_fd_wl)], None, _fd_dir)
+    finally:
+        globals()["run_ffuf"], globals()["RESUME"] = _real_run_ffuf, False
+    assert len(_rf_calls) == 1                           # SÍ relanzó ffuf
+    assert _fd_hits2 == [{"path": "x", "status": 200, "length": 1}]
+    # sin --resume (normal): ffuf se relanza aunque el .json ya exista
+    _rf_calls.clear()
+    _fd_cached.write_text(json.dumps({"results": [{"input": {"FUZZ": "admin"}, "status": 200, "length": 123}]}))
+    globals()["run_ffuf"] = lambda *a, **kw: (_rf_calls.append(a), [])[1]
+    globals()["RESUME"] = False
+    try:
+        fuzz_dirs("10.0.0.1", {"port": 80, "tunnel": "", "name": "http"}, [str(_fd_wl)], None, _fd_dir)
+    finally:
+        globals()["run_ffuf"] = _real_run_ffuf
+    assert len(_rf_calls) == 1
     # _ffuf_hit_findings: antes los hits de ffuf solo rellenaban la tabla pasiva de 'Fuzzing
     # web/vhosts' (sin severidad, invisible en Quick Wins/Hallazgos accionables) — caso real:
     # ffuf encontró '/retro' (la única ruta no trivial de todo el sitio) y no se destacaba en
@@ -17966,11 +18036,13 @@ def main():
                          "más rápido que --stealth y sin perder el WinRM 5985 que desaparecía por un "
                          "ligolo-ng. UDP por túnel poco fiable. Ideal en ~/.palantirrc si siempre pivotas.")
     g_escaneo.add_argument("--resume", action="store_true",
-                    help="Reutiliza los XML de nmap ya existentes (no re-escanea) Y, si los puertos/"
-                         "servicios no cambiaron, el footprint/searchsploit/credenciales por defecto "
-                         "del findings.json anterior (no los repite): solo relanza fuzzing/informes y, "
-                         "sobre todo, las credenciales APORTADAS nuevas (-u/-p/-H/-U/-P), que nunca se "
-                         "saltan. Útil para iterar rápido, p. ej. probar una credencial recién encontrada.")
+                    help="Reutiliza los XML de nmap ya existentes (no re-escanea), el fuzzing de "
+                         "directorios/vhosts (ffuf) de sus .json previos para el MISMO puerto/wordlist "
+                         "(sí, uno corrupto/truncado se relanza) y, si los puertos/servicios no "
+                         "cambiaron, el footprint/searchsploit/credenciales por defecto del "
+                         "findings.json anterior (no los repite): solo relanza informes y, sobre todo, "
+                         "las credenciales APORTADAS nuevas (-u/-p/-H/-U/-P), que nunca se saltan. Útil "
+                         "para iterar rápido, p. ej. probar una credencial recién encontrada.")
     g_escaneo.add_argument("--no-scripts", action="store_true",
                     help="No lanzar los scripts NSE de enumeración en la Fase 2 (solo -sV, más rápido/silencioso).")
     g_escaneo.add_argument("--no-banner", action="store_true",
