@@ -3602,7 +3602,18 @@ def fp_dns(ip, ports, services, host, domains, extra_domain, deep):
     # una fuga de versión — antes se colaba como hallazgo [info] (puro ruido).
     if rc == 0 and ver and ";;" not in out and "no servers" not in out.lower():
         res["findings"].append(("info", f"version.bind: {ver}"))
-    targets = list(dict.fromkeys(([extra_domain] if extra_domain else []) + list(domains)))
+    # BUG real reportado en vivo (DC01/soupedecode.local): este bucle iteraba sobre los
+    # strings CRUDOS de discover_domains() (p. ej. "dc01.soupedecode.local", un HOSTNAME
+    # sacado de un banner SMB/Kerberos/certificado, no la zona apex) y los pasaba tal cual a
+    # _dns_axfr_against(), que los trata como si FUERAN una zona DNS propia — así se generaba
+    # un brute de subzonas contra '*.dc01.soupedecode.local' (ns.dc01.…, admin.dc01.…, 20
+    # consultas SOA, varias con timeout) en vez de contra la zona real 'soupedecode.local'.
+    # fp_dns_nameservers (justo debajo) ya hacía esto BIEN (sorted({base_domain(d) for d in
+    # …})) — aquí no se colapsaba a la zona apex, y además NUNCA llegaba a probarse la zona
+    # real si discover_domains() solo había capturado el hostname (como en el caso real: la
+    # zona 'soupedecode.local' solo quedaba cubierta por el otro camino, fp_dns_nameservers).
+    targets = sorted({base_domain(d) for d in
+                      (([extra_domain] if extra_domain else []) + list(domains))})
     if not targets:
         res["next"].append(f"dig axfr <dominio> @{ip}   # pasa -D/--domain DOM (te lo da el enunciado) → AXFR del apex + brute de subzonas")
         res["next"].append(f"dig axfr <sub>.<dominio> @{ip}   # las subzonas delegadas (hr./internal./dev.) suelen transferir aunque el apex lo niegue")
@@ -16306,6 +16317,46 @@ def selftest():
         globals()["have"], globals()["run_capture"] = _real_have_d19, _real_rc_d19
     assert any("corp.local" in s["cmd"] and "@1.2.3.4" in s["cmd"] for s in _dns19["steps"]), _dns19["steps"]
     assert any("ns1.corp.local" in t for _s, t in _dns19["findings"]), _dns19["findings"]
+
+    # BUG real reportado en vivo (DC01/soupedecode.local): fp_dns debe colapsar discover_domains()
+    # a la zona APEX (base_domain) antes de usarla como target de AXFR+brute-de-subzonas — si
+    # domains solo trae el HOSTNAME del DC ("dc01.soupedecode.local", lo normal: lo saca de un
+    # banner SMB/Kerberos/cert, nunca el apex "pelado"), antes se probaba el AXFR/brute contra
+    # 'dc01.soupedecode.local' como si FUERA una zona propia (ns.dc01.…, admin.dc01.…: 20+
+    # consultas SOA sin sentido) y la zona real 'soupedecode.local' nunca se llegaba a probar
+    # por este camino.
+    _dns_cmds_bug = []
+    def _fake_dns_apex_bug(cmd, timeout=None, **kw):
+        _dns_cmds_bug.append(" ".join(cmd))
+        return 0, ""
+    _real_have_dbug, _real_rc_dbug = globals()["have"], run_capture
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), _fake_dns_apex_bug
+    try:
+        fp_dns("10.0.0.1", [{"port": 53, "name": "domain", "scripts": {}}], [], {},
+               ["dc01.soupedecode.local"], None, False)
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_dbug, _real_rc_dbug
+    assert "dig any soupedecode.local @10.0.0.1 +noall +answer" in _dns_cmds_bug, _dns_cmds_bug   # la zona APEX, no el hostname
+    assert "dig axfr soupedecode.local @10.0.0.1" in _dns_cmds_bug, _dns_cmds_bug
+    assert "dig any dc01.soupedecode.local @10.0.0.1 +noall +answer" not in _dns_cmds_bug         # NUNCA el hostname como "la zona"
+    assert "dig axfr dc01.soupedecode.local @10.0.0.1" not in _dns_cmds_bug                       # NUNCA AXFR del hostname como si fuera apex
+    # el hostname SÍ puede aparecer como candidato de SUBZONA legítimo (¿es él mismo un punto de
+    # delegación?), pero SIEMPRE colgando de la zona apex correcta — nunca como base de más
+    # subdominios inventados tipo 'ns.dc01.soupedecode.local'/'admin.dc01.soupedecode.local'.
+    assert not any(".dc01.soupedecode.local" in c for c in _dns_cmds_bug), _dns_cmds_bug
+    # con VARIOS hostnames bajo la MISMA zona (el caso típico: DC + otro equipo), colapsa a UNA
+    # sola zona apex — no repite el AXFR dos veces contra el mismo dominio.
+    _dns_cmds_bug2 = []
+    def _fake_dns_apex_bug2(cmd, timeout=None, **kw):
+        _dns_cmds_bug2.append(" ".join(cmd))
+        return 0, ""
+    globals()["have"], globals()["run_capture"] = (lambda *_a, **_k: True), _fake_dns_apex_bug2
+    try:
+        fp_dns("10.0.0.1", [{"port": 53, "name": "domain", "scripts": {}}], [], {},
+               ["dc01.soupedecode.local", "file01.soupedecode.local"], None, False)
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_dbug, _real_rc_dbug
+    assert sum(1 for c in _dns_cmds_bug2 if c == "dig axfr soupedecode.local @10.0.0.1") == 1, _dns_cmds_bug2
     # Windows → wordlists -lowercase (URLs case-insensitive); Linux → se quedan igual
     assert _target_is_windows([{"port": 3389, "name": "ms-wbt-server", "scripts": {}}], {}) is True   # RDP
     assert _target_is_windows([{"port": 80, "name": "http", "product": "Apache httpd 2.4.53", "extrainfo": "Win64", "scripts": {}}], {}) is True

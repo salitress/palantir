@@ -6,6 +6,23 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`fp_dns` was brute-forcing fictional subdomains of a discovered hostname instead of the real
+  domain** (operator-reported, live run against a lab DC: "no deberia de hacer el dns a
+  `*.soupedecode.local` y no a `*.dc01.soupedecode.local`"). `discover_domains()` finds whatever
+  FQDN-looking string shows up in a banner/script output — usually a *hostname* like
+  `dc01.soupedecode.local` (from an SMB/Kerberos banner or cert CN), not the bare apex domain.
+  `fp_dns_nameservers` already collapsed that to the real zone with `base_domain()`, but `fp_dns`
+  didn't — it ran the full AXFR-and-subzone-brute-force check (`_dns_axfr_against`) treating the
+  *hostname* itself as if it were a DNS zone apex, generating 20+ nonsense `dig soa
+  <guess>.dc01.soupedecode.local` lookups (several timing out, adding real wall-clock delay) and
+  never actually testing AXFR against the real apex `soupedecode.local` through this code path.
+  `fp_dns` now collapses to `base_domain()` the same way, so the apex is the one actually tested
+  and the wasted/wrong subzone brute-force is gone.
+
 ## [2.1.0] - 2026-11-24
 
 ### Added
