@@ -6,6 +6,56 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **nikto ran clean (55s, exit 0, 17 real items including an HTTP TRACE/XST) and produced zero
+  findings in the report** (operator-reported, live run against a real DC: "porque no ha tirado
+  nikto???"). The item-count regex lived inline in `fp_web_slow` and required the EXACT phrase
+  `N item(s) reported on remote host` — the literal `(s)` parens and no `the` before `remote
+  host`, matching an older nikto release's wording. Real nikto v2.6.1 (confirmed against the
+  operator's actual captured output) says `N items reported on THE remote host` — plain plural,
+  no parens, with `the` — none of which matched, so the whole finding silently vanished even
+  though nikto found real things. Extracted to `_parse_nikto_items`, now tolerant of both the
+  old and new phrasing (with a regression test using the operator's exact real output). Also
+  added `_nikto_trace_xst`: the HTTP TRACE/XST line is promoted to its own `alta` finding with a
+  manual next-step — unlike `/server-status`/`/icons/`/missing-headers (already covered by
+  palantir's own direct checks, so nikto was only repeating them), TRACE/XST is signal nothing
+  else in palantir catches.
+
+### Changed
+
+- **Kerberos userenum now always runs all 3 wordlists, instead of stopping at the first one
+  with a hit** (operator-reported, live run: jsmith.txt found 0, awesome-mix-vol1.txt found 1
+  ["administrator"], and xato-net-10-million-usernames-dup.txt — run by hand afterwards — found
+  *additional* real users ["wreed11", "printserver", "kleo2"] that neither of the first two
+  would ever find, since they generate firstname/lastname-style patterns while xato-dup is a
+  corpus of real breached usernames: "haz que palantir ejecute las 3 wordlists de usernames con
+  kerbrute, es lo mejor creo yo"). The escalation chain used to stop as soon as any tier found
+  ≥1 user (optimizing for runtime); now all 3 automatic tiers always run when the first one was
+  jsmith.txt (an explicit `--userenum-wordlist` still never auto-escalates — that's the
+  operator's own decision), and a partial (timed-out) tier no longer blocks the next one
+  either. Every user found across all 3 passes is merged (deduped) into `ad_users.txt`.
+
+### Added
+
+- **nxc is now always invoked with `--verbose` internally, and its raw output is always logged**
+  (parser-reliability fix, not a user-facing option): confirmed against nxc's real source
+  (`nxc/logger.py`, `setup_debug_logging`) that without `--verbose`/`--debug` its logger sits at
+  `ERROR` level, so some internal `.info()`-level diagnostic lines a module/protocol emits get
+  silently dropped — found while manually debugging a run that printed nothing, not even a
+  `[-]`. `--verbose` only adds signal (the `[+]`/`[-]`/highlighted lines palantir's parsers
+  already look for print at any level), so it's forced on every nxc call, never shown on
+  screen by itself. Its raw captured output (now richer) is also appended to `commands.log`
+  for every nxc invocation, so a stuck/empty-looking run can be diagnosed from the log without
+  re-running anything by hand.
+- **New `-v`/`--verbose` flag** (a different, user-facing thing: operator-asked, after manually
+  debugging a run that looked stuck or empty, "que eche en vivo el comando crudo + su salida tal
+  cual se ejecuta, bypaseando el resumen bonito"): echoes every raw command and its raw output
+  live as it runs, bypassing the normal `quiet=True` silence used for large loops (Fase 5d
+  spraying, bulk enumeration). Diagnostic only — doesn't change what's parsed or reported.
+
 ## [2.1.1] - 2026-11-24
 
 ### Fixed

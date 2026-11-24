@@ -602,6 +602,12 @@ NO_USERENUM = False   # --no-userenum: no ejecutar kerbrute userenum (solo dejar
 # --spray: contraseña(s) para el password spraying AUTOMÁTICO contra los usuarios AD descubiertos
 # en vivo (ad_users.txt). None = desactivado; lista de contraseñas si se da. Ver _spray_phase.
 SPRAY_PASSWORDS = None
+# --verbose/-v: eco EN VIVO del comando crudo + su salida cruda tal cual se ejecuta, saltándose
+# el resumen bonito (quiet=True) — para diagnosticar un run que parece colgado o vacío (operator-
+# asked, tras depurar a mano uno así: "echar en vivo el comando crudo + su salida tal cual se
+# ejecuta, bypaseando el resumen bonito"). Distinto de _ensure_nxc_verbose (más abajo), que es
+# interno y siempre está activo: esto es solo PANTALLA, aquello es fiabilidad del parser.
+VERBOSE = False
 
 # Puertos UDP que de verdad importan en labs (lista explícita: --top-ports UDP no
 # es portable entre versiones de nmap y puede saltarse el 623/IPMI).
@@ -672,6 +678,52 @@ def _log(line):
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")   # color/CSI que algunas tools (enum4linux-ng) emiten aunque no sea un TTY
 
+# ── Fiabilidad del parser: nxc siempre con --verbose (interno, NUNCA a pantalla) ────────────
+# Confirmado leyendo el código fuente real de nxc (nxc/logger.py, setup_debug_logging): SIN
+# --verbose ni --debug, el logger de nxc queda a nivel ERROR — cualquier línea de diagnóstico
+# interna que un módulo/protocolo emita con .info()/.debug() (no con log.success/fail/highlight,
+# que SIEMPRE se imprimen, sea el nivel que sea) se descarta en silencio. Depurando a mano un run
+# que parecía colgado/vacío se confirmó el caso real: un comando no imprimía NADA, ni un '[-]',
+# porque la única pista de qué pasaba de verdad vivía en una línea .info() que ese nivel por
+# defecto tira. Si palantir busca patrones tipo 'Pwn3d!'/'[+]'/'STATUS_' en esa salida y nxc se
+# queda mudo, el riesgo es un falso "sin hallazgos" sin que lo sea. --verbose sube el nivel a
+# INFO: estrictamente MÁS señal, nunca menos (las líneas que los parsers de palantir SÍ miran ya
+# se imprimían en ambos niveles). Por eso se fuerza SIEMPRE, sin flag de cara al operador.
+_NXC_BASENAMES = {"nxc", "netexec", "crackmapexec"}
+
+
+def _is_nxc_cmd(cmd):
+    """¿Es `cmd` una invocación real de nxc/netexec/crackmapexec? Chequeo barato (solo el
+    nombre base de cmd[0], SIN tocar el filesystem) — nxc_bin() hace un have()/PATH scan real
+    y llamarlo en cada run_capture (dig, whois, hydra, impacket…) sería caro sin necesidad.
+    Puro → testeable sin red."""
+    return bool(cmd) and Path(cmd[0]).name in _NXC_BASENAMES
+
+
+def _ensure_nxc_verbose(cmd):
+    """Si `cmd` es una invocación de nxc (ver _is_nxc_cmd) y no lleva ya --verbose/--debug, le
+    añade --verbose (ver el comentario de arriba). Devuelve una lista NUEVA (no muta `cmd`).
+    Puro → testeable sin red."""
+    if not _is_nxc_cmd(cmd) or "--verbose" in cmd or "--debug" in cmd:
+        return cmd
+    return cmd + ["--verbose"]
+
+
+def _log_nxc_output(cmd, out):
+    """Si `cmd` es una invocación de nxc, vuelca su salida CRUDA (ya con --verbose forzado por
+    _ensure_nxc_verbose) a commands.log — NUNCA a pantalla (eso es cosa de VERBOSE, la opción
+    de palantir, propósito distinto: ver run_capture). Antes solo quedaba registrada la LÍNEA
+    de comando (_log(line)); para depurar un run que parece colgado/vacío el operador tenía que
+    relanzar el comando a mano para ver qué decía nxc de verdad — con esto ya queda en el log,
+    sin repetir nada. Se limita a nxc (no a CUALQUIER comando) para no inflar commands.log con
+    la salida ya-volcada-a-su-propio--o-file de nmap/ffuf/hydra, que no aporta nada nuevo ahí."""
+    if not _is_nxc_cmd(cmd):
+        return
+    out = (out or "").strip()
+    if not out:
+        return
+    _log("    » " + out.replace("\n", "\n    » "))
+
 
 def run(cmd, timeout=None, outfile=None, quiet_stdout=False):
     """Ejecuta un comando: lo muestra, lo registra, y borra su fichero de salida
@@ -708,24 +760,36 @@ def run_capture(cmd, timeout=None, input_text=None, env=None, quiet=False):
     entorno en vez de en la línea de comandos (no quedan en el log ni en 'ps').
     `quiet=True` NO imprime el '$ comando' en pantalla (sigue yendo a commands.log
     igual) — para cuando la llamada se repite muchísimas veces (p. ej. Fase 5d con
-    --user-list/--pass-list grandes) y el eco de cada una inundaría la terminal."""
+    --user-list/--pass-list grandes) y el eco de cada una inundaría la terminal
+    — salvo con --verbose (VERBOSE global), que se salta ese silencio a propósito
+    (ver más abajo): es justo para los runs que parecen colgados/vacíos donde `quiet`
+    normalmente oculta la única señal de qué está pasando.
+    Si `cmd` es una invocación de nxc, se le añade --verbose SIEMPRE (ver
+    _ensure_nxc_verbose: fiabilidad del parser, no tiene que ver con VERBOSE/-v de
+    palantir) y su salida cruda queda volcada a commands.log (ver _log_nxc_output) —
+    nunca a pantalla por eso solo, solo si --verbose/-v de palantir también está activo."""
+    cmd = _ensure_nxc_verbose(cmd)
     line = shlex.join(cmd)
-    if not quiet:
+    if not quiet or VERBOSE:
         print(f"{C_GREY}    $ {line}{C_RESET}", flush=True)
     _log(line)
     full_env = {**os.environ, **env} if env else None
     try:
         r = subprocess.run(cmd, timeout=timeout, capture_output=True,
                            text=True, errors="replace", input=input_text, env=full_env)
-        return r.returncode, _ANSI_RE.sub("", (r.stdout or "") + (r.stderr or "")).strip()
+        rc, out = r.returncode, _ANSI_RE.sub("", (r.stdout or "") + (r.stderr or "")).strip()
     except subprocess.TimeoutExpired as e:
         warn(f"'{cmd[0]}' superó el timeout de {timeout}s; uso la salida parcial.")
         out = e.stdout or ""
         if isinstance(out, bytes):
             out = out.decode("latin-1", "replace")
-        return None, _ANSI_RE.sub("", out).strip()
+        rc, out = None, _ANSI_RE.sub("", out).strip()
     except FileNotFoundError:
-        return None, ""
+        rc, out = None, ""
+    _log_nxc_output(cmd, out)
+    if VERBOSE:
+        print(f"{C_GREY}    » {out or '(sin salida)'}{C_RESET}", flush=True)
+    return rc, out
 
 
 _CMD_LABEL_PROTOS = ("ldap", "smb", "winrm", "rdp", "mssql", "wmi", "ssh", "ftp")
@@ -811,7 +875,7 @@ def _run_capture_retry(cmd, timeout=None, quiet=False, retries=1, heartbeat_inte
         while (not (out or "").strip() and tries < retries
                and not (timeout and elapsed >= timeout * 0.9)):
             tries += 1
-            if not quiet:   # deja claro POR QUÉ el mismo comando sale dos veces seguidas
+            if not quiet or VERBOSE:   # deja claro POR QUÉ el mismo comando sale dos veces seguidas
                 print(f"{C_GREY}      ↳ reintento: la 1ª respuesta vino vacía (posible glitch "
                       f"transitorio del túnel/conexión, no 'sin hallazgos'){C_RESET}", flush=True)
             t0 = time.monotonic()
@@ -847,9 +911,14 @@ def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval
     veríamos crecer NADA hasta que el proceso termine del todo, y el seguimiento de progreso
     sería inútil (toda la salida llegaría de golpe al final, indistinguible de un timeout fijo).
 
-    Devuelve (rc, texto) igual que run_capture — rc=None si no se encontró el binario."""
+    Devuelve (rc, texto) igual que run_capture — rc=None si no se encontró el binario.
+    Mismo trato que run_capture para nxc: --verbose forzado (_ensure_nxc_verbose) y la salida
+    cruda volcada a commands.log (_log_nxc_output) — tiene sentido especial aquí, ya que
+    --users/--rid-brute son justo los comandos largos/silenciosos donde más cuesta saber si
+    de verdad no hay nada o si nxc se quedó mudo a medio camino."""
+    cmd = _ensure_nxc_verbose(cmd)
     line = shlex.join(cmd)
-    if not quiet:
+    if not quiet or VERBOSE:
         print(f"{C_GREY}    $ {line}{C_RESET}", flush=True)
     _log(line)
     full_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
@@ -857,6 +926,7 @@ def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, errors="replace", bufsize=1, env=full_env)
     except FileNotFoundError:
+        _log_nxc_output(cmd, "")
         return None, ""
     lines = []
 
@@ -906,6 +976,9 @@ def _run_capture_progressive(cmd, timeout=1800, stall_timeout=300, poll_interval
                  "uso la salida parcial; si hace falta más margen, repite este comando a mano.")
     th.join(timeout=5)
     out = _ANSI_RE.sub("", "".join(lines)).strip()
+    _log_nxc_output(cmd, out)
+    if VERBOSE:
+        print(f"{C_GREY}    » {out or '(sin salida)'}{C_RESET}", flush=True)
     return proc.returncode, out
 
 
@@ -5244,6 +5317,42 @@ def fp_web_fast(ip, p, services, host, deep, hostname=None):
     return res, whatweb_out
 
 
+# BUG real reportado en vivo (operador: nikto corrió 55s, "✓", y el informe no sacó NI UN
+# hallazgo de nikto — "porque no ha tirado nikto???"): el regex de recuento vivía INLINE en
+# fp_web_slow y exigía la frase EXACTA 'N item(s) reported on remote host' (con los paréntesis
+# literales de '(s)' y SIN 'the' antes de 'remote host') — el formato de una versión vieja de
+# nikto. nikto v2.6.1 real (confirmado contra la salida real del operador) dice 'N items
+# reported on THE remote host' (plural llano, sin paréntesis, CON 'the') — ninguna de esas tres
+# diferencias casaba con el regex viejo, así que el hallazgo entero (17 ítems reales, incluido
+# un HTTP TRACE/XST) se perdía en silencio pese a que nikto SÍ encontró cosas. Extraído a
+# función propia + tolerante a AMBOS formatos (viejo Y nuevo) — mismo patrón que cualquier otro
+# parser de este fichero: no asumas que la herramienta externa no cambia su salida entre
+# versiones.
+_NIKTO_ITEMS_RE = re.compile(r"(\d+)\s+items?(?:\(s\))?\s+reported\s+on\s+(?:the\s+)?remote\s+host", re.I)
+# HTTP TRACE activo → XST (Cross-Site Tracing): a diferencia de /server-status, /icons/ o las
+# cabeceras de seguridad que faltan (todo eso palantir YA lo comprueba por su cuenta, ver
+# WEB_SENSITIVE/fp_web_fast — nikto solo lo repite), esto es señal NUEVA que ningún otro check
+# de palantir cubre — por eso se promueve a un hallazgo propio en vez de quedar enterrado en el
+# recuento genérico.
+_NIKTO_TRACE_RE = re.compile(r"HTTP TRACE method is active.*?vulnerable to XST", re.I)
+
+
+def _parse_nikto_items(out):
+    """Nº de ítems que nikto reportó, de la línea resumen final ('N item(s) reported on
+    remote host' en versiones viejas, 'N items reported on the remote host' en nikto 2.6.1+)
+    — ver _NIKTO_ITEMS_RE. 0 si no hay línea resumen (nikto no llegó a terminar/crasheó antes).
+    Puro → testeable sin red."""
+    m = _NIKTO_ITEMS_RE.search(out or "")
+    return int(m.group(1)) if m else 0
+
+
+def _nikto_trace_xst(out):
+    """¿Marca nikto el método HTTP TRACE como activo y vulnerable a XST (Cross-Site Tracing)?
+    Señal que ningún otro check de palantir cubre (a diferencia de /server-status/headers/
+    icons, que SÍ se comprueban por otro lado). Puro → testeable sin red."""
+    return bool(_NIKTO_TRACE_RE.search(out or ""))
+
+
 def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
     """Escáneres web LENTOS y opt-in (--nikto/--nuclei/--cms-scan/--crawl): cada uno
     puede tardar varios minutos. Se llaman aparte y DESPUÉS del informe HTML
@@ -5261,10 +5370,17 @@ def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
             rc, out = run_capture(["nikto", "-h", url, "-ask", "no"], timeout=1200)
             _step(res, f"nikto -h {url}", rc == 0, out,
                   note="escaneo completo de vulnerabilidades/configuración conocidas (--nikto: opt-in, lento — varios minutos)")
-            m = re.search(r"(\d+)\s+item\(s\)\s+reported\s+on\s+remote\s+host", out)
-            n_items = int(m.group(1)) if m else 0
+            n_items = _parse_nikto_items(out)
             if n_items:
                 res["findings"].append(("media", f"Nikto {port}: {n_items} ítem(s) reportados (detalle completo en los pasos de esta sección)"))
+            if _nikto_trace_xst(out):
+                res["findings"].append(("alta",
+                    f"Nikto {port}: método HTTP TRACE activo — vulnerable a XST (Cross-Site Tracing): "
+                    "una página con un script vulnerable a XSS en OTRO sitio puede usar TRACE para leer "
+                    "cookies HttpOnly, saltándose esa protección"))
+                res["next"].append(
+                    f"curl -X TRACE -v {url}   # confirma el método TRACE activo (nikto ya lo marcó arriba) — "
+                    "deshabilítalo en la config del servidor (Apache: 'TraceEnable off')")
         else:
             res["missing"].append("nikto")
 
@@ -5588,27 +5704,26 @@ def _kerbrute_run_pass(res, kb, ip, domain, wl, base):
 
 
 def _kerbrute_escalate(res, kb, ip, domain, base, wl2, label, why, manual_url=None, manual_path=None):
-    """Un escalón de la cadena de kerbrute userenum (ver _kerbrute_userenum): si `wl2` (ya
+    """Un escalón MÁS de la cadena de kerbrute userenum (ver _kerbrute_userenum): si `wl2` (ya
     resuelta por el llamante, p. ej. _awesome_mix_wordlist()/_xato_dup_wordlist()) está
-    instalada, lanza un pase más con ella y devuelve (usuarios, parcial) igual que
-    _kerbrute_run_pass; si no está instalada, deja una sugerencia MANUAL (con `manual_url` si
-    el recurso no viene por apt — jsmith.txt/awesome-mix-vol1.txt — o `manual_path` si ya
-    viene con un paquete apt como 'seclists') y devuelve ([], False). El 'False' de 'parcial'
-    aquí es deliberado: no haber podido intentar este escalón no es un resultado INCOMPLETO
-    que deba frenar al llamante de seguir probando el SIGUIENTE escalón de la cadena — solo
-    un timeout de un pase que SÍ llegó a correr debe frenarla (ver _kerbrute_userenum)."""
+    instalada, lanza un pase más con ella — SIEMPRE, sin importar qué encontró el escalón
+    anterior (ver _kerbrute_userenum: desde el caso real que motivó esto, parar en el primer
+    acierto perdía usuarios reales que solo una lista MÁS GRANDE encuentra) — y devuelve
+    (usuarios, parcial) igual que _kerbrute_run_pass; si no está instalada, deja una
+    sugerencia MANUAL (con `manual_url` si el recurso no viene por apt — jsmith.txt/
+    awesome-mix-vol1.txt — o `manual_path` si ya viene con un paquete apt como 'seclists') y
+    devuelve ([], False)."""
     if not wl2:
         if manual_url:
             res["next"].append(
-                f"kerbrute userenum -d {domain} --dc {ip} {label}   # ningún formato anterior dio ningún "
-                f"usuario — prueba esta ({why}): {manual_url} — guárdala junto a jsmith.txt y la próxima "
-                "vez la uso sola, sin --userenum-wordlist")
+                f"kerbrute userenum -d {domain} --dc {ip} {label}   # prueba TAMBIÉN esta lista "
+                f"({why}): {manual_url} — guárdala junto a jsmith.txt y la próxima vez la uso sola, "
+                "sin --userenum-wordlist")
         else:
             res["next"].append(
-                f"kerbrute userenum -d {domain} --dc {ip} {manual_path}   # ningún formato anterior dio "
-                f"ningún usuario — prueba esta lista ({why})")
+                f"kerbrute userenum -d {domain} --dc {ip} {manual_path}   # prueba TAMBIÉN esta lista ({why})")
         return [], False
-    info(f"Kerberos: ningún formato anterior dio ningún usuario — reintento con {label} ({why})")
+    info(f"Kerberos: pruebo TAMBIÉN {label} ({why}) — cada lista caza usuarios distintos, no me quedo con el primer acierto")
     return _kerbrute_run_pass(res, kb, ip, domain, wl2, base)
 
 
@@ -5623,29 +5738,28 @@ def _kerbrute_userenum(res, ip, domain, base):
     minutos) si está instalada, si no cae a una shortlist genérica (segundos) — ver
     _userenum_wordlist. Con --userenum-wordlist se le pasa una grande a conciencia.
 
-    Escalado automático en CADENA (operator-asked: "si con jsmith.txt no encuentra users,
-    probar con otra wordlist del mismo repo" + "pon otro salto si con esos dos wordlist no
-    pilla nada a la de xato-net-10 million", tras un caso real donde ni jsmith.txt ni
-    awesome-mix-vol1.txt pillaron nombres de pila sueltos tipo 'charlie'/'admin' que sí
-    encontró xato-net-10-million-usernames-dup.txt a mano): SOLO si el pase con jsmith.txt
-    fue el AUTOMÁTICO (sin --userenum-wordlist: con una lista propia el operador ya decidió,
-    no hay nada que escalar) y no dio NINGÚN usuario Y no quedó PARCIAL (un timeout no es "0
-    usuarios"), se reintenta con awesome-mix-vol1.txt (mismo repo que jsmith.txt, mezcla de
-    formatos — recomendada por su propio README cuando el formato real es desconocido); si
-    ESE pase tampoco da nada (de nuevo, ni parcial), se reintenta con
-    xato-net-10-million-usernames-dup.txt (nombres de pila reales, no patrones de formato —
-    viene con el paquete apt 'seclists', no con un repo aparte). Cualquier escalón que no
-    esté instalado se deja como sugerencia MANUAL (con la URL si hace falta instalarlo, o el
-    path si ya viene con seclists) y la cadena sigue probando el siguiente escalón igual —
-    "no instalada" no es lo mismo que "instalada pero sin resultado parcial", así que no
-    frena el encadenado.
+    Las TRES listas automáticas se corren SIEMPRE, incondicionalmente (operator-asked, tras
+    un caso real en vivo: jsmith.txt dio 0, awesome-mix-vol1.txt dio 1 ['administrator'] y
+    xato-net-10-million-usernames-dup.txt, lanzada A MANO después, dio ADEMÁS 'wreed11',
+    'printserver', 'kleo2' — usuarios REALES que ni jsmith ni awesome-mix iban a encontrar
+    NUNCA: jsmith/awesome-mix generan patrones first.last/flast de nombres comunes, mientras
+    que xato-dup es un corpus de nombres de usuario REALES vistos en brechas — formatos
+    distintos cazan gente distinta, no es que uno sea "mejor" que otro. Versión anterior:
+    "haz que palantir ejecute las 3 wordlists de usernames con kerbrute" tras ver ese hallazgo
+    en vivo). Antes la cadena paraba en el primer escalón con ≥1 usuario (pensado para ahorrar
+    tiempo con xato-dup, la más lenta) — eso es exactamente lo que se perdía 'wreed11' y
+    compañía: se queda SOLO con lo que encontró el primer acierto, sin seguir mirando. Ahora
+    se encadenan los 3 pases SIEMPRE que el automático sea el que arrancó con jsmith.txt
+    (--userenum-wordlist nunca escala: el operador ya decidió su lista) — un pase PARCIAL
+    (cortado por timeout) tampoco frena el siguiente escalón, porque el objetivo ya no es
+    "ahorrar tiempo parando pronto" sino cobertura máxima; cada escalón que no esté instalado
+    se deja como sugerencia MANUAL y la cadena sigue igual con el siguiente.
 
-    Los usuarios hallados (en cualquiera de los pases) se vuelcan a <base>/ad_users.txt
-    (listos para AS-REP roast / spray) y los '(sin pre-auth)' se marcan como AS-REP
-    roastables (hash crackeable sin credenciales). Devuelve True si ya encoló la sugerencia
-    de AS-REP roast (hubo usuarios, en cualquier pase de la cadena) — el llamante
-    (fp_kerberos) la usa para NO repetirla en su propio bloque de next-steps genérico (antes
-    salía DOS VECES, con distinta coletilla, cuando SÍ había usuarios: visto en vivo)."""
+    Los usuarios hallados (en CUALQUIERA de los 3 pases) se vuelcan todos juntos, deduplicados,
+    a <base>/ad_users.txt (_merge_write_ad_users ya mezcla en vez de pisar — ver ahí) y los
+    '(sin pre-auth)' se marcan como AS-REP roastables. Devuelve True si algún pase de la cadena
+    encontró usuarios — el llamante (fp_kerberos) la usa para NO repetir su propia sugerencia
+    genérica de AS-REP roast."""
     kb = _kerbrute_bin()
     if not kb:
         res["missing"].append("kerbrute")
@@ -5660,20 +5774,20 @@ def _kerbrute_userenum(res, ip, domain, base):
                             "— guárdala en /usr/share/wordlists/statistically-likely-usernames/jsmith.txt y la próxima vez la uso solo, sin --userenum-wordlist")
         return False
     info(f"Kerberos: enum de usuarios con kerbrute ({Path(wl).name}) — no bloquea cuentas, puede tardar según la lista")
-    users, partial = _kerbrute_run_pass(res, kb, ip, domain, wl, base)
-    if not USERENUM_WORDLIST and not users and not partial and wl in _JSMITH_USERLISTS:
-        users2, partial2 = _kerbrute_escalate(
+    users, _partial = _kerbrute_run_pass(res, kb, ip, domain, wl, base)
+    found_any = users
+    if not USERENUM_WORDLIST and wl in _JSMITH_USERLISTS:
+        users2, _partial2 = _kerbrute_escalate(
             res, kb, ip, domain, base, _awesome_mix_wordlist(), "awesome-mix-vol1.txt",
-            "mezcla de formatos, recomendada por su propio README",
+            "mezcla de formatos, recomendada por su propio README — cubre patrones que jsmith.txt no prueba",
             manual_url="https://raw.githubusercontent.com/insidetrust/statistically-likely-usernames/master/awesome-mix-vol1.txt")
-        users = users or users2
-        if not users and not partial2:
-            users3, _partial3 = _kerbrute_escalate(
-                res, kb, ip, domain, base, _xato_dup_wordlist(), "xato-net-10-million-usernames-dup.txt",
-                "nombres de pila reales, no patrones de formato — ya viene con el paquete apt 'seclists'",
-                manual_path="/usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt")
-            users = users or users3
-    return bool(users)
+        found_any = found_any or users2
+        users3, _partial3 = _kerbrute_escalate(
+            res, kb, ip, domain, base, _xato_dup_wordlist(), "xato-net-10-million-usernames-dup.txt",
+            "nombres de pila REALES de una brecha, no patrones de formato — ya viene con el paquete apt 'seclists'",
+            manual_path="/usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt")
+        found_any = found_any or users3
+    return bool(found_any)
 
 
 def _parse_kerbrute_spray(out):
@@ -16381,9 +16495,45 @@ def selftest():
     assert _robots_sitemaps("User-agent: *\nDisallow: /x") == []
     assert _parse_ports("80, 443,80,abc,99999") == [80, 443]                # dedup + descarta inválidos
     assert _parse_hostnames(" App.X.local, dev.x.local ,,App.x.local") == ["app.x.local", "dev.x.local"]
-    _nikto_sample = "+ 1316 requests: 0 error(s) and 12 item(s) reported on remote host"
-    _m = re.search(r"(\d+)\s+item\(s\)\s+reported\s+on\s+remote\s+host", _nikto_sample)
-    assert _m and int(_m.group(1)) == 12
+    # BUG real reportado en vivo ("porque no ha tirado nikto???"): nikto 2.6.1 real dice
+    # 'N items reported on THE remote host' (plural llano, sin paréntesis, CON 'the') — el
+    # formato VIEJO ('item(s)'/sin 'the') y el NUEVO deben casar los dos.
+    assert _parse_nikto_items("+ 1316 requests: 0 error(s) and 12 item(s) reported on remote host") == 12   # formato viejo
+    assert _parse_nikto_items("+ 8001 requests: 0 errors and 17 items reported on the remote host") == 17  # formato real de nikto 2.6.1 (operador)
+    assert _parse_nikto_items("+ 1 requests: 0 error and 1 item reported on the remote host") == 1          # singular, por si acaso
+    assert _parse_nikto_items("") == 0 and _parse_nikto_items("sin línea resumen") == 0
+    # TRACE/XST: señal NUEVA que ningún otro check de palantir cubre (a diferencia de
+    # /server-status, /icons/ o cabeceras, que palantir ya comprueba por su cuenta).
+    assert _nikto_trace_xst(
+        "+ [000434] /: HTTP TRACE method is active and replies which suggests the host is "
+        "vulnerable to XST. See: https://owasp.org/www-community/attacks/Cross_Site_Tracing") is True
+    assert _nikto_trace_xst("+ No CGI Directories found") is False
+    assert _nikto_trace_xst("") is False
+    # Integración de punta a punta con la salida REAL capturada en vivo (nikto v2.6.1 contra
+    # DC04/soupedecode.local) — confirma que, con el bug SIN arreglar, esto no producía NINGÚN
+    # hallazgo de nikto (el caso real que motivó el fix), y que arreglado SÍ los produce.
+    _real_nikto_out = (
+        "- Nikto v2.6.1\n"
+        "+ Target IP:          192.168.1.208\n"
+        "+ Server: Apache/2.4.58 (Win64) OpenSSL/3.1.3 PHP/8.2.12\n"
+        "+ [000434] /: HTTP TRACE method is active and replies which suggests the host is "
+        "vulnerable to XST. See: https://owasp.org/www-community/attacks/Cross_Site_Tracing\n"
+        "+ [013587] /: Suggested security header missing: content-security-policy.\n"
+        "+ 8001 requests: 0 errors and 17 items reported on the remote host\n"
+        "+ End Time:           2026-11-24 22:52:05 (GMT1) (55 seconds)\n"
+    )
+    _real_have_nk, _real_rc_nk, _real_nikto_g = globals()["have"], run_capture, globals()["NIKTO"]
+    globals()["have"] = lambda name: name == "nikto"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (0, _real_nikto_out)
+    globals()["NIKTO"] = True
+    try:
+        _nres = _fp("web", "Web http://:80", [80])
+        fp_web_slow("192.168.1.208", {"port": 80, "name": "http", "tunnel": ""}, _nres, "", {}, False)
+    finally:
+        globals()["have"], globals()["run_capture"], globals()["NIKTO"] = _real_have_nk, _real_rc_nk, _real_nikto_g
+    assert any(s == "media" and "Nikto 80: 17 ítem(s) reportados" in t for s, t in _nres["findings"]), _nres["findings"]
+    assert any(s == "alta" and "HTTP TRACE" in t and "XST" in t for s, t in _nres["findings"]), _nres["findings"]
+    assert any("curl -X TRACE" in n for n in _nres["next"]), _nres["next"]
     # --cms-scan: detección de CMS (puro) + parseo de wpscan -f json (tolerante a JSON roto)
     assert _detect_cms("HTTPServer[Apache], WordPress[6.4.2], PHP[8.1]") == "wordpress"
     assert _detect_cms("MetaGenerator[Joomla! - Open Source CMS]") == "joomla"
@@ -17765,23 +17915,33 @@ def selftest():
                           [{"port": 88, "name": "kerberos-sec", "scripts": {}}], {}, False)
     assert _kb_cmds == [] and any("DOMINIO" in n for n in _kbres2["next"])
 
-    # Escalado automático jsmith.txt → awesome-mix-vol1.txt (operator-asked: "si con jsmith.txt
-    # no encuentra users, probar con otra wordlist del mismo repo"). Mockea _kerbrute_bin/
-    # _userenum_wordlist/_awesome_mix_wordlist/run_capture — sin red real.
+    # Las TRES listas SIEMPRE, incondicionalmente (operator-asked: "haz que palantir ejecute
+    # las 3 wordlists de usernames con kerbrute", tras un caso real en vivo donde jsmith dio 0,
+    # awesome-mix dio 1 ['administrator'] y xato-dup, lanzada A MANO después, encontró ADEMÁS
+    # 'wreed11'/'printserver'/'kleo2' — usuarios que jsmith/awesome-mix NUNCA iban a encontrar,
+    # formato de patrón vs. corpus de nombres reales). Mockea _kerbrute_bin/_userenum_wordlist/
+    # _awesome_mix_wordlist/_xato_dup_wordlist/run_capture — sin red real.
     _real_kbbin4 = globals()["_kerbrute_bin"]
     _real_wl4 = globals()["_userenum_wordlist"]
     _real_mix4 = globals()["_awesome_mix_wordlist"]
+    _real_xato4 = globals()["_xato_dup_wordlist"]
     _real_rc4b = globals()["run_capture"]
     _real_uw4 = globals()["USERENUM_WORDLIST"]
 
     def _fake_esc_rc_ok(cmd, timeout=None, quiet=False, **kw):
         if _JSMITH_USERLISTS[0] in cmd:
             return 0, "Done! Tested 48705 usernames (0 valid) in 20 seconds"
-        return 0, ("[+] VALID USERNAME:\t svc_sql@corp.local\n"
-                   "Done! Tested 25784 usernames (1 valid) in 10 seconds")
+        if _AWESOME_MIX_USERLISTS[0] in cmd:
+            return 0, ("[+] VALID USERNAME:\t svc_sql@corp.local\n"
+                       "Done! Tested 25784 usernames (1 valid) in 10 seconds")
+        # xato-dup: encuentra un usuario DISTINTO — el caso real exacto (awesome-mix YA había
+        # encontrado algo, pero xato-dup se ejecuta IGUAL y aporta MÁS, nunca se para en el 1er acierto)
+        return 0, ("[+] VALID USERNAME:\t wreed11@corp.local\n"
+                   "Done! Tested 624370 usernames (1 valid) in 180 seconds")
     globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
     globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
     globals()["_awesome_mix_wordlist"] = lambda: _AWESOME_MIX_USERLISTS[0]
+    globals()["_xato_dup_wordlist"] = lambda: _XATO_DUP_USERLISTS[0]
     globals()["run_capture"] = _fake_esc_rc_ok
     globals()["USERENUM_WORDLIST"] = None
     _esc_dir = Path(tempfile.mkdtemp())
@@ -17790,18 +17950,23 @@ def selftest():
         _esc_found = _kerbrute_userenum(_esc_res, "10.0.0.5", "corp.local", _esc_dir)
     finally:
         (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
-         globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (_real_kbbin4, _real_wl4, _real_mix4, _real_rc4b, _real_uw4)
+         globals()["_xato_dup_wordlist"], globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (
+            _real_kbbin4, _real_wl4, _real_mix4, _real_xato4, _real_rc4b, _real_uw4)
     assert _esc_found is True, _esc_res
+    # LOS 3 pases corrieron — ni awesome-mix (encontró 1) ni jsmith (encontró 0) frenaron a xato-dup.
     assert sum(_JSMITH_USERLISTS[0] in c for s in _esc_res["steps"] for c in [s["cmd"]]) == 1
     assert sum(_AWESOME_MIX_USERLISTS[0] in c for s in _esc_res["steps"] for c in [s["cmd"]]) == 1
+    assert sum(_XATO_DUP_USERLISTS[0] in c for s in _esc_res["steps"] for c in [s["cmd"]]) == 1
     assert any(s == "info" and "48705 nombre(s) de la lista (jsmith.txt), 0 válido(s)" in t for s, t in _esc_res["findings"]), _esc_res["findings"]
     assert any(s == "alta" and "1 usuario(s) AD válidos por kerbrute (awesome-mix-vol1.txt)" in t for s, t in _esc_res["findings"]), _esc_res["findings"]
-    assert (_esc_dir / "ad_users.txt").read_text().strip() == "svc_sql"
+    assert any(s == "alta" and "1 usuario(s) AD válidos por kerbrute (xato-net-10-million-usernames-dup.txt)" in t for s, t in _esc_res["findings"]), _esc_res["findings"]
+    # UNIÓN de los dos aciertos (awesome-mix + xato-dup) en ad_users.txt, deduplicada — esto es
+    # justo lo que se perdía antes al parar en el primer escalón con resultado.
+    assert sorted((_esc_dir / "ad_users.txt").read_text().split()) == ["svc_sql", "wreed11"]
 
     # awesome-mix-vol1.txt NI xato-dup instaladas: 1 solo pase (jsmith, 0 usuarios) + sugerencia
     # MANUAL de CADA escalón, SIN segundo/tercer pase de kerbrute — "ningún escalón instalado"
     # no debe lanzar nada, solo dejar las 2 sugerencias.
-    _real_xato4 = globals()["_xato_dup_wordlist"]
     _esc_cmds2 = []
 
     def _fake_esc_rc_noinstall(cmd, timeout=None, quiet=False, **kw):
@@ -17826,9 +17991,9 @@ def selftest():
                for n in _esc_res2["next"]), _esc_res2["next"]
     assert any("xato-net-10-million-usernames-dup.txt" in n and "seclists" in n for n in _esc_res2["next"]), _esc_res2["next"]
 
-    # Cadena completa: jsmith.txt (0) → awesome-mix-vol1.txt (0, NO parcial) → xato-dup (encuentra
-    # usuarios) — el caso real exacto que motivó el 3er escalón ("pon otro salto si con esos dos
-    # wordlist no pilla nada a la de xato-net-10 million").
+    # Cadena completa con los 3 instalados y jsmith/awesome-mix sin ningún acierto: los 3 pases
+    # corren igual (ya no depende de si el anterior encontró algo) y xato-dup aporta usuarios que
+    # los otros dos nunca iban a encontrar — el caso real que motivó el 3er escalón.
     _esc_cmds4 = []
 
     def _fake_esc_rc_chain(cmd, timeout=None, quiet=False, **kw):
@@ -17859,31 +18024,37 @@ def selftest():
                for s, t in _esc_res4["findings"]), _esc_res4["findings"]
     assert sorted((_esc_dir4 / "ad_users.txt").read_text().split()) == ["admin", "charlie"]
 
-    # Si el 2º escalón (awesome-mix) se corta por TIMEOUT (parcial), la cadena NO debe seguir al
-    # 3º — un timeout no es "awesome-mix no tenía al usuario", es "no se llegó a probar entera":
-    # escalar más con ese resultado a medias sería decidir con información incompleta.
+    # Si el 2º escalón (awesome-mix) se corta por TIMEOUT (parcial), la cadena SIGUE igual al 3º
+    # — ya NO se para por nada (ni 0 usuarios, ni parcial): el objetivo es cobertura máxima, no
+    # ahorrar tiempo parando pronto. xato-dup corre igual y lo que encuentre se suma.
     _esc_cmds5 = []
 
     def _fake_esc_rc_partial(cmd, timeout=None, quiet=False, **kw):
         _esc_cmds5.append(cmd)
         if _JSMITH_USERLISTS[0] in cmd:
             return 0, "Done! Tested 48705 usernames (0 valid) in 20 seconds"
-        return None, "Tested 9000 usernames so far"   # rc=None: run_capture cortó por timeout
+        if _AWESOME_MIX_USERLISTS[0] in cmd:
+            return None, "Tested 9000 usernames so far"   # rc=None: run_capture cortó por timeout
+        return 0, ("[+] VALID USERNAME:\t kleo2@corp.local\n"
+                   "Done! Tested 624370 usernames (1 valid) in 180 seconds")
     globals()["_kerbrute_bin"] = lambda: "FAKE_KERBRUTE"
     globals()["_userenum_wordlist"] = lambda arg=None: _JSMITH_USERLISTS[0]
     globals()["_awesome_mix_wordlist"] = lambda: _AWESOME_MIX_USERLISTS[0]
-    globals()["_xato_dup_wordlist"] = lambda: _XATO_DUP_USERLISTS[0]   # instalada, pero NO debe tocarse
+    globals()["_xato_dup_wordlist"] = lambda: _XATO_DUP_USERLISTS[0]
     globals()["run_capture"] = _fake_esc_rc_partial
     globals()["USERENUM_WORDLIST"] = None
+    _esc_dir5 = Path(tempfile.mkdtemp())
     _esc_res5 = _fp("kerberos", "Kerberos", [88])
     try:
-        _kerbrute_userenum(_esc_res5, "10.0.0.5", "corp.local", None)
+        _esc_found5 = _kerbrute_userenum(_esc_res5, "10.0.0.5", "corp.local", _esc_dir5)
     finally:
         (globals()["_kerbrute_bin"], globals()["_userenum_wordlist"], globals()["_awesome_mix_wordlist"],
          globals()["_xato_dup_wordlist"], globals()["run_capture"], globals()["USERENUM_WORDLIST"]) = (
             _real_kbbin4, _real_wl4, _real_mix4, _real_xato4, _real_rc4b, _real_uw4)
-    assert len(_esc_cmds5) == 2, _esc_cmds5   # jsmith + awesome-mix (parcial) — NUNCA xato-dup
-    assert not any(_XATO_DUP_USERLISTS[0] in c for c in _esc_cmds5), _esc_cmds5
+    assert len(_esc_cmds5) == 3, _esc_cmds5   # jsmith + awesome-mix (parcial) + xato-dup — LOS 3, nada frena la cadena
+    assert any(_XATO_DUP_USERLISTS[0] in c for c in _esc_cmds5), _esc_cmds5
+    assert _esc_found5 is True, _esc_res5   # xato-dup SÍ encontró, aunque el escalón anterior quedase parcial
+    assert (_esc_dir5 / "ad_users.txt").read_text().strip() == "kleo2"
 
     # --userenum-wordlist (el operador trajo la suya): NUNCA escala, aunque dé 0 usuarios — ya
     # decidió él qué lista usar.
@@ -18435,6 +18606,86 @@ def selftest():
     assert any(s == "critica" and "KeePass EN EJECUCIÓN" in t for s, t in _kres["findings"])
     _kp_key = next(t for s, t in _kres["findings"] if "KeePass EN EJECUCIÓN" in t)
     assert any("keepass_trigger" in c for c in _kres.get("_cmd_for", {}).get(_kp_key, []))
+
+    # ── _is_nxc_cmd / _ensure_nxc_verbose: fiabilidad del parser (--verbose siempre a nxc) ────
+    assert _is_nxc_cmd(["nxc", "smb", "1.2.3.4"]) is True
+    assert _is_nxc_cmd(["netexec", "ldap", "1.2.3.4"]) is True
+    assert _is_nxc_cmd(["crackmapexec", "smb", "1.2.3.4"]) is True
+    assert _is_nxc_cmd(["/home/user/.local/bin/nxc", "smb", "x"]) is True   # basename, no solo el nombre pelado
+    assert _is_nxc_cmd(["dig", "NS", "x"]) is False
+    assert _is_nxc_cmd([]) is False
+    assert _is_nxc_cmd(["FAKE_NXC", "smb", "x"]) is False   # a propósito: los mocks del selftest usan este nombre, NUNCA deben disparar esto
+    _nv1 = ["nxc", "smb", "1.2.3.4", "-u", "a", "-p", "b"]
+    _nv1_out = _ensure_nxc_verbose(_nv1)
+    assert _nv1_out == _nv1 + ["--verbose"]
+    assert _nv1 == ["nxc", "smb", "1.2.3.4", "-u", "a", "-p", "b"]   # NO muta la lista original
+    assert _ensure_nxc_verbose(["nxc", "smb", "x", "--verbose"]) == ["nxc", "smb", "x", "--verbose"]   # no lo duplica
+    assert _ensure_nxc_verbose(["nxc", "smb", "x", "--debug"]) == ["nxc", "smb", "x", "--debug"]        # respeta --debug explícito
+    assert _ensure_nxc_verbose(["dig", "NS", "x"]) == ["dig", "NS", "x"]   # no-nxc: intacto
+
+    # ── run_capture REAL (sin mockear): --verbose llega de verdad al subproceso, su salida
+    # cruda queda en commands.log (nunca a pantalla salvo VERBOSE), y --verbose/-v de palantir
+    # hace el eco en vivo. Script de mentira cuyo basename es EXACTAMENTE 'nxc' (ruta absoluta:
+    # subprocess no busca en PATH) para que _is_nxc_cmd lo reconozca igual que al binario real.
+    import stat as _stat_mod
+    _vdir = Path(tempfile.mkdtemp())
+    _fake_nxc_path = _vdir / "nxc"
+    _fake_nxc_path.write_text("#!/bin/sh\necho \"ARGS:$*\"\n", encoding="utf-8")
+    _fake_nxc_path.chmod(_fake_nxc_path.stat().st_mode | _stat_mod.S_IEXEC)
+    _fake_other_path = _vdir / "notnxc"
+    _fake_other_path.write_text("#!/bin/sh\necho \"other output\"\n", encoding="utf-8")
+    _fake_other_path.chmod(_fake_other_path.stat().st_mode | _stat_mod.S_IEXEC)
+    _log_path = _vdir / "commands.log"
+    _real_log_path = _commands_log()
+    _set_commands_log(str(_log_path))
+    try:
+        _rc_v, _out_v = run_capture([str(_fake_nxc_path), "smb", "1.2.3.4"], quiet=True)
+    finally:
+        _set_commands_log(_real_log_path)
+    assert _rc_v == 0
+    assert "ARGS:smb 1.2.3.4 --verbose" in _out_v   # el subproceso REAL recibió --verbose (no solo en Python)
+    _logged = _log_path.read_text(encoding="utf-8")
+    assert "» ARGS:smb 1.2.3.4 --verbose" in _logged   # la salida cruda de nxc SÍ queda en commands.log
+
+    # quiet=True + VERBOSE=False (modo normal): nada a pantalla.
+    import io as _io_v, contextlib as _cl_v
+    _buf_v = _io_v.StringIO()
+    _log_path2 = _vdir / "commands2.log"
+    _set_commands_log(str(_log_path2))
+    try:
+        with _cl_v.redirect_stdout(_buf_v):
+            run_capture([str(_fake_nxc_path), "smb", "1.2.3.4"], quiet=True)
+    finally:
+        _set_commands_log(_real_log_path)
+    assert _buf_v.getvalue() == ""   # silencio total en pantalla
+
+    # VERBOSE=True (palantir -v): eco en vivo del comando Y de la salida, aunque quiet=True.
+    _real_verbose = globals()["VERBOSE"]
+    globals()["VERBOSE"] = True
+    _buf_v2 = _io_v.StringIO()
+    _log_path3 = _vdir / "commands3.log"
+    _set_commands_log(str(_log_path3))
+    try:
+        with _cl_v.redirect_stdout(_buf_v2):
+            run_capture([str(_fake_nxc_path), "smb", "1.2.3.4"], quiet=True)
+    finally:
+        globals()["VERBOSE"] = _real_verbose
+        _set_commands_log(_real_log_path)
+    _printed_v2 = _buf_v2.getvalue()
+    assert "$ " in _printed_v2 and str(_fake_nxc_path) in _printed_v2   # el comando crudo
+    assert "ARGS:smb 1.2.3.4 --verbose" in _printed_v2                  # la salida cruda, en vivo
+
+    # un comando NO-nxc (basename distinto) nunca recibe --verbose ni se vuelca a commands.log
+    # por _log_nxc_output (sigue registrando la LÍNEA de comando, como siempre — eso no cambia).
+    _log_path4 = _vdir / "commands4.log"
+    _set_commands_log(str(_log_path4))
+    try:
+        _rc_o, _out_o = run_capture([str(_fake_other_path)], quiet=True)
+    finally:
+        _set_commands_log(_real_log_path)
+    assert _out_o.strip() == "other output" and "--verbose" not in _out_o
+    _logged4 = _log_path4.read_text(encoding="utf-8")
+    assert "» other output" not in _logged4   # _log_nxc_output no se dispara para comandos ajenos a nxc
 
     print("selftest OK")
 
@@ -20306,6 +20557,11 @@ def main():
                          "salida a severidad low+ (descarta el ruido 'info' de detección de tecnología). "
                          "OFF por defecto: escaneo completo de plantillas, lento y ruidoso — opt-in.")
     g_informe.add_argument("--no-html", action="store_true", help="No generar report.html / findings.json.")
+    g_informe.add_argument("-v", "--verbose", action="store_true",
+                    help="Eco EN VIVO del comando crudo + su salida cruda tal cual se ejecuta, "
+                         "saltándose el resumen bonito (y el silencio de --jobs/listas grandes). "
+                         "Para diagnosticar un run que parece colgado o vacío — nada que ver con "
+                         "el --verbose interno que palantir ya le fuerza siempre a nxc.")
     g_informe.add_argument("--selftest", action="store_true",
                     help="Ejecuta las pruebas internas (sin tocar la red) y sale.")
     rc_args = _load_rc_args()
@@ -20327,8 +20583,9 @@ def main():
         ap.error(str(e))
 
     global RESUME, SNMP_WORDLIST, NIKTO, CMS_SCAN, CRAWL, CONNECT, NUCLEI, SPIDER, SPIDER_PATTERN, TUNNEL
-    global USERENUM_WORDLIST, NO_USERENUM, SPRAY_PASSWORDS, SHOW_SECRETS
+    global USERENUM_WORDLIST, NO_USERENUM, SPRAY_PASSWORDS, SHOW_SECRETS, VERBOSE
     SHOW_SECRETS = not args.hide_secrets
+    VERBOSE = args.verbose
     RESUME = args.resume
     NIKTO = args.nikto
     CMS_SCAN = args.cms_scan
