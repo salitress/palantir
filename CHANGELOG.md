@@ -42,6 +42,17 @@ this project follows [Semantic Versioning](https://semver.org/).
   `fp_oracle`'s `tnscmd10g` call); any files found become an `alta` finding with a `tftp -c get
   <file>` next-step per file.
 
+- **ADWS (9389) finding now reflects whether LDAP is actually usable on the same host**
+  (operator-asked "¿se le podría mejorar?"): `fp_adws` never ran any active enumeration (nmap has
+  no NSE script for 9389, and NetExec has no `adws` protocol at all — checked against its real
+  `nxc/protocols/` source: only `ftp/ldap/mssql/nfs/rdp/smb/ssh/vnc/winrm/wmi`), so the only honest
+  improvement left is making the finding/next-steps context-aware instead of always identical. When
+  LDAP (389/636/3268/3269) is also open on the host, ADWS is redundant with the automated LDAP
+  enumeration `fp_ldap` already does — stays an `info` finding, RSAT suggested first. When LDAP is
+  NOT open, ADWS is the *only* AD-enumeration path left without an RSAT foothold — now a `media`
+  finding, with SOAPy (the ADWS-based collector) put first instead of as an afterthought next to the
+  RSAT note.
+
 ### Fixed
 
 - **`--resume` always re-ran ffuf in full** (operator-reported): directory/vhost fuzzing (up to

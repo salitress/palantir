@@ -5606,19 +5606,40 @@ def fp_adws(ip, ports, services, host, deep, domain=None):
     convertir su salida a JSON de BloodHound. Sintaxis verificada contra el README real
     del repo (no inventada) — aun así el autor sigue desarrollándolo (ahora en
     SpecterOps), así que si algo no cuadra, revisa su wiki antes de asumir que es un
-    error de palantir. Solo lectura: nmap no trae scripts NSE propios para 9389, así que
-    no hay nada que enumerar aquí sin más herramientas."""
+    error de palantir. Solo lectura: nmap no trae scripts NSE propios para 9389, y nxc
+    tampoco tiene protocolo 'adws' (confirmado en su código fuente real: nxc/protocols/
+    solo trae ftp/ldap/mssql/nfs/rdp/smb/ssh/vnc/winrm/wmi) — así que no hay nada que
+    automatizar aquí sin SOAPy, que no es una dependencia habitual de palantir.
+
+    Si LDAP (389/636/3268/3269) NO aparece entre los `services` de este mismo host,
+    ADWS deja de ser un canal redundante con la enumeración automática que ya hace
+    fp_ldap: es la ÚNICA vía de enumeración de AD sin un foothold RSAT en ese objetivo.
+    En ese caso sube la severidad a 'media' (en vez de 'info') y antepone SOAPy como la
+    jugada principal, no una alternativa genérica al lado de la nota de RSAT."""
     res = _fp("adws", "ADWS", [p["port"] for p in ports])
-    res["findings"].append(("info",
-        "ADWS (9389) abierto — corrobora que es un Domain Controller; mismo canal que "
-        "usa el módulo PowerShell ActiveDirectory (Get-AD*) en vez de LDAP"))
-    res["next"] += [
+    ldap_open = any(classify(p) == "ldap" for p in services)
+    rsat_next = (
         "Import-Module ActiveDirectory; Get-ADUser -Filter * -Properties MemberOf,ServicePrincipalName   "
         "# si ya tienes PowerShell con RSAT en un host del dominio, el módulo ActiveDirectory habla "
-        "por ADWS en vez de LDAP — útil si el LDAP está limitado/monitorizado",
-        "pipx install git+https://github.com/logangoins/SOAPy   # colector de AD por ADWS en vez de LDAP (repo activo — revisa su wiki si --help no coincide)",
-        f"SOAPy {domain or 'DOMINIO'}/USER:'PASS'@{ip} --users   # recolección por ADWS — el binario es 'SOAPy' con mayúsculas (pyproject [tool.poetry.scripts]); 'soapy' falla en Linux. Convierte la salida a JSON de BloodHound con bofhound (github.com/coffeegist/bofhound)",
-    ]
+        "por ADWS en vez de LDAP" + ("" if ldap_open else " — aquí LDAP no está disponible, es la única vía RSAT")
+    )
+    soapy_install = ("pipx install git+https://github.com/logangoins/SOAPy   # colector de AD por ADWS en vez "
+                      "de LDAP (repo activo — revisa su wiki si --help no coincide)")
+    soapy_run = (f"SOAPy {domain or 'DOMINIO'}/USER:'PASS'@{ip} --users   # recolección por ADWS — el binario es "
+                 "'SOAPy' con mayúsculas (pyproject [tool.poetry.scripts]); 'soapy' falla en Linux. Convierte la "
+                 "salida a JSON de BloodHound con bofhound (github.com/coffeegist/bofhound)")
+    if ldap_open:
+        res["findings"].append(("info",
+            "ADWS (9389) abierto — corrobora que es un Domain Controller; mismo canal que "
+            "usa el módulo PowerShell ActiveDirectory (Get-AD*) en vez de LDAP"))
+        res["next"] += [rsat_next, soapy_install, soapy_run]
+    else:
+        res["findings"].append(("media",
+            "ADWS (9389) abierto y corrobora que es un Domain Controller, pero SIN LDAP "
+            "(389/636/3268/3269) detectado en este host — la enumeración automática de AD por "
+            "LDAP de palantir (fp_ldap) no se puede ejecutar aquí, así que ADWS (vía SOAPy) es tu "
+            "única vía de enumeración de AD sin un foothold RSAT"))
+        res["next"] += [soapy_install, soapy_run, rsat_next]
     return res
 
 
@@ -15412,18 +15433,36 @@ def selftest():
     assert any("impacket-GetUserSPNs " in n for n in _kb_fpr["next"]), _kb_fpr["next"]
     assert not any("GetNPUsers.py" in n or "GetUserSPNs.py" in n for n in _kb_fpr["next"])
 
-    # fp_adws: puerto 9389 (mc-nmf) → finding de DC + next-steps (PowerShell AD + SoaPy)
+    # fp_adws: puerto 9389 (mc-nmf) → finding de DC + next-steps (PowerShell AD + SoaPy).
+    # Caso con LDAP TAMBIÉN abierto en el host: ADWS es redundante con fp_ldap → severidad
+    # 'info', RSAT primero en next (comportamiento de siempre).
     _adws_fpr = fp_adws("10.0.0.1", [{"port": 9389, "name": "mc-nmf", "scripts": {}}],
-                         [{"port": 9389, "name": "mc-nmf", "scripts": {}}], {}, False)
-    assert any("Domain Controller" in f[1] for f in _adws_fpr["findings"]), _adws_fpr["findings"]
+                         [{"port": 9389, "name": "mc-nmf", "scripts": {}},
+                          {"port": 389, "name": "ldap", "scripts": {}}], {}, False)
+    assert any("Domain Controller" in t for _s, t in _adws_fpr["findings"]), _adws_fpr["findings"]
+    assert any(s == "info" for s, _t in _adws_fpr["findings"]), _adws_fpr["findings"]
+    assert _adws_fpr["next"][0].startswith("Import-Module ActiveDirectory"), _adws_fpr["next"]
     assert any("Get-ADUser" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
     # #34: el binario es 'SOAPy' con mayúsculas (pyproject [tool.poetry.scripts]); 'soapy' falla en Linux.
     assert any("SOAPy DOMINIO/USER" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
     assert not any(re.search(r"\bsoapy ", n) for n in _adws_fpr["next"]), _adws_fpr["next"]
     assert any("logangoins/SOAPy" in n for n in _adws_fpr["next"]), _adws_fpr["next"]
     _adws_fpr2 = fp_adws("10.0.0.1", [{"port": 9389, "name": "mc-nmf", "scripts": {}}],
-                         [{"port": 9389, "name": "mc-nmf", "scripts": {}}], {}, False, domain="corp.local")
+                         [{"port": 9389, "name": "mc-nmf", "scripts": {}},
+                          {"port": 389, "name": "ldap", "scripts": {}}], {}, False, domain="corp.local")
     assert any("SOAPy corp.local/USER" in n for n in _adws_fpr2["next"]), _adws_fpr2["next"]
+
+    # Caso SIN LDAP entre los services del host (nxc no tiene protocolo 'adws' — confirmado en
+    # el código fuente real de NetExec: nxc/protocols/ solo trae ftp/ldap/mssql/nfs/rdp/smb/
+    # ssh/vnc/winrm/wmi): aquí ADWS deja de ser redundante con fp_ldap → severidad 'media' y
+    # SOAPy antepuesto (primer next-step) en vez de la nota de RSAT.
+    _adws_noldap = fp_adws("10.0.0.1", [{"port": 9389, "name": "mc-nmf", "scripts": {}}],
+                            [{"port": 9389, "name": "mc-nmf", "scripts": {}}], {}, False)
+    assert any("Domain Controller" in t for _s, t in _adws_noldap["findings"]), _adws_noldap["findings"]
+    assert any(s == "media" and "SIN LDAP" in t for s, t in _adws_noldap["findings"]), _adws_noldap["findings"]
+    assert not any(s == "info" for s, _t in _adws_noldap["findings"]), _adws_noldap["findings"]
+    assert _adws_noldap["next"][0].startswith("pipx install"), _adws_noldap["next"]
+    assert any("aquí LDAP no está disponible" in n for n in _adws_noldap["next"]), _adws_noldap["next"]
 
     # _secretsdump_bin: el nombre de apt ('impacket-secretsdump') va PRIMERO — confirmado
     # contra un Kali real que no tiene 'secretsdump.py' así en el PATH (ver _impacket_suggest_bin
