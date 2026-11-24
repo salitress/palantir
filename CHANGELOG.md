@@ -21,6 +21,19 @@ this project follows [Semantic Versioning](https://semver.org/).
   technique instead of inventing one) and `DnsAdmins` (`ServerLevelPluginDll` against the DC's DNS
   service — needs `dnscmd.exe`/RSAT, same story: no Linux one-liner, named honestly as such).
 
+### Fixed
+
+- **Confirmed Domain Admins never got an `impacket-secretsdump` suggestion** (operator-reported,
+  live run: Administrator confirmed Domain Admin — `Pwn3d!` by LDAP/SMB/WinRM/WMI — but the report
+  never suggested a DCSync: "no da impacket secretsdump etc, faltan cosas"). The only existing path
+  to a DCSync finding checked a *direct* ACE on the credential's own SID
+  (`daclread RIGHTS=DCSync` — confirmed against nxc's real source, it compares the principal's own
+  SID against the ACE's trustee, without expanding group membership), but the replication right is
+  almost always granted to the `Domain Admins`/`Enterprise Admins` *group* SID, not to each member —
+  so it missed exactly the most common case, a real Domain Admin. Membership in either group now
+  implies DCSync on its own and suggests `impacket-secretsdump -just-dc`, sharing the same finding
+  marker as the ACE-based path so only one `DCSync viable` finding ever appears.
+
 ## [2.0.6] - 2026-11-24
 
 ### Added

