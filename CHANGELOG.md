@@ -6,7 +6,7 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.1.0] - 2026-11-24
 
 ### Added
 
