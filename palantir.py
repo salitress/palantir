@@ -3270,6 +3270,14 @@ def fp_smb(ip, ports, services, host, deep, base=None):
             # 'enumdomusers' NO devuelve nada (p. ej. ese subcomando bloqueado pero el resto de la
             # sesión nula sí responde) — ver el 'else' de abajo.
             res["findings"].append(("alta", f"Usuarios por RPC null-session: {', '.join(users[:15])}"))
+            # BUG real (operador: "los users que ha sacado no los ha guardado en ningún .txt") —
+            # a diferencia de kerbrute/_smb_ad_enum (que sí vuelcan a <base>/ad_users.txt), esta
+            # lista de 'enumdomusers' por sesión nula se quedaba SOLO en el hallazgo, nunca en
+            # disco — nada que pasarle a un bruteforce/spray después sin copiarlos a mano del
+            # informe. Mismo filtro de cuentas de equipo ($) que el resto de puntos que ya
+            # escriben a ad_users.txt (no sirven para AS-REP roast ni spraying, ver línea ~3030).
+            if base:
+                _merge_write_ad_users(base, [u for u in users if not u.endswith("$")])
         else:
             res["next"].append("rpcclient: 'queryuser <RID>' / brute de RIDs con seq+queryuser")
         if not nxc:   # sin nxc, 'getdompwinfo' es la ÚNICA fuente de pass-pol por sesión nula
@@ -5656,6 +5664,19 @@ def fp_rmi(ip, ports, services, host, deep):
     return res
 
 
+def _ad_users_path(base):
+    """Ruta de <base>/ad_users.txt para ENSEÑAR en comandos sugeridos (AS-REP roast, password
+    spraying…) — ya absoluta desde que args.outdir se resuelve una vez al arrancar (ver main()),
+    así que lo que aquí se construye es siempre copiable/pegable desde cualquier directorio.
+    BUG real corregido (operador: "si me recomienda... users.txt o ad_users.txt que lo haga de
+    manera absoluta"): varios next-steps escribían el nombre 'ad_users.txt' a secas en el propio
+    texto del comando en vez de esta ruta — el FICHERO ya se escribía bien en <base>/ad_users.txt
+    (ver _merge_write_ad_users), pero el comando sugerido para LEERLO solo era válido relanzado
+    desde el mismo directorio donde corrió palantir, no desde donde el operador lea el informe
+    después. 'ad_users.txt' a secas (sin 'base') solo puede pasar fuera de producción (tests)."""
+    return str(Path(base) / "ad_users.txt") if base else "ad_users.txt"
+
+
 def _merge_write_ad_users(base, users):
     """Escribe <base>/ad_users.txt MEZCLANDO con lo que ya hubiera, en vez de pisarlo entero.
     Dos fuentes DISTINTAS escriben a este mismo fichero: kerbrute (Fase 5, adivina cuentas
@@ -5723,7 +5744,7 @@ def _kerbrute_run_pass(res, kb, ip, domain, wl, base):
                 _merge_write_ad_users(base, users)
             except OSError:
                 pass
-        res["next"].append(f"{_impacket_suggest_bin('GetNPUsers')} {domain}/ -usersfile ad_users.txt -no-pass -dc-ip {ip}   # AS-REP roast de los usuarios hallados")
+        res["next"].append(f"{_impacket_suggest_bin('GetNPUsers')} {domain}/ -usersfile {_ad_users_path(base)} -no-pass -dc-ip {ip}   # AS-REP roast de los usuarios hallados")
     if noauth:
         res["findings"].append(("alta", f"Kerberos: {len(noauth)} cuenta(s) SIN pre-auth (AS-REP roastables, hash crackeable sin credenciales): "
                                 + ", ".join(noauth[:10]) + psfx))
@@ -5889,7 +5910,7 @@ def _spray_phase(ip, domain, base, services):
     if not kb:
         res["missing"].append("kerbrute")
         res["next"].append(
-            f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt '<pass>' --safe   # instala kerbrute y rocía")
+            f"kerbrute passwordspray -d {domain} --dc {ip} {_ad_users_path(base)} '<pass>' --safe   # instala kerbrute y rocía")
         return res
     users = _read_ad_users(base)
     if not users:
@@ -5902,12 +5923,12 @@ def _spray_phase(ip, domain, base, services):
          "detecta un bloqueo). Una pre-auth fallida cuenta como login fallido: con una política de "
          "bloqueo agresiva PUEDE bloquear cuentas — es un paso ACTIVO que pediste tú con --spray.")
     for pw in SPRAY_PASSWORDS:
-        info(f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt {_sec_disp(pw)} --safe   ({len(users)} usuarios)")
+        info(f"kerbrute passwordspray -d {domain} --dc {ip} {userfile} {_sec_disp(pw)} --safe   ({len(users)} usuarios)")
         rc, out = run_capture([kb, "passwordspray", "-d", domain, "--dc", ip, userfile, pw, "--safe"],
                               timeout=1800, quiet=True)
         valid = _parse_kerbrute_spray(out)
         shown = _mask_out(out, pw)
-        _step(res, f"kerbrute passwordspray -d {domain} --dc {ip} ad_users.txt {_sec_disp(pw)} --safe", bool(valid), shown,
+        _step(res, f"kerbrute passwordspray -d {domain} --dc {ip} {userfile} {_sec_disp(pw)} --safe", bool(valid), shown,
               note="password spraying con --safe contra los usuarios descubiertos (pre-auth fallida = login fallido → posible bloqueo)")
         for usr in valid:
             good(f"  ✓ Password spraying VÁLIDO: {usr} : {pw}")   # en pantalla; el informe la enmascara solo con --hide-secrets
@@ -5982,11 +6003,11 @@ def fp_kerberos(ip, ports, services, host, deep, domain=None, base=None, has_cre
     else:
         res["next"].append(f"kerbrute userenum -d DOMINIO --dc {ip} /usr/share/seclists/Usernames/xato-net-10-million-usernames-dup.txt   # enum de usuarios por Kerberos (NO bloquea cuentas) — dominio aún no resuelto en este punto")
     res["next"] += [
-        f"kerbrute passwordspray -d {domain or 'DOMINIO'} --dc {ip} ad_users.txt 'Welcome1' --safe   # spray 1 pass contra los usuarios hallados (OJO: pre-auth fallida SÍ cuenta como login fallido → lockout; --safe aborta si detecta una cuenta bloqueada)",
+        f"kerbrute passwordspray -d {domain or 'DOMINIO'} --dc {ip} {_ad_users_path(base)} 'Welcome1' --safe   # spray 1 pass contra los usuarios hallados (OJO: pre-auth fallida SÍ cuenta como login fallido → lockout; --safe aborta si detecta una cuenta bloqueada)",
     ]
     if not asrep_ya_sugerido:   # _kerbrute_userenum YA la puso arriba si encontró usuarios — no repetirla
         res["next"].append(
-            f"{_impacket_suggest_bin('GetNPUsers')} {domain or 'DOMINIO'}/ -usersfile ad_users.txt -no-pass -dc-ip {ip}   # AS-REP roast: 1 intento por usuario YA conocido (sácalos de SMB/LDAP/kerbrute primero)")
+            f"{_impacket_suggest_bin('GetNPUsers')} {domain or 'DOMINIO'}/ -usersfile {_ad_users_path(base)} -no-pass -dc-ip {ip}   # AS-REP roast: 1 intento por usuario YA conocido (sácalos de SMB/LDAP/kerbrute primero)")
     res["next"] += [
         f"{_impacket_suggest_bin('GetUserSPNs')} {domain or 'DOMINIO'}/USER:PASS -dc-ip {ip} -request   # Kerberoasting (con credenciales válidas)",
         # Timeroasting (MS-SNTP, Secura/@Disgame): pide por UDP/123 el hash de CUALQUIER cuenta de
@@ -6033,7 +6054,7 @@ def _run_deferred_kerbrute_fallback(footprints):
             # usuario YA conocido", añadido sin saber aún si kerbrute iba a correr) deja
             # puesto — quitarlo evita el MISMO comando por duplicado.
             f["next"] = [n for n in f["next"]
-                         if not ("-usersfile ad_users.txt -no-pass" in n and "YA conocido" in n)]
+                         if not (f"-usersfile {_ad_users_path(pending['base'])} -no-pass" in n and "YA conocido" in n)]
 
 
 def fp_adws(ip, ports, services, host, deep, domain=None):
@@ -15035,36 +15056,44 @@ def selftest():
     assert "_signing_disabled" not in _fs_smb3
 
     # _suggest_brutespray: 0 o 1 servicio "crackeable" → None (hydra por protocolo ya alcanza,
-    # no mete ruido). 2+ → UN footprint sintético con el recuento real y, si existe el .gnmap
-    # de la Fase 2 (deep_scan -oA), su ruta real en vez de un placeholder.
-    assert _suggest_brutespray([_fp("ssh", "SSH", [22])], "10.0.0.1", "/tmp/no-existe-nunca") is None
-    assert _suggest_brutespray([], "10.0.0.1", "/tmp/no-existe-nunca") is None
-    _bs_tmp = Path(tempfile.mkdtemp())
+    # no mete ruido). 2+ → UN footprint sintético con el recuento real y un '-H servicio://ip:
+    # puerto' por cada puerto real (ver el docstring de la función: ya NO depende de ningún
+    # .gnmap/.xml en disco ni del nombre de servicio que nmap le haya puesto al puerto).
+    assert _suggest_brutespray([_fp("ssh", "SSH", [22])], "10.0.0.1") is None
+    assert _suggest_brutespray([], "10.0.0.1") is None
     _bs_fps = [_fp("ssh", "SSH", [22]), _fp("ftp", "FTP", [21]), _fp("smb", "SMB / RPC", [445])]
-    _bsres_nognmap = _suggest_brutespray(_bs_fps, "10.0.0.1", _bs_tmp)
-    assert _bsres_nognmap is not None and _bsres_nognmap["proto"] == "brutespray"
-    assert any(s == "info" and "3 servicio" in t and "ssh" in t and "smbnt" in t for s, t in _bsres_nognmap["findings"])
-    assert any("brutespray -f TU_GNMAP_O_XML" in n and "no encontré" in n for n in _bsres_nognmap["next"])   # sin .gnmap: placeholder, nunca '-f <ip>' (sintaxis inválida)
-    assert not any(" -f 10.0.0.1 " in n for n in _bsres_nognmap["next"])   # '-f' SIEMPRE un fichero, nunca la IP suelta
-    (_bs_tmp / "nmap").mkdir()
-    (_bs_tmp / "nmap" / "deep.gnmap").write_text("# fake gnmap\n")
-    _bsres_gnmap = _suggest_brutespray(_bs_fps, "10.0.0.1", _bs_tmp)
-    assert any(f"brutespray -f {_bs_tmp / 'nmap' / 'deep.gnmap'}" in n for n in _bsres_gnmap["next"])   # CON .gnmap: la ruta real
-    shutil.rmtree(_bs_tmp)
+    _bsres = _suggest_brutespray(_bs_fps, "10.0.0.1")
+    assert _bsres is not None and _bsres["proto"] == "brutespray"
+    assert any(s == "info" and "3 servicio" in t and "ssh" in t and "smbnt" in t for s, t in _bsres["findings"])
+    _bs_cmd = _bsres["next"][0]
+    assert "-H ssh://10.0.0.1:22" in _bs_cmd and "-H ftp://10.0.0.1:21" in _bs_cmd and "-H smbnt://10.0.0.1:445" in _bs_cmd, _bs_cmd
+    assert "-f " not in _bs_cmd, _bs_cmd   # BUG real corregido: ya no depende de ningún fichero de nmap
+    # Mismo bug, con las DOS firmas reales de un puerto SMB servido por Samba (139 Y 445, ambas
+    # vistas en un run real) — '-H smbnt://...' sale para cada una, nunca se confunde con el
+    # 'netbios-ssn' que nmap le pone de nombre de servicio (que es justo lo que rompía el '-f
+    # deep.gnmap' de antes: brutespray no reconoce 'netbios-ssn', así que SMB se quedaba fuera
+    # en silencio aunque el hallazgo dijera "crackeable").
+    _bsres_samba = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("smb", "SMB / RPC", [139, 445])], "10.0.0.1")
+    _bs_cmd_samba = _bsres_samba["next"][0]
+    assert "-H smbnt://10.0.0.1:139" in _bs_cmd_samba and "-H smbnt://10.0.0.1:445" in _bs_cmd_samba, _bs_cmd_samba
     # #59: imap_pop3 se discrimina por los PUERTOS reales, no asume ambos. 143-only → solo imap
     # (antes contaba imap Y pop3, inflando el conteo y listando un pop3 inexistente).
     _bsres_imap = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("imap_pop3", "IMAP / POP3", [143])],
-                                       "10.0.0.1", "/tmp/no-existe-nunca")
+                                       "10.0.0.1")
     assert _bsres_imap is not None
     assert any("imap" in t and "pop3" not in t for s, t in _bsres_imap["findings"]), _bsres_imap["findings"]
+    assert "-H imap://10.0.0.1:143" in _bsres_imap["next"][0] and "pop3://" not in _bsres_imap["next"][0]
     # con 143 Y 110 presentes, sí cuenta imap Y pop3
-    _bsres_both = _suggest_brutespray([_fp("imap_pop3", "IMAP / POP3", [143, 110])], "10.0.0.1", "/tmp/no-existe-nunca")
+    _bsres_both = _suggest_brutespray([_fp("imap_pop3", "IMAP / POP3", [143, 110])], "10.0.0.1")
     assert _bsres_both is not None and any("imap" in t and "pop3" in t for s, t in _bsres_both["findings"])
-    # #57: el modo spray MANTIENE '-p' (no lo sustituye); #60: avisa de SNMP en udp.gnmap.
-    _bsres_sn = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("snmp", "SNMP", [161])], "10.0.0.1", "/tmp/no-existe-nunca")
+    assert "-H imap://10.0.0.1:143" in _bsres_both["next"][0] and "-H pop3://10.0.0.1:110" in _bsres_both["next"][0]
+    # #57: el modo spray MANTIENE '-p' (no lo sustituye). SNMP (UDP) va como cualquier otro: un
+    # '-H snmp://ip:161' — ya no hace falta ningún aviso de udp.gnmap (#60 quedó obsoleto: ya no
+    # se depende de qué fichero de nmap trae qué puerto).
+    _bsres_sn = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("snmp", "SNMP", [161])], "10.0.0.1")
     _bs_next_txt = " ".join(_bsres_sn["next"])
     assert "en vez de" not in _bs_next_txt and "MANTENIENDO" in _bs_next_txt, _bs_next_txt
-    assert "udp.gnmap" in _bs_next_txt, _bs_next_txt
+    assert "-H snmp://10.0.0.1:161" in _bs_next_txt, _bs_next_txt
     # #63: mongodb cubierto por brutespray; oracle NO (no está en services.md de brutespray).
     assert "mongodb" in _BRUTESPRAY_EXTRA_PROTOS and "oracle" not in _BRUTESPRAY_EXTRA_PROTOS
     # #62: _brutespray_bulk no fuerza '-r 1' (usa el default 3 de brutespray) y no re-lanza en vacío.
@@ -15082,14 +15111,6 @@ def selftest():
     assert _brutespray_is_v2("Usage of brutespray:\n  -no-tui\n  -summary\n  -checkpoint string") is True
     assert _brutespray_is_v2("brutespray.py Usage: -f <gnmapfile> -s ssh -t 5 --service") is False
     assert _brutespray_is_v2("") is True   # ante la duda, no bloquear
-    # #30: con SNMP en el set Y un udp.gnmap en disco, el comando incluye un segundo '-f udp.gnmap'.
-    _bs30 = Path(tempfile.mkdtemp())
-    (_bs30 / "nmap").mkdir()
-    (_bs30 / "nmap" / "deep.gnmap").write_text("# tcp\n")
-    (_bs30 / "nmap" / "udp.gnmap").write_text("# udp snmp\n")
-    _bsr30 = _suggest_brutespray([_fp("ssh", "SSH", [22]), _fp("snmp", "SNMP", [161])], "10.0.0.1", _bs30)
-    assert any(f"-f {_bs30 / 'nmap' / 'udp.gnmap'}" in n for n in _bsr30["next"]), _bsr30["next"]
-    shutil.rmtree(_bs30)
     # #31: un servicio crackeable SIN camino automatizado (oracle) se avisa aunque no haya nada que probar por nxc.
     _real_nxcbin31, _real_rc31 = nxc_bin, run_capture
     globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), (lambda *a, **kw: (1, "x"))
@@ -18708,7 +18729,7 @@ def selftest():
     # '-usersfile ad_users.txt -no-pass' salía DOS VECES en next-steps (una de
     # _kerbrute_userenum, "de los usuarios hallados", y otra fija de fp_kerberos, "1 intento
     # por usuario YA conocido") — visto en vivo, mismo informe real que el de arriba.
-    assert sum("-usersfile ad_users.txt -no-pass" in n for n in _kbres["next"]) == 1, _kbres["next"]
+    assert sum(f"-usersfile {_ad_users_path(_kb_dir)} -no-pass" in n for n in _kbres["next"]) == 1, _kbres["next"]
     # timeroast: sugerencia MANUAL con rango de RIDs acotado (NO el 1-2^31 por defecto del
     # módulo, que puede tardar mucho/ser muy ruidoso) — nunca ejecutado por palantir.
     assert any("-M timeroast" in n and "rids=500-2000" in n for n in _kbres["next"]), _kbres["next"]
@@ -20278,27 +20299,46 @@ _BRUTESPRAY_SVC = {
 }
 
 
-def _suggest_brutespray(footprints, ip, base):
+def _suggest_brutespray(footprints, ip):
     """Si hay 2 o más servicios DISTINTOS de los que brutespray sabe atacar por diccionario
-    (ver _BRUTESPRAY_SVC) en el MISMO objetivo, sugiere UNA sola pasada de brutespray contra
-    el .gnmap que nmap ya guardó (Fase 2, 'deep_scan' con -oA) en vez de ir servicio a servicio
-    con hydra — lo que cada fp_* YA sugiere por separado y sigue ahí, esto es un complemento,
-    no un reemplazo. Con 0 o 1 servicio no aporta nada sobre el hydra de ese único protocolo →
-    None (no se añade ruido). Nunca se ejecuta — sugerencia de texto, igual que el resto de
-    next-steps de esta sección. Devuelve un footprint para el informe, o None."""
-    svcs = set()
+    (ver _BRUTESPRAY_SVC) en el MISMO objetivo, sugiere UNA sola pasada de brutespray en vez de
+    ir servicio a servicio con hydra — lo que cada fp_* YA sugiere por separado y sigue ahí,
+    esto es un complemento, no un reemplazo. Con 0 o 1 servicio no aporta nada sobre el hydra de
+    ese único protocolo → None (no se añade ruido). Nunca se ejecuta — sugerencia de texto,
+    igual que el resto de next-steps de esta sección.
+
+    BUG real corregido aquí (operador, run en vivo: el '-f .../deep.gnmap' que esto sugería
+    antes hacía que brutespray atacara ssh Y http, pero JAMÁS smb, pese a que el hallazgo decía
+    "2 servicios crackeables (smbnt, ssh)"). Confirmado leyendo el código fuente real de
+    brutespray (modules/parse.go): su parser de .gnmap solo reconoce el nombre de servicio
+    LITERAL de esa línea ('microsoft-ds'/'cifs' → smbnt) — pero nmap renombra SIEMPRE el
+    servicio a 'netbios-ssn' en cuanto su firma de -sV detecta Samba (confirmado contra
+    nmap-service-probes: TODAS las firmas de 'Samba smbd' registran 'netbios-ssn', nunca
+    'microsoft-ds', sea cual sea el puerto) — 'netbios-ssn' no está en ninguna lista de
+    brutespray, así que el SMB de CUALQUIER Samba quedaba fuera del '-f' en silencio. De
+    regalo, 'http' SÍ está en su lista, así que el mismo '-f' colaba un intento de fuerza
+    bruta HTTP que el hallazgo ni pedía ni contaba.
+
+    Ahora se usa '-H servicio://ip:puerto' (repetible — confirmado en brutespray/config.go,
+    hostListFlag) con los mismos nombres de _BRUTESPRAY_SVC, construido desde los footprints
+    que palantir YA tiene en memoria — nunca pasa por el nombre de servicio que nmap le puso al
+    puerto, así que la firma de -sV de Samba no puede confundirlo. Tampoco depende de que el
+    .gnmap de la Fase 2 exista en disco (--resume, --port, o sin Fase 2 completa: igual)."""
+    pairs = []   # [(servicio_brutespray, puerto)], uno por puerto real del footprint
     for f in footprints:
         proto = f.get("proto")
         if proto == "imap_pop3":
             # Discrimina imap/pop3 por los puertos REALES del footprint, no asume ambos: un host
             # solo-IMAP (143) contaba imap Y pop3 → inflaba el conteo y listaba un pop3 inexistente (#59).
-            for _pt in f.get("ports", []):
-                svcs.add("imap" if _pt in (143, 993) else "pop3")
+            for pt in f.get("ports", []):
+                pairs.append(("imap" if pt in (143, 993) else "pop3", pt))
         else:
-            svcs |= set(_BRUTESPRAY_SVC.get(proto, []))
+            for svc in _BRUTESPRAY_SVC.get(proto, []):
+                for pt in f.get("ports", []):
+                    pairs.append((svc, pt))
+    svcs = {svc for svc, _pt in pairs}
     if len(svcs) < 2:
         return None
-    gnmap = Path(base) / "nmap" / "deep.gnmap"
     res = _fp("brutespray", "Fuerza bruta multi-protocolo (brutespray)", [])
     res["findings"].append(("info",
         f"{len(svcs)} servicio(s) crackeable(s) por diccionario en este objetivo ({', '.join(sorted(svcs))}) "
@@ -20307,31 +20347,13 @@ def _suggest_brutespray(footprints, ip, base):
         "servicio)"))
     # '-spray' NO sustituye a '-p': el modo spray de brutespray SIGUE necesitando la lista de
     # contraseñas (-p) — prueba UNA por ronda contra todos los usuarios. Decir 'en vez de -p' dejaba
-    # el comando sin fuente de contraseñas (#57). SNMP vive en udp.gnmap, no en deep.gnmap (#60).
+    # el comando sin fuente de contraseñas (#57).
     tail = ("fuerza bruta de diccionario contra los {0} servicios detectados de una sola pasada "
             "(paso MANUAL, no se ejecuta solo) — añade '-spray -spray-delay 15m' (MANTENIENDO '-p') "
             "si hay riesgo real de bloqueo de cuentas (p. ej. contra AD)"
             ).format(len(svcs))
-    udp_gnmap = Path(base) / "nmap" / "udp.gnmap"
-    _snmp_udp = "snmp" in svcs and udp_gnmap.exists()
-    if "snmp" in svcs and not _snmp_udp:
-        tail += "; SNMP está en udp.gnmap (no en deep.gnmap, que es TCP) — pásalo aparte con otro '-f .../nmap/udp.gnmap'"
-    if gnmap.exists():
-        # #30: brutespray acepta varios '-f'; si SNMP (161/udp) está en el set y tenemos el
-        # udp.gnmap en disco, se añade para que la "una sola pasada" también cubra SNMP.
-        _f_args = f"-f {gnmap}" + (f" -f {udp_gnmap}" if _snmp_udp else "")
-        res["next"].append(
-            f"brutespray {_f_args} -u users.txt -p /usr/share/wordlists/rockyou.txt   # {tail}")
-    else:
-        # '-f' espera un FICHERO (gnmap/xml/nessus/nexpose/json) — nunca una IP suelta (eso es
-        # '-H protocolo://host:puerto', y aquí hay varios protocolos a la vez, no uno). Sin el
-        # .gnmap de la Fase 2 en disco, NO se rellena '-f' con la IP (sería sintaxis inválida si
-        # se copia-pega tal cual) — se deja como instrucción, no como comando listo para pegar.
-        res["next"].append(
-            f"brutespray -f TU_GNMAP_O_XML -u users.txt -p /usr/share/wordlists/rockyou.txt   # "
-            f"{tail}; no encontré {gnmap} (¿--ports/un solo puerto, sin Fase 2 completa?) — "
-            "sustituye TU_GNMAP_O_XML por el .gnmap/.xml real de este objetivo ('-f' quiere un "
-            "FICHERO, no la IP sola)")
+    h_args = " ".join(f"-H {svc}://{ip}:{pt}" for svc, pt in sorted(set(pairs)))
+    res["next"].append(f"brutespray {h_args} -u users.txt -p /usr/share/wordlists/rockyou.txt   # {tail}")
     return res
 
 
@@ -20916,7 +20938,7 @@ def run_one(ip, name, args, folder=None):
     # brutespray multi-protocolo: mismo momento que el relay de arriba (necesita conocer TODOS
     # los footprints ya corridos) — solo añade algo al informe si hay 2+ servicios crackeables
     # (ver _suggest_brutespray); con 0 o 1, no mete ruido.
-    _bs_fp = _suggest_brutespray(footprints, ip, base)
+    _bs_fp = _suggest_brutespray(footprints, ip)
     if _bs_fp:
         footprints.append(_bs_fp)
 
@@ -21462,6 +21484,17 @@ def main():
         args.vhost = _reconcile_domain(args.vhost, args.domain)
     except ValueError as e:
         ap.error(str(e))
+
+    # -o/--outdir a ABSOLUTO aquí, UNA sola vez: 'base' (run_one, línea ~20488) se construye
+    # como Path(args.outdir)/<carpeta>, y de ahí cuelgan TODAS las rutas que el informe enseña
+    # para relanzar algo a mano (ad_users.txt, report.html, commands.log, los .xml/.gnmap de
+    # nmap…) — si el operador pasó '-o' relativo (p. ej. '-o CTF/Discover', el caso real que lo
+    # destapó), esas rutas solo eran válidas lanzadas desde el MISMO directorio donde corrió
+    # palantir; copiadas a un comando y relanzadas desde otro sitio (el caso de uso real de
+    # "siguientes pasos"), apuntaban a un fichero que no existe ahí (operator-asked: "que
+    # cualquier ruta que use sea de manera absoluta"). expanduser() primero por si acaso llega
+    # con un '~' literal (bash ya lo expande solo, pero --targets/un .palantirrc podrían no).
+    args.outdir = str(Path(args.outdir).expanduser().resolve())
 
     global RESUME, SNMP_WORDLIST, NIKTO, CMS_SCAN, CRAWL, CONNECT, NUCLEI, SPIDER, SPIDER_PATTERN, TUNNEL
     global USERENUM_WORDLIST, NO_USERENUM, SPRAY_PASSWORDS, SHOW_SECRETS, VERBOSE

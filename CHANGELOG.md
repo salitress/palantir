@@ -6,6 +6,44 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **RID-cycling-discovered users (null-session `enumdomusers`) are now persisted to
+  `ad_users.txt`** (operator-reported: "los users que ha sacado no los ha guardado en ningún
+  .txt"). Unlike kerbrute and the credentialed SMB/LDAP AD enum, this path only ever recorded
+  the usernames in the finding text, never on disk — nothing to hand to a later
+  bruteforce/spray without copying them out by hand. Now merged into `<base>/ad_users.txt`
+  (machine accounts filtered, same as every other writer of that file).
+
+### Fixed
+
+- **`-o`/`--outdir` is now always resolved to an absolute path at startup** (operator-reported:
+  "que cualquier ruta que use sea de manera absoluta"). Every path that hangs off `base`
+  (report.html, commands.log, ad_users.txt, findings.json, …) inherits this automatically.
+  Confirmed live: `-o relative_out` now resolves to `/tmp/.../relative_out/<ip>`, not the
+  relative string the operator typed.
+
+- **Several suggested commands still hardcoded the bare `ad_users.txt` filename** (AS-REP
+  roast, password spraying) even though the file itself was already written correctly to
+  `<base>/ad_users.txt` — the suggested command was only valid copy-pasted from the same
+  directory palantir ran in. New `_ad_users_path(base)` centralizes this; fixed in the 4 spots
+  that got it wrong.
+
+- **brutespray never actually tested SMB against a real Samba target, and tested an unasked-for
+  HTTP service instead** (operator-reported, from a live run: port 445 never showed up in
+  brutespray's own UI). Read brutespray's real source (`modules/parse.go`): its `.gnmap` parser
+  only recognizes the literal service-name string nmap writes (`microsoft-ds`/`cifs` for SMB) —
+  but nmap always renames the service to `netbios-ssn` the moment its `-sV` signature matches
+  Samba (confirmed against nmap's own `nmap-service-probes`: every "Samba smbd" signature
+  registers as `netbios-ssn`, regardless of port), a name brutespray doesn't recognize at all.
+  Meanwhile "http" *is* in brutespray's recognized list, so the same `-f deep.gnmap` quietly
+  pulled in an HTTP bruteforce attempt palantir's own finding never claimed. Rewritten to use
+  repeatable `-H service://ip:port` arguments (confirmed in brutespray's `config.go`) built
+  directly from palantir's own already-computed service names — no longer depends on any nmap
+  file on disk, or on what nmap happened to name the port.
+
 ## [2.2.4] - 2026-11-25
 
 ### Fixed
