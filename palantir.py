@@ -1604,6 +1604,21 @@ def fuzz_dirs(ip, p, wordlists, ext, webdir, stealth=False, proxy=None, hostname
         target, extra_h, otag = (hostname or ip), [], "root"
     url = f"{scheme}://{target}:{p['port']}/FUZZ"
     extra = (["-e", ext] if ext else []) + extra_h
+    # -recursion: un directorio que ffuf encuentra (p. ej. '/aspnet_client' → 301 a
+    # '/aspnet_client/') antes se quedaba ahí — nunca se fuzzeaba DENTRO (operator-asked:
+    # "comprueba que hace ffuf también a los subdirectorios que encuentra"). ffuf ya trae esto
+    # de serie (confirmado en su propio -h): '-recursion-strategy default' solo añade una
+    # nueva pasada cuando hay un REDIRECT real a subcarpeta (no en cada 'match', eso sería
+    # '-greedy' y dispararía el coste sin límite claro), y '-recursion-depth 3' acota la
+    # profundidad (operator-asked) a 3 niveles — una subcarpeta encontrada se fuzzea, lo que
+    # ESA encuentre también, hasta 3 de profundidad. Sigue acotado por el mismo -maxtime de
+    # siempre, no es un bucle aparte. Desactivado en --stealth: ahí el objetivo es pasar
+    # desapercibido, no generar más tráfico del mínimo.
+    if not stealth:
+        extra += ["-recursion", "-recursion-depth", "3"]
+    # Para calcular el path relativo (ver más abajo, 'prefix'): la URL SIEMPRE termina en
+    # 'FUZZ' literal (ffuf lo exige: "-u has to end in it").
+    prefix = url[:-len("FUZZ")]
     otag = re.sub(r"[^A-Za-z0-9_.-]", "_", otag)
     hits = {}
     for wl in wordlists:
@@ -1625,7 +1640,16 @@ def fuzz_dirs(ip, p, wordlists, ext, webdir, stealth=False, proxy=None, hostname
                 print(f"{C_GREY}    $ [--resume] reutilizo el ffuf existente: {outfile}{C_RESET}", flush=True)
         results = cached if cached is not None else run_ffuf(url, wl, outfile, scheme, extra, stealth=stealth, proxy=proxy)
         for r in results:
-            path = r.get("input", {}).get("FUZZ")
+            # BUG real (encontrado al implementar -recursion arriba): 'input.FUZZ' es solo la
+            # palabra del wordlist que coincidió — para un hit DENTRO de una subcarpeta
+            # recursada, eso da el nombre PELADO ('flag.txt'), sin el 'aspnet_client/' delante
+            # (confirmado montando un servidor de prueba real con -recursion: el JSON de ese
+            # hit trae 'aspnet_client/flag.txt' en 'url', pero solo 'flag.txt' en
+            # 'input.FUZZ') — se perdería en qué subcarpeta estaba de verdad. 'url' SÍ es
+            # siempre la ruta completa real; se deriva el path de ahí (recorta el prefijo
+            # scheme://host:puerto/, ver 'prefix' arriba) en vez de 'input.FUZZ'.
+            full_url = r.get("url") or ""
+            path = full_url[len(prefix):] if full_url.startswith(prefix) else r.get("input", {}).get("FUZZ")
             if path is None:
                 continue
             hit = {"path": path, "status": r.get("status"), "length": r.get("length")}
@@ -1867,6 +1891,30 @@ def netbios_computer_name(ports, host):
     return next(g for g in m.groups() if g).rstrip("\x00").strip()
 
 
+# La entrada de 'nbstat' con sufijo <00> y 'Flags: <group>' es el WORKGROUP (o, en un DC, el
+# nombre NetBIOS corto del dominio — el mismo campo, confirmado en el formato real de nbstat):
+# la del propio equipo es TAMBIÉN <00> pero con 'Flags: <unique>' — hay que distinguir por el
+# flag, no basta con el sufijo. Ejemplo real: 'WORKGROUP<00>  Flags: <group><active>'.
+_NBSTAT_WORKGROUP_RE = re.compile(r"^\s*(\S+?)<00>\s+Flags:\s*<group>", re.M)
+
+
+def netbios_workgroup(ports, host):
+    """Nombre del WORKGROUP/dominio NetBIOS corto, de 'nbstat' (ver _NBSTAT_WORKGROUP_RE) —
+    operator-reported, 3 objetivos reales: nxc SIEMPRE falla credenciales válidas por SMB/WMI
+    contra un Samba/Windows SUELTO (sin AD) si no se le pasa -d explícito, porque sin él cae a
+    usar el propio HOSTNAME del objetivo como domain para la autenticación NTLM (confirmado
+    leyendo nxc/protocols/smb.py: 'self.domain = self.targetDomain', y targetDomain cae a
+    self.hostname cuando no hay dominio DNS) — un valor que casi nunca coincide con nada que el
+    servidor reconozca. 'nxc smb IP -u ken -p kenken' → STATUS_LOGON_FAILURE; el MISMO par con
+    '-d WORKGROUP' → login válido, confirmado en vivo tres veces. None si nbstat no corrió o no
+    lo trae. Mismo patrón de 'blob' que discover_domains/netbios_computer_name. Puro → testable
+    sin red."""
+    blob = "\n".join([s for p in ports for s in p["scripts"].values()] +
+                     [p.get("banner", "") for p in ports] + list(host.values()))
+    m = _NBSTAT_WORKGROUP_RE.search(blob)
+    return m.group(1).rstrip("\x00").strip() if m else None
+
+
 _NXC_NAME_RE = re.compile(r"\(name:([^)]+)\)")
 _NXC_DOMAIN_RE = re.compile(r"\(domain:([^)]+)\)")
 
@@ -2017,7 +2065,43 @@ def _fp(proto, title, ports):
             "steps": [], "findings": [], "next": [], "missing": []}
 
 
+# El '--verbose' forzado de nxc (ver _ensure_nxc_verbose: fiabilidad del parser, nada que ver
+# con esto) también saca a la luz el log INTERNO de la propia librería (impacket) — 'Socket
+# info: host=...', 'Creating SMBv1/SMBv3 connection to ...', el típico "Error creating SMBv1
+# connection... unpack requires a buffer of 1 bytes" cuando el objetivo tiene SMB1
+# deshabilitado (normal y sin relación con ningún bug: nxc SIEMPRE prueba SMBv1 primero y cae a
+# SMBv3 si falla, confirmado leyendo su código fuente real, nxc/protocols/smb.py:
+# create_smbv1_conn envuelve la conexión en un except (Exception, NetBIOSTimeout) de propósito,
+# así que CUALQUIER fallo ahí, incluido ese unpack roto de impacket al parsear una respuesta
+# SMB1 vacía/truncada, se traga y cae a SMBv3 sin más). SIEMPRE las MISMAS líneas, para
+# CUALQUIER objetivo, sin aportar nada a un humano leyendo el informe (operador, run real:
+# "sobre todo te he pasado el error de nxc" — el mismo bloque repetido en cada una de las
+# ~10 llamadas a nxc smb de un mismo run). Se reconocen por su formato real (RichHandler de
+# Python logging: el mensaje SIEMPRE termina con 'fichero.py:NNN' alineado a la derecha —
+# confirmado en nxc/logger.py, NXCAdapter) — a diferencia de la salida REAL de un
+# módulo/protocolo (display()/success()/fail(), por nxc_console.print() directo, SIN ese
+# sufijo), que nunca se toca aunque contenga la palabra "Error" (p. ej. "[-] Error enumerating
+# shares: STATUS_ACCESS_DENIED" se queda, no termina en .py:NNN). La salida CRUDA sigue intacta
+# en commands.log (ver _log_nxc_output) — esto solo limpia lo que se guarda para el informe
+# HTML/Markdown.
+_NXC_NOISE_RE = re.compile(r"\S+\.py:\d+\s*$")
+
+
+def _strip_nxc_noise(cmd, output):
+    """Quita del 'output' de una invocación de nxc (ver _NXC_BASENAMES) las líneas de log
+    interno de la librería (ver el comentario de _NXC_NOISE_RE). Para cualquier otro comando,
+    devuelve 'output' sin tocar. Puro → testeable sin red."""
+    if not output:
+        return output
+    first = (cmd or "").split(None, 1)
+    if not first or Path(first[0]).name not in _NXC_BASENAMES:
+        return output
+    kept = [line for line in output.splitlines() if not _NXC_NOISE_RE.search(line)]
+    return "\n".join(kept)
+
+
 def _step(res, cmd, ok, output, note=""):
+    output = _strip_nxc_noise(cmd, output)
     res["steps"].append({"cmd": cmd, "ok": bool(ok),
                          "output": sanitize(output or "")[:8000], "note": note})
 
@@ -6626,14 +6710,25 @@ def _pwn_clause(proto):
 
 
 # ── Probadores por protocolo ──
-def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None):
+def _cc_nxc(res, nxc, nxc_proto, ip, creds, port=None, domain=None):
     """Prueba pares usuario/contraseña por defecto con nxc (1 intento por par) y los
     confirma con la marca [+]/(Pwn3d!) de nxc. Devuelve el primer par que entra, o None.
     Las identidades anónimas (null/guest sin contraseña) se marcan 'media'; una
-    credencial real por defecto 'alta'; (Pwn3d!) = admin → 'critica'."""
+    credencial real por defecto 'alta'; (Pwn3d!) = admin → 'critica'.
+
+    `domain`: BUG real (operator-reported, confirmado en vivo contra 3 objetivos reales) — sin
+    '-d' explícito, nxc cae a usar el propio HOSTNAME del objetivo como domain NTLM cuando no
+    hay AD (confirmado leyendo nxc/protocols/smb.py: 'self.domain = self.targetDomain', que cae
+    a self.hostname sin dominio DNS), y una credencial LOCAL válida (p. ej. 'ken:kenken' contra
+    un Samba/Windows suelto) se rechaza con STATUS_LOGON_FAILURE por ese domain equivocado — la
+    MISMA credencial con '-d WORKGROUP' sí entra. Se pasa (ver netbios_workgroup, calculado una
+    vez en creds_check) solo para los protocolos con autenticación NTLM real (_PWN_IS_ADMIN) —
+    ftp/ssh/vnc/… no tienen concepto de 'domain' y pasarlo ahí sería un flag desconocido."""
     hit = None
     for u, p, lbl in creds:
         cmd = [nxc, nxc_proto, ip, "-u", u, "-p", p]
+        if domain and nxc_proto in _PWN_IS_ADMIN:
+            cmd += ["-d", domain]
         dp = _NXC_DEFAULT_PORT.get(nxc_proto)
         if port and dp and port != dp:
             cmd += ["--port", str(port)]
@@ -7019,24 +7114,24 @@ def _ssh_post_enum(res, ip, port, user, password):
             res["missing"].append("searchsploit")
 
 
-def cc_ftp(ip, ports, deep):
+def cc_ftp(ip, ports, deep, domain=None):
     res = _cc_res("ftp", "FTP", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
         for p in ports:
-            _cc_nxc(res, nxc, "ftp", ip, DEFAULT_CREDS["ftp"], port=p["port"])
+            _cc_nxc(res, nxc, "ftp", ip, DEFAULT_CREDS["ftp"], port=p["port"], domain=domain)
     else:
         res["missing"].append("nxc/netexec")
     res["next"].append(f"hydra -L users.txt -P /usr/share/wordlists/rockyou.txt ftp://{ip}   # fuerza bruta real (manual)")
     return res
 
 
-def cc_ssh(ip, ports, deep):
+def cc_ssh(ip, ports, deep, domain=None):
     res = _cc_res("ssh", "SSH", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
         for p in ports:
-            hit = _cc_nxc(res, nxc, "ssh", ip, DEFAULT_CREDS["ssh"], port=p["port"])
+            hit = _cc_nxc(res, nxc, "ssh", ip, DEFAULT_CREDS["ssh"], port=p["port"], domain=domain)
             # Credencial por defecto válida → la MISMA enum post-auth de solo lectura que la
             # Fase 5d (sudo -l/SUID/capabilities…), no solo el login — ver _ssh_post_enum.
             if hit and hit[1]:
@@ -7047,22 +7142,22 @@ def cc_ssh(ip, ports, deep):
     return res
 
 
-def cc_smb(ip, ports, deep):
+def cc_smb(ip, ports, deep, domain=None):
     res = _cc_res("smb", "SMB", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
-        _cc_nxc(res, nxc, "smb", ip, DEFAULT_CREDS["smb"])
+        _cc_nxc(res, nxc, "smb", ip, DEFAULT_CREDS["smb"], domain=domain)
     else:
         res["missing"].append("nxc/netexec")
     return res
 
 
-def cc_winrm(ip, ports, deep):
+def cc_winrm(ip, ports, deep, domain=None):
     res = _cc_res("winrm", "WinRM", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
         for p in ports:
-            hit = _cc_nxc(res, nxc, "winrm", ip, DEFAULT_CREDS["winrm"], port=p["port"])
+            hit = _cc_nxc(res, nxc, "winrm", ip, DEFAULT_CREDS["winrm"], port=p["port"], domain=domain)
             if hit:
                 res["next"].append(f"evil-winrm -i {ip} -u {hit[0] or 'USER'} -p '{hit[1]}'   # shell remota")
     else:
@@ -7070,38 +7165,38 @@ def cc_winrm(ip, ports, deep):
     return res
 
 
-def cc_rdp(ip, ports, deep):
+def cc_rdp(ip, ports, deep, domain=None):
     res = _cc_res("rdp", "RDP", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
         for p in ports:
-            _cc_nxc(res, nxc, "rdp", ip, DEFAULT_CREDS["rdp"], port=p["port"])
+            _cc_nxc(res, nxc, "rdp", ip, DEFAULT_CREDS["rdp"], port=p["port"], domain=domain)
     else:
         res["missing"].append("nxc/netexec")
     return res
 
 
-def cc_ldap(ip, ports, deep):
+def cc_ldap(ip, ports, deep, domain=None):
     res = _cc_res("ldap", "LDAP", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
-        _cc_nxc(res, nxc, "ldap", ip, DEFAULT_CREDS["ldap"])
+        _cc_nxc(res, nxc, "ldap", ip, DEFAULT_CREDS["ldap"], domain=domain)
     else:
         res["missing"].append("nxc/netexec")
     return res
 
 
-def cc_wmi(ip, ports, deep):
+def cc_wmi(ip, ports, deep, domain=None):
     res = _cc_res("wmi", "WMI / MSRPC", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
-        _cc_nxc(res, nxc, "wmi", ip, DEFAULT_CREDS["wmi"])
+        _cc_nxc(res, nxc, "wmi", ip, DEFAULT_CREDS["wmi"], domain=domain)
     else:
         res["missing"].append("nxc/netexec")
     return res
 
 
-def cc_vnc(ip, ports, deep):
+def cc_vnc(ip, ports, deep, domain=None):
     res = _cc_res("vnc", "VNC", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
@@ -7122,7 +7217,7 @@ def cc_vnc(ip, ports, deep):
     return res
 
 
-def cc_mysql(ip, ports, deep):
+def cc_mysql(ip, ports, deep, domain=None):
     res = _cc_res("mysql", "MySQL", [p["port"] for p in ports])
     if not have("mysql"):
         res["missing"].append("mysql (mariadb-client)")
@@ -7149,7 +7244,7 @@ def cc_mysql(ip, ports, deep):
     return res
 
 
-def cc_postgres(ip, ports, deep):
+def cc_postgres(ip, ports, deep, domain=None):
     res = _cc_res("postgres", "PostgreSQL", [p["port"] for p in ports])
     if not have("psql"):
         res["missing"].append("psql (postgresql-client)")
@@ -7173,12 +7268,12 @@ def cc_postgres(ip, ports, deep):
     return res
 
 
-def cc_mssql(ip, ports, deep):
+def cc_mssql(ip, ports, deep, domain=None):
     res = _cc_res("mssql", "MSSQL", [p["port"] for p in ports])
     nxc = nxc_bin()
     if nxc:
         for p in ports:
-            hit = _cc_nxc(res, nxc, "mssql", ip, DEFAULT_CREDS["mssql"], port=p["port"])
+            hit = _cc_nxc(res, nxc, "mssql", ip, DEFAULT_CREDS["mssql"], port=p["port"], domain=domain)
             if hit:
                 res["next"].append(f"nxc mssql {ip} -u {hit[0] or 'USER'} -p '{hit[1]}' -x whoami   # si xp_cmdshell está activo → RCE")
                 _db_enum(res, "mssql", ip, p["port"], hit[0] or "sa", hit[1], None)   # BBDD/tablas + impersonación/linked/sysadmin
@@ -7488,7 +7583,7 @@ def _db_enum(res, proto, ip, port, user, password, base, is_hash=False):
         res["next"].append(f"psql -h {ip} -U {user}   # COPY ... FROM PROGRAM → RCE si eres superusuario")
 
 
-def cc_redis(ip, ports, deep):
+def cc_redis(ip, ports, deep, domain=None):
     res = _cc_res("redis", "Redis", [p["port"] for p in ports])
     if not have("redis-cli"):
         res["missing"].append("redis-cli (redis-tools)")
@@ -7518,7 +7613,7 @@ def cc_redis(ip, ports, deep):
     return res
 
 
-def cc_snmp(ip, ports, deep):
+def cc_snmp(ip, ports, deep, domain=None):
     res = _cc_res("snmp", "SNMP", [p["port"] for p in ports])
     if not have("snmpwalk"):
         res["missing"].append("snmpwalk (snmp)")
@@ -7536,7 +7631,7 @@ def cc_snmp(ip, ports, deep):
     return res
 
 
-def cc_oracle(ip, ports, deep):
+def cc_oracle(ip, ports, deep, domain=None):
     res = _cc_res("oracle", "Oracle TNS", [p["port"] for p in ports])
     if have("tnscmd10g"):
         rc, out = run_capture(["tnscmd10g", "version", "-h", ip], timeout=20)
@@ -7574,7 +7669,7 @@ def cc_oracle(ip, ports, deep):
     return res
 
 
-def cc_ipmi(ip, ports, deep):
+def cc_ipmi(ip, ports, deep, domain=None):
     res = _cc_res("ipmi", "IPMI / BMC", [p["port"] for p in ports])
     if have("ipmitool"):
         for u, pw, vendor in IPMI_CREDS:
@@ -7635,7 +7730,7 @@ def _mongo_ok(out):
     return "databases" in low or "totalsize" in low
 
 
-def cc_mongodb(ip, ports, deep):
+def cc_mongodb(ip, ports, deep, domain=None):
     res = _cc_res("mongodb", "MongoDB", [p["port"] for p in ports])
     client = next((t for t in ("mongosh", "mongo") if have(t)), None)
     for p in ports:
@@ -7664,7 +7759,7 @@ def cc_mongodb(ip, ports, deep):
     return res
 
 
-def cc_telnet(ip, ports, deep):
+def cc_telnet(ip, ports, deep, domain=None):
     res = _cc_res("telnet", "Telnet", [p["port"] for p in ports])
     for p in ports:
         b = grab_banner(ip, p["port"], timeout=5)
@@ -7684,6 +7779,13 @@ def creds_check(ip, services, host, deep):
     que se renderizan y exportan igual (pantalla + HTML + JSON) sin tocar nada más."""
     phase("Fase 5c — credenciales por defecto (verificadas)",
           "prueba SOLO credenciales de fábrica/instalación conocidas de cada servicio y confirma el acceso; descarta falsos positivos y NO hace fuerza bruta (eso queda como sugerencia manual)")
+    # BUG real (operator-reported, confirmado en vivo contra 3 objetivos reales): sin '-d'
+    # explícito, nxc cae a usar el propio HOSTNAME del objetivo como domain NTLM cuando no hay
+    # AD — y una credencial LOCAL válida (Samba/Windows SUELTO) se rechaza con
+    # STATUS_LOGON_FAILURE por ese domain equivocado (ver _cc_nxc/netbios_workgroup). Se calcula
+    # UNA vez aquí (nbstat ya corrió en la Fase 2) y se pasa a todos los _CC_DISPATCH que hacen
+    # autenticación NTLM real — los demás (ftp/mysql/redis/…) lo reciben y lo ignoran sin más.
+    workgroup = netbios_workgroup(services, host)
     buckets = {}
     for p in services:
         if not _confirmed_open(p):                 # UDP open|filtered sin confirmar: no gastar cred-checks (coherente con el footprint, línea ~2104); evita 5×20s de ipmitool y 7× snmpwalk sobre un 623/161 fantasma
@@ -7697,7 +7799,7 @@ def creds_check(ip, services, host, deep):
         if not fn:
             continue
         try:
-            out.append(fn(ip, ports, deep))
+            out.append(fn(ip, ports, deep, domain=workgroup))
         except Exception as e:                     # un protocolo que peta no tumba el resto
             warn(f"creds {proto} falló: {e}")
     for p in services:                             # Tomcat: solo sobre webs que lo parezcan
@@ -8601,7 +8703,8 @@ def _parse_ioxidresolver(out):
     return addrs
 
 
-def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_hash=False, pool=None):
+def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_hash=False, pool=None,
+                   domain=None):
     """Tras un Pwn3d! confirmado por SMB (Fase 5d), encadena automáticamente un volcado de
     SAM (hashes de cuentas locales), LSA secrets (claves DPAPI, NL$KM, credenciales de
     servicio en texto claro) y memoria de lsass.exe (-M lsassy: credenciales de CUALQUIER
@@ -8614,7 +8717,13 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
     defecto; solo importa si el objetivo SÍ está unido a un dominio y la cuenta es local de
     esa máquina. Solo SMB: --sam/--lsa/-M lsassy son todos de nxc smb (lsassy declara
     supported_protocols=["smb"] en su propio código) — ninguno existe en winrm/wmi aunque el
-    Pwn3d! llegara por ahí (el llamante ya filtra por eso)."""
+    Pwn3d! llegara por ahí (el llamante ya filtra por eso).
+
+    `domain`: mismo fix de NTLM-domain que _cc_nxc/_creds_enum (ver sus docstrings) — este es
+    un proceso nxc NUEVO (no comparte estado con el login que acaba de confirmar Pwn3d!), así
+    que sin '-d' puede fallar con STATUS_LOGON_FAILURE la MISMA credencial que segundos antes
+    validó como admin. Se ignora si local_auth ya está activo (nxc fuerza domain=hostname
+    igual, ver _nxc_bulk)."""
     import tempfile
     pw_file = None
     if p and not is_hash:
@@ -8639,6 +8748,9 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
         if local_auth:
             base_cmd.append("--local-auth")
             shown_base += " --local-auth"
+        elif domain:
+            base_cmd += ["-d", domain]
+            shown_base += f" -d {domain}"
         if port and dp and port != dp:
             base_cmd += ["--port", str(port)]
             shown_base += f" --port {port}"
@@ -9460,18 +9572,26 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
         os.chmod(sec_file.name, 0o600)
     use_la = local_auth and np in _NXC_LOCAL_AUTH_PROTOS
 
+    # BUG real (operator-reported, confirmado en vivo contra 3 objetivos reales — mismo fix que
+    # _cc_nxc/Fase 5c, ver su docstring): sin '-d' explícito nxc cae a usar el HOSTNAME del
+    # objetivo como domain NTLM, rechazando con STATUS_LOGON_FAILURE una credencial LOCAL/de
+    # dominio que YA acaba de validar como login. Se ignora con --local-auth (nxc fuerza
+    # domain=hostname igual en ese modo, ver _nxc_bulk) y solo aplica a smb/ldap (_PWN_IS_ADMIN).
     def A():   # argv de auth (se reconstruye por llamada: el fichero de contraseña es el mismo)
         a = ["-u", u] + (["-H", secret] if is_hash else ["-p", sec_file.name if sec_file else ""])
         if use_la:
             a.append("--local-auth")
+        elif domain and np in _PWN_IS_ADMIN:
+            a += ["-d", domain]
         if port and dp and port != dp:
             a += ["--port", str(port)]
         return a
 
     la = " --local-auth" if use_la else ""
+    dm = f" -d {domain}" if (domain and not use_la and np in _PWN_IS_ADMIN) else ""
     pt = f" --port {port}" if (port and dp and port != dp) else ""
     shown_sec = ("-H " if is_hash else "-p ") + _sec_disp(secret)
-    shown_auth = f"-u {shlex.quote(u)} {shown_sec}{la}{pt}"
+    shown_auth = f"-u {shlex.quote(u)} {shown_sec}{la}{dm}{pt}"
 
     def mask(o):
         return _mask_out(o, secret)
@@ -10343,11 +10463,17 @@ def _nxc_confirm_smb(nxc, ip, user, password, port, dp, local_auth):
     return ok, bool(re.search(r"\(Pwn3d!\)", out))
 
 
-def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_hash, local_auth):
+def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_hash, local_auth,
+              domain=None):
     """Spray de listas por nxc (fallback: protocolo que hydra no cubre, pass-the-hash, o hydra
     ausente). Escribe las dos listas a fichero (secreto nunca en argv), lanza UN nxc con -u/-p
     de fichero + --continue-on-success, parsea los '[+]' y registra el paso con la contraseña
-    en claro por defecto (--hide-secrets la enmascara). Devuelve [{"user","password","pwn3d"}]."""
+    en claro por defecto (--hide-secrets la enmascara). Devuelve [{"user","password","pwn3d"}].
+
+    `domain`: mismo fix de NTLM-domain que _cc_nxc (ver su docstring) — se ignora si local_auth
+    ya está activo porque nxc fuerza domain=hostname en ese modo de todos modos (confirmado en
+    nxc/protocols/smb.py: 'if self.args.local_auth: self.domain = self.hostname', sin excepción
+    para -d), así que pasarlo ahí sería un flag inútil."""
     import tempfile
     uf = tempfile.NamedTemporaryFile("w", delete=False, suffix=".users")
     uf.write("\n".join(bulk_users) + "\n")
@@ -10363,6 +10489,8 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
             cmd.append("--no-bruteforce")
         if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
             cmd.append("--local-auth")
+        elif domain and np in _PWN_IS_ADMIN:
+            cmd += ["-d", domain]
         if port and dp and port != dp:
             cmd += ["--port", str(port)]
         n = len(bulk_users) if no_bf else len(bulk_users) * len(bulk_passwords)
@@ -10380,6 +10508,8 @@ def _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_
         shown += " --no-bruteforce"
     if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
         shown += " --local-auth"
+    elif domain and np in _PWN_IS_ADMIN:
+        shown += f" -d {domain}"
     if port and dp and port != dp:
         shown += f" --port {port}"
     safe_out = out or ""
@@ -10866,10 +10996,13 @@ def _stash_valid_cred(res, user, secret, is_hash, admin=False):
         res["_valid_cred_admin"] = admin
 
 
-def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
+def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp, domain=None):
     """Un ÚNICO intento de una credencial por un protocolo nxc (reutilización entre servicios).
     Contraseña por fichero 0600 (nunca en el argv); hash por -H. Devuelve (ok, pwn3d,
-    salida_enmascarada, comando_mostrado)."""
+    salida_enmascarada, comando_mostrado).
+
+    `domain`: mismo fix de NTLM-domain que _cc_nxc (ver su docstring) — ignorado si local_auth
+    ya está activo (nxc fuerza domain=hostname igual, ver _nxc_bulk)."""
     import tempfile
     sec_file = None
     if secret and not is_hash:
@@ -10882,6 +11015,8 @@ def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
         cmd = [nxc, np, ip, "-u", user] + auth
         if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
             cmd.append("--local-auth")
+        elif domain and np in _PWN_IS_ADMIN:
+            cmd += ["-d", domain]
         if port and dp and port != dp:
             cmd += ["--port", str(port)]
         # _run_capture_retry (no run_capture a secas): nxc por SMB/LDAP puede devolver salida
@@ -10902,6 +11037,8 @@ def _nxc_try_cred(nxc, np, ip, user, secret, is_hash, local_auth, port, dp):
     shown = f"{nxc} {np} {ip} -u {shlex.quote(user)} {shown_sec}"
     if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
         shown += " --local-auth"
+    elif domain and np in _PWN_IS_ADMIN:
+        shown += f" -d {domain}"
     if port and dp and port != dp:
         shown += f" --port {port}"
     safe_out = _mask_out(out, secret)
@@ -10941,7 +11078,7 @@ def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enrich
                     continue
                 tried.add(key)
                 port, dp = proto_meta[np]
-                ok, pwn, safe_out, shown = _nxc_try_cred(nxc, np, ip, u, secret, ch, local_auth, port, dp)
+                ok, pwn, safe_out, shown = _nxc_try_cred(nxc, np, ip, u, secret, ch, local_auth, port, dp, domain=domain)
                 res = res_by_proto[np]
                 cred_disp = f"{u}:{secret}" if secret else f"{u}:∅"   # botín descubierto → en claro
                 _step(res, shown, ok or pwn, safe_out,
@@ -10963,7 +11100,8 @@ def _reuse_chain(ip, buckets, proto_meta, res_by_proto, cred_pool, tried, enrich
                     _psev, _pcl = _pwn_clause(np)
                     res["findings"].append((_psev, f"{np.upper()}: credencial reutilizada {_pcl} — «{cred_disp}»"))
                     if np == "smb":
-                        _dump_sam_lsa(res, nxc, ip, u, secret, port, dp, local_auth=local_auth, is_hash=ch, pool=cred_pool)
+                        _dump_sam_lsa(res, nxc, ip, u, secret, port, dp, local_auth=local_auth, is_hash=ch, pool=cred_pool,
+                                      domain=domain)
                 else:
                     res["findings"].append(("alta", f"{np.upper()}: credencial reutilizada VÁLIDA — «{cred_disp}»"))
                 if np in ("smb", "ldap") and np not in enriched:
@@ -10991,10 +11129,14 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
     guardado (informe/commands.log): un hash NTLM es tan reutilizable como la contraseña en
     claro (pass-the-hash no necesita crackeo), así que se trata igual.
 
-    `domain`: dominio AD ya resuelto (discover_domains, calculado pronto por run_one para
-    esto — ver main()) o None si aún no se conoce. Solo lo usa la rama LDAP de _creds_enum,
-    para 'certipy find -u user@dominio' (AD CS). Sin él, certipy igualmente puesto se deja
-    como sugerencia manual con el placeholder "DOMINIO" en vez de ejecutarse a ciegas.
+    `domain`: el mejor dominio conocido — AD ya resuelto (discover_domains, calculado pronto
+    por run_one para esto — ver main()) o, si no hay AD, el WORKGROUP NetBIOS (netbios_workgroup);
+    None si no se conoce ninguno. Dos usos: (1) la rama LDAP de _creds_enum, para
+    'certipy find -u user@dominio' (AD CS) — sin AD, certipy se deja como sugerencia manual con
+    el placeholder "DOMINIO" en vez de ejecutarse a ciegas; (2) '-d domain' en toda llamada nxc
+    NTLM (_PWN_IS_ADMIN) para evitar el mismo bug de domain-fallback que _cc_nxc (ver su
+    docstring): sin él, nxc usa el HOSTNAME del objetivo como domain y una credencial LOCAL
+    válida se rechaza con STATUS_LOGON_FAILURE.
 
     `local_auth` (--local-auth de palantir) añade --local-auth a nxc en los protocolos de
     `_NXC_LOCAL_AUTH_PROTOS`: hace falta cuando el objetivo SÍ está unido a un dominio pero
@@ -11142,7 +11284,8 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             if np in _HYDRA_SPRAY_PROTOS and not is_hash and hydra_bin():
                 hits = _hydra_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, local_auth)
             else:
-                hits = _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_hash, local_auth)
+                hits = _nxc_bulk(res, np, ip, port, dp, bulk_users, bulk_passwords, no_bf, nxc, is_hash, local_auth,
+                                  domain=domain)
             for hit in hits:
                 # La credencial GANADORA del spray es botín DESCUBIERTO (no es tu input) → se muestra en
                 # CLARO, igual que los hashes de SAM/LSA: así sabes CUÁL de la lista acertó sin re-lanzar nada.
@@ -11157,7 +11300,8 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                     res["findings"].append((_psev, f"{np.upper()}: credencial del spray {_pcl} — «{label}»"))
                     if np == "smb":
                         if hit["user"] and hit["password"]:
-                            _dump_sam_lsa(res, nxc, ip, hit["user"], hit["password"], port, dp, local_auth=local_auth, is_hash=is_hash, pool=cred_pool)
+                            _dump_sam_lsa(res, nxc, ip, hit["user"], hit["password"], port, dp, local_auth=local_auth, is_hash=is_hash, pool=cred_pool,
+                                          domain=domain)
                         else:
                             res["findings"].append(("info",
                                 "SMB: Pwn3d! en el spray pero no se pudo extraer la credencial exacta de la línea "
@@ -11192,6 +11336,14 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
             cmd = [nxc, np, ip, "-u", u] + auth
             if local_auth and np in _NXC_LOCAL_AUTH_PROTOS:
                 cmd.append("--local-auth")
+            # BUG real (operator-reported, confirmado en vivo contra 3 objetivos reales — mismo
+            # fix que ya lleva _cc_nxc/Fase 5c): sin '-d' explícito, nxc cae a usar el propio
+            # HOSTNAME del objetivo como domain NTLM cuando no hay AD, y una credencial LOCAL
+            # válida se rechaza con STATUS_LOGON_FAILURE por ese domain equivocado. 'domain' aquí
+            # ya es "el mejor dominio conocido" (AD si se resolvió, si no el WORKGROUP NetBIOS —
+            # ver la llamada en run_one), así que basta con pasarlo tal cual.
+            if domain and np in _PWN_IS_ADMIN:
+                cmd += ["-d", domain]
             if port and dp and port != dp:
                 cmd += ["--port", str(port)]
             try:
@@ -11290,7 +11442,8 @@ def provided_creds_check(ip, services, creds, bulk=None, local_auth=False, is_ha
                 _psev, _pcl = _pwn_clause(np)
                 res["findings"].append((_psev, f"{np.upper()}: credencial aportada «{masked}» {_pcl}"))
                 if np == "smb":
-                    _dump_sam_lsa(res, nxc, ip, u, p, port, dp, local_auth=local_auth, is_hash=is_hash, pool=cred_pool)
+                    _dump_sam_lsa(res, nxc, ip, u, p, port, dp, local_auth=local_auth, is_hash=is_hash, pool=cred_pool,
+                                  domain=domain)
             elif ok:
                 res["findings"].append(("alta", f"{np.upper()}: credencial aportada válida — «{masked}»"))
             # Credencial VÁLIDA → enumeración de SOLO LECTURA CON ella (shares/usuarios/grupos/
@@ -12051,6 +12204,21 @@ def quick_wins(footprints, vulns=None):
             seen_cmds.add(key)
             kept.append(c)
         w["cmds"] = kept
+    # Sin NINGÚN hallazgo crítico/alto (operator-asked: "si no hay vector claro de entrada que
+    # recomiende fuerza bruta") la caja de Quick Wins se queda VACÍA y ni se imprime (ver
+    # render_quick_wins: 'if not wins: return') — el operador se queda sin "por dónde empezar"
+    # aunque exista una sugerencia razonable más abajo en el informe completo (brutespray, ya
+    # construido en este mismo paso si hay 2+ servicios crackeables — ver _suggest_brutespray).
+    # Fallback: si no hay NADA mejor que ofrecer, se promueve esa sugerencia aquí, marcada
+    # explícitamente como "sin vector claro" para no confundirla con un hallazgo real.
+    if not wins:
+        for fpr in footprints:
+            if fpr.get("proto") == "brutespray" and fpr.get("next"):
+                wins.append({"sev": "info",
+                             "title": "Sin hallazgo crítico/alto claro — prueba fuerza bruta de diccionario "
+                                      "contra los servicios crackeables detectados",
+                             "cmds": list(fpr["next"]), "tip": None, "targeted": True})
+                break
     return wins
 
 
@@ -13330,6 +13498,37 @@ def selftest():
     finally:
         globals()["run_ffuf"] = _real_run_ffuf
     assert len(_rf_calls) == 1
+
+    # -recursion (operator-asked: "comprueba que hace ffuf también a los subdirectorios que
+    # encuentra") — se pasa '-recursion -recursion-depth 3' salvo en --stealth (ahí el
+    # objetivo es pasar desapercibido, no generar más tráfico).
+    _rf_calls.clear()
+    globals()["run_ffuf"] = lambda url, wl, outfile, scheme, extra, **kw: (_rf_calls.append(extra), [])[1]
+    globals()["RESUME"] = False
+    try:
+        fuzz_dirs("10.0.0.1", {"port": 80, "tunnel": "", "name": "http"}, [str(_fd_wl)], None, _fd_dir)
+        fuzz_dirs("10.0.0.1", {"port": 80, "tunnel": "", "name": "http"}, [str(_fd_wl)], None, _fd_dir, stealth=True)
+    finally:
+        globals()["run_ffuf"] = _real_run_ffuf
+    assert "-recursion" in _rf_calls[0] and "-recursion-depth" in _rf_calls[0], _rf_calls[0]
+    assert "-recursion" not in _rf_calls[1], _rf_calls[1]   # --stealth: sin recursión
+
+    # BUG real corregido al implementar -recursion: un hit DENTRO de una subcarpeta recursada
+    # solo trae el nombre PELADO en 'input.FUZZ' (p. ej. 'flag.txt'), sin el 'sub/' delante —
+    # confirmado montando un servidor de prueba real con -recursion de verdad. 'url' SÍ es la
+    # ruta completa; el path mostrado se deriva de ahí, nunca de 'input.FUZZ', para no perder
+    # en qué subcarpeta estaba.
+    globals()["run_ffuf"] = lambda *a, **kw: [
+        {"input": {"FUZZ": "index.html"}, "url": "http://10.0.0.1:80/index.html", "status": 200, "length": 10},
+        {"input": {"FUZZ": "flag.txt"}, "url": "http://10.0.0.1:80/sub/flag.txt", "status": 200, "length": 5},
+    ]
+    try:
+        _fd_rec = fuzz_dirs("10.0.0.1", {"port": 80, "tunnel": "", "name": "http"}, [str(_fd_wl)], None, _fd_dir)
+    finally:
+        globals()["run_ffuf"] = _real_run_ffuf
+    assert {"path": "index.html", "status": 200, "length": 10} in _fd_rec
+    assert {"path": "sub/flag.txt", "status": 200, "length": 5} in _fd_rec, _fd_rec
+
     # _ffuf_hit_findings: antes los hits de ffuf solo rellenaban la tabla pasiva de 'Fuzzing
     # web/vhosts' (sin severidad, invisible en Quick Wins/Hallazgos accionables) — caso real:
     # ffuf encontró '/retro' (la única ruta no trivial de todo el sitio) y no se destacaba en
@@ -15432,6 +15631,10 @@ def selftest():
         globals()["certipy_bin"], globals()["have"] = _real_certipy_skip, _real_have_skip
     assert not any("--users" in c or "--rid-brute" in c for c in _smb_cmds), _smb_cmds   # SMB se SALTÓ los dos: LDAP ya los tenía
     assert any("--pass-pol" in c for c in _smb_cmds)   # --pass-pol SÍ sigue (SMB-específico, no lo cubre LDAP)
+    # Mismo fix de domain que _cc_nxc (Fase 5c) pero en _creds_enum (Fase 5d, vía su ayudante A()):
+    # TODO comando SMB/LDAP de esta función debe llevar '-d <domain>' si se conoce, no solo el
+    # certipy de más abajo.
+    assert all("-d" in c and c[c.index("-d") + 1] == "inlanefreight.local" for c in _smb_cmds), _smb_cmds
     assert any(s == "info" and "me salto --users/--rid-brute" in t for s, t in _ceres_smb["findings"])
 
     # Fallback: si LDAP no consiguió la lista (0 usuarios, p. ej. acceso LDAP restringido), SMB
@@ -17892,6 +18095,33 @@ def selftest():
     assert _tip_for("Puerto 80 abierto") is None   # texto sin ninguna categoría conocida → sin tip, no inventa nada
     assert all(w.get("tip") for w in qw), qw   # "Pwn3d!" y "share READ" SÍ tienen tip en este fixture
     assert not qw[0]["tip"].startswith("$") and "\n" not in qw[0]["tip"]   # prosa, nunca un comando a pegar
+
+    # quick_wins: sin NINGÚN hallazgo crítico/alto (operator-asked: "si no hay vector claro de
+    # entrada que recomiende fuerza bruta") se promueve la sugerencia de brutespray (si existe)
+    # como fallback — antes la caja de Quick Wins se quedaba vacía y ni se imprimía, dejando al
+    # operador sin "por dónde empezar" pese a tener una sugerencia razonable más abajo.
+    _bs_fp_qw = {"proto": "brutespray", "title": "Fuerza bruta multi-protocolo (brutespray)",
+                 "ports": [], "steps": [],
+                 "findings": [("info", "2 servicio(s) crackeable(s) por diccionario (ftp, smbnt)")],
+                 "next": ["brutespray -H ftp://x:21 -H smbnt://x:445 -u users.txt -p rockyou.txt"],
+                 "missing": []}
+    _novec_qw = quick_wins([{"proto": "web", "title": "Web", "ports": [80], "steps": [],
+                             "findings": [("media", "Web 80: falta X-Frame-Options")],
+                             "next": [], "missing": []}, _bs_fp_qw])
+    assert len(_novec_qw) == 1 and _novec_qw[0]["sev"] == "info"
+    assert "brutespray" in _novec_qw[0]["cmds"][0], _novec_qw
+    assert "Sin hallazgo crítico/alto" in _novec_qw[0]["title"]
+    # Con un hallazgo crítico/alto YA presente, no hace falta el fallback — brutespray se queda
+    # fuera de Quick Wins (sigue en el informe completo, solo no aquí).
+    _conhit_qw = quick_wins([{"proto": "smb", "title": "SMB", "ports": [445], "steps": [],
+                              "findings": [("alta", "SMB: algo crítico")],
+                              "next": ["cmd1"], "missing": []}, _bs_fp_qw])
+    assert not any(w["sev"] == "info" for w in _conhit_qw), _conhit_qw
+    # Sin brutespray en los footprints (0 o 1 servicio crackeable: nunca se construyó esa
+    # sugerencia), el fallback no inventa nada — la caja se queda vacía, igual que antes.
+    assert quick_wins([{"proto": "web", "title": "Web", "ports": [80], "steps": [],
+                        "findings": [("media", "Web 80: falta X-Frame-Options")],
+                        "next": [], "missing": []}]) == []
     # _known_web_product: banner genérico de nmap, el título SÍ delata el producto
     web_svc = [{"port": 5000, "proto": "tcp", "name": "http",
                 "product": "Microsoft HTTPAPI httpd", "version": "2.0",
@@ -18025,6 +18255,90 @@ def selftest():
                   "NetBIOS computer name: ACADEMY-EA-DC01\\x00\nDomain name: INLANEFREIGHT.LOCAL"}}]
     assert netbios_computer_name(_smbos_svc, {}) == "ACADEMY-EA-DC01"         # sin el '\x00' colgando
     assert netbios_computer_name([{"port": 80, "scripts": {}}], {}) is None   # ninguno de los 3 corrió
+
+    # netbios_workgroup / _cc_nxc(domain=): BUG real (operador, confirmado en vivo contra 3
+    # objetivos reales distintos) — sin '-d' explícito, nxc cae a usar el propio HOSTNAME del
+    # objetivo como domain NTLM cuando no hay AD, y una credencial LOCAL válida se rechaza con
+    # STATUS_LOGON_FAILURE por ese domain equivocado; con '-d WORKGROUP' SÍ entra. Fixture =
+    # texto REAL de un nbstat real (mismo formato que el operador pegó): la entrada <00> con
+    # 'Flags: <group>' es el workgroup; la del propio equipo es TAMBIÉN <00> pero <unique>.
+    _nbstat_real = ("NetBIOS name: DISCOVER, NetBIOS user: <unknown>, NetBIOS MAC: 08:00:27:88:57:94\n"
+                    "Names:\n"
+                    "  DISCOVER<00>         Flags: <unique><active>\n"
+                    "  DISCOVER<03>         Flags: <unique><active>\n"
+                    "  DISCOVER<20>         Flags: <unique><active>\n"
+                    "  \\x01\\x02__MSBROWSE__\\x02<01>  Flags: <group><active>\n"
+                    "  WORKGROUP<00>        Flags: <group><active>\n"
+                    "  WORKGROUP<1d>        Flags: <unique><active>\n"
+                    "  WORKGROUP<1e>        Flags: <group><active>")
+    assert netbios_workgroup([{"port": 445, "scripts": {}}], {"nbstat": _nbstat_real}) == "WORKGROUP"
+    assert netbios_workgroup([{"port": 80, "scripts": {}}], {}) is None   # nbstat no corrió
+    # Segundo objetivo real (dc01.soupedecode.local, mismo síntoma): el workgroup NetBIOS es el
+    # nombre corto del propio dominio AD, no literalmente "WORKGROUP" — misma extracción vale.
+    _nbstat_dc = ("NetBIOS name: WIN-JG67MIHZH2X, NetBIOS user: <unknown>, NetBIOS MAC: 08:00:27:38:d0:92\n"
+                  "Names:\n"
+                  "  WIN-JG67MIHZH2X<00>  Flags: <unique><active>\n"
+                  "  SOUPEDECODE<00>      Flags: <group><active>\n"
+                  "  WIN-JG67MIHZH2X<20>  Flags: <unique><active>")
+    assert netbios_workgroup([{"port": 445, "scripts": {}}], {"nbstat": _nbstat_dc}) == "SOUPEDECODE"
+
+    _real_nxcbin_dom, _real_rc_dom = nxc_bin, run_capture
+    _dom_cmds = []
+    globals()["nxc_bin"] = lambda: "FAKE_NXC"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (_dom_cmds.append(cmd), (0, "[-] no"))[1]
+    try:
+        _cc_nxc(_fp("x", "x", []), "FAKE_NXC", "smb", "10.0.0.1", [("ken", "kenken", "ken:kenken")], domain="WORKGROUP")
+        _cc_nxc(_fp("x", "x", []), "FAKE_NXC", "ftp", "10.0.0.1", [("anonymous", "anonymous@palantir", "anónimo")], domain="WORKGROUP")
+        _cc_nxc(_fp("x", "x", []), "FAKE_NXC", "smb", "10.0.0.1", [("ken", "kenken", "ken:kenken")])
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_dom, _real_rc_dom
+    assert "-d" in _dom_cmds[0] and _dom_cmds[0][_dom_cmds[0].index("-d") + 1] == "WORKGROUP", _dom_cmds[0]
+    assert "-d" not in _dom_cmds[1], _dom_cmds[1]   # ftp: sin NTLM, domain se ignora
+    assert "-d" not in _dom_cmds[2], _dom_cmds[2]   # sin domain conocido: sin '-d' (comportamiento de siempre)
+
+    # Mismo fix de domain, pero en Fase 5d (provided_creds_check y sus ayudantes _nxc_bulk/
+    # _nxc_try_cred/_dump_sam_lsa) — no es el mismo código que _cc_nxc (Fase 5c), así que necesita
+    # su propia cobertura: cada función abre su PROPIO proceso nxc y hay que confirmar que CADA
+    # una mete '-d' cuando toca, y que --local-auth (nxc fuerza domain=hostname en ese modo, ver
+    # nxc/protocols/smb.py) sigue ganando y dejando '-d' fuera.
+    _real_nxcbin_dom2, _real_rc_dom2 = nxc_bin, run_capture
+    _dom2_cmds = []
+    globals()["nxc_bin"] = lambda: "FAKE_NXC"
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (_dom2_cmds.append(cmd), (0, "[-] no"))[1]
+    try:
+        _nxc_bulk(_fp("x", "x", []), "smb", "10.0.0.1", 445, 445, ["ken"], ["kenken"], False, "FAKE_NXC", False, False,
+                  domain="WORKGROUP")
+        _nxc_bulk(_fp("x", "x", []), "smb", "10.0.0.1", 445, 445, ["ken"], ["kenken"], False, "FAKE_NXC", False, True,
+                  domain="WORKGROUP")   # local_auth=True: '-d' se ignora, nxc ya fuerza domain=hostname
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_dom2, _real_rc_dom2
+    assert "-d" in _dom2_cmds[0] and _dom2_cmds[0][_dom2_cmds[0].index("-d") + 1] == "WORKGROUP", _dom2_cmds[0]
+    assert "-d" not in _dom2_cmds[1] and "--local-auth" in _dom2_cmds[1], _dom2_cmds[1]
+
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (_dom2_cmds.append(cmd), (0, "[-] no"))[1]
+    try:
+        _nxc_try_cred("FAKE_NXC", "smb", "10.0.0.1", "ken", "kenken", False, False, None, None, domain="WORKGROUP")
+        _nxc_try_cred("FAKE_NXC", "ftp", "10.0.0.1", "anonymous", "anonymous@palantir", False, False, None, None,
+                      domain="WORKGROUP")   # ftp: sin NTLM, domain se ignora
+    finally:
+        globals()["run_capture"] = _real_rc_dom2
+    assert "-d" in _dom2_cmds[2] and _dom2_cmds[2][_dom2_cmds[2].index("-d") + 1] == "WORKGROUP", _dom2_cmds[2]
+    assert "-d" not in _dom2_cmds[3], _dom2_cmds[3]
+
+    _sam_cmds = []
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (_sam_cmds.append(cmd), (0, ""))[1]
+    try:
+        _dump_sam_lsa(_fp("x", "x", []), "FAKE_NXC", "10.0.0.1", "ken", "kenken", domain="WORKGROUP")
+    finally:
+        globals()["run_capture"] = _real_rc_dom2
+    assert _sam_cmds and all("-d" in c and c[c.index("-d") + 1] == "WORKGROUP" for c in _sam_cmds), _sam_cmds
+    _sam_cmds2 = []
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (_sam_cmds2.append(cmd), (0, ""))[1]
+    try:
+        _dump_sam_lsa(_fp("x", "x", []), "FAKE_NXC", "10.0.0.1", "ken", "kenken", domain="WORKGROUP", local_auth=True)
+    finally:
+        globals()["run_capture"] = _real_rc_dom2
+    assert _sam_cmds2 and all("-d" not in c and "--local-auth" in c for c in _sam_cmds2), _sam_cmds2
 
     # _nxc_identity_from_footprints: identidad (name/domain) desde la salida de nxc del footprint,
     # única fuente para un host sin 445/LDAP/DNS (SQL01). Dominio solo si es FQDN (workgroup no).
@@ -19483,6 +19797,44 @@ def selftest():
     assert _ensure_nxc_verbose(["nxc", "smb", "x", "--debug"]) == ["nxc", "smb", "x", "--debug"]        # respeta --debug explícito
     assert _ensure_nxc_verbose(["dig", "NS", "x"]) == ["dig", "NS", "x"]   # no-nxc: intacto
 
+    # _strip_nxc_noise / _step: el --verbose forzado de arriba también saca el log INTERNO de
+    # impacket (operador, run real: "sobre todo te he pasado el error de nxc" — el mismo bloque
+    # de 'Creating SMBv1/SMBv3 connection' + el unpack roto repetido en cada llamada a nxc smb).
+    # Fixture = texto REAL de un commands.log real (mismas líneas, mismo formato de RichHandler).
+    _nxc_raw = (
+        "[18:53:42] INFO     Socket info: host=192.168.1.234, hostname=192.168.1.234, "
+        "kerberos=False, ipv6=False, link-local ipv6=False                                  "
+        "connection.py:174\n"
+        "           INFO     Creating SMBv1 connection to 192.168.1.234                             "
+        "smb.py:555\n"
+        "           INFO     Error creating SMBv1 connection to 192.168.1.234: ('unpack requires a "
+        "buffer of 1 bytes', \"When unpacking field 'SecurityMode | <B | b''[:1]'\")                "
+        "smb.py:581\n"
+        "           INFO     Creating SMBv3 connection to 192.168.1.234                             "
+        "smb.py:586\n"
+        "SMB                      192.168.1.234   445    DISCOVER         [*] Unix - Samba "
+        "(name:DISCOVER) (domain: ) (signing:True) (SMBv1:None) (Null Auth:True)\n"
+        "SMB                      192.168.1.234   445    DISCOVER         [+]  \\guest: (Guest)\n"
+        "SMB                      192.168.1.234   445    DISCOVER         [-] Error enumerating "
+        "shares: STATUS_ACCESS_DENIED"
+    )
+    _nxc_clean = _strip_nxc_noise("nxc smb 192.168.1.234 -u guest -p '' --shares --verbose", _nxc_raw)
+    assert "connection.py:174" not in _nxc_clean and "smb.py:555" not in _nxc_clean
+    assert "smb.py:581" not in _nxc_clean and "smb.py:586" not in _nxc_clean
+    assert "[*] Unix - Samba" in _nxc_clean and "[+]  \\guest: (Guest)" in _nxc_clean
+    # "[-] Error enumerating..." SÍ contiene la palabra 'Error', pero NO termina en '.py:NNN' —
+    # es salida REAL del módulo (display()/success()/fail()), nunca se toca.
+    assert "[-] Error enumerating shares: STATUS_ACCESS_DENIED" in _nxc_clean
+    # Un comando que NO es nxc se queda intacto, aunque su salida por casualidad termine en algo.py:1
+    assert _strip_nxc_noise("python3 script.py:1", "cualquier salida.py:1") == "cualquier salida.py:1"
+    assert _strip_nxc_noise("nxc smb x", "") == ""   # sin salida: no revienta
+    # _step() ya aplica el filtro solo — el informe nunca ve el log interno, commands.log (ver
+    # _log_nxc_output, aparte) sigue completo porque usa la salida CRUDA, no la de _step().
+    _nres_noise = _fp("smb", "SMB", [445])
+    _step(_nres_noise, "nxc smb 192.168.1.234 -u '' -p '' --shares", True, _nxc_raw)
+    assert "connection.py:174" not in _nres_noise["steps"][0]["output"]
+    assert "[*] Unix - Samba" in _nres_noise["steps"][0]["output"]
+
     # ── run_capture REAL (sin mockear): --verbose llega de verdad al subproceso, su salida
     # cruda queda en commands.log (nunca a pantalla salvo VERBOSE), y --verbose/-v de palantir
     # hace el eco en vivo. Script de mentira cuyo basename es EXACTAMENTE 'nxc' (ruta absoluta:
@@ -20547,10 +20899,21 @@ def run_one(ip, name, args, folder=None):
     global CONNECT
     if not ports and is_root() and not _initial_connect and not args.stealth:
         warn("SYN scan (-sS) sin resultados con root — posible túnel que descarta SYN raw "
-             "(p. ej. WSL2 mirrored + VPN). Reintento con connect scan (-sT)…")
+             "(p. ej. WSL2 mirrored + VPN). Reintento con connect scan (-sT), sin --min-rate "
+             "para no perder respuestas por la misma causa…")
         CONNECT = True
+        # BUG real (operador, confirmado dos veces en vivo contra WSL2: 'nmap -p445 <ip>' SYN
+        # daba 'filtered' en un puerto que -sT SÍ mostraba abierto, y el reintento aquí mismo
+        # seguía viniendo vacío) — el AVISO de arriba ya diagnostica "posible túnel que
+        # descarta SYN raw (WSL2 mirrored + VPN)", pero el reintento seguía usando el timing
+        # agresivo de siempre (-T4 --min-rate, ver _fast_scan_timing) salvo que el operador
+        # TAMBIÉN pasara --tunnel — algo que nadie hace al escanear una VM local sin
+        # pivot/VPN de por medio. Llegar aquí YA significa "el SYN raw no está volviendo", el
+        # mismo síntoma que --tunnel existe para tratar — así que este reintento concreto
+        # fuerza tunnel=True (perfil sin pérdidas: -T3, sin --min-rate, 10 reintentos) SIEMPRE,
+        # pase lo que pase con args.tunnel.
         ports = fast_ports(ip, nmapdir, args.min_rate, args.top, stealth=args.stealth,
-                           source_port=args.source_port, ports=forced_ports, tunnel=args.tunnel, tag="fast_connect")
+                           source_port=args.source_port, ports=forced_ports, tunnel=True, tag="fast_connect")
     if not ports and not forced_ports:
         # Algunos WAF/CDN/firewalls detectan y bloquean el PATRÓN de un barrido masivo
         # (muchos puertos en poco tiempo) pero dejan pasar una conexión HTTP normal —
@@ -20819,8 +21182,12 @@ def run_one(ip, name, args, folder=None):
                 if name and name not in _early_domains:
                     _early_domains = sorted(set(_early_domains) | {name})
                 _early_ad_domain = next((d for d in _early_domains if base_domain(d) == d), None)
+                # Sin AD, _early_ad_domain sale None — pero nxc SIGUE necesitando un '-d' correcto
+                # para NTLM (ver provided_creds_check): el WORKGROUP NetBIOS es el valor que toca
+                # en ese caso (mismo fallback que ya usa creds_check en Fase 5c).
                 newcreds = provided_creds_check(ip, services, pcreds, bulk=bulk, local_auth=args.local_auth,
-                                                is_hash=bool(args.hash), base=base, domain=_early_ad_domain,
+                                                is_hash=bool(args.hash), base=base,
+                                                domain=_early_ad_domain or netbios_workgroup(services, host),
                                                 known_ad_users=_known_ad_users)
                 for f in newcreds:
                     f["phase"] = "creds_provided"
@@ -21240,9 +21607,9 @@ def main():
                     help="Carpeta base de resultados (def. ~/htb del usuario real, no /root bajo sudo).")
     g_fuzzing.add_argument("-w", "--wordlist", nargs="+", metavar="WL",
                     help="Una o varias wordlists para ffuf (gana al --profile).")
-    g_fuzzing.add_argument("--profile", choices=WORDLIST_PROFILES, default="medium",
-                    help="Tamaño de la wordlist de fuzzing web: quick (rápida), medium (equilibrada, def.), "
-                         "big (exhaustiva). La gana -w/--wordlist si la pasas.")
+    g_fuzzing.add_argument("--profile", choices=WORDLIST_PROFILES, default="big",
+                    help="Tamaño de la wordlist de fuzzing web: quick (rápida), medium (equilibrada), "
+                         "big (exhaustiva, def.). La gana -w/--wordlist si la pasas.")
     g_fuzzing.add_argument("--no-big-wordlist", action="store_true",
                     help="No añadas dirb/big.txt (~20k líneas) a la(s) wordlist(s) elegida(s) — por defecto "
                          "se suma siempre sea cual sea --profile/-w. Para objetivos reales (no labs) donde "

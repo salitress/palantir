@@ -231,7 +231,7 @@ sudo ./palantir.py 10.129.21.27 --resume -u Administrator -H 31d6cfe0d16ae931b73
 | `--tcp-connect` (`--connect`) | Fuerza connect scan (`-sT`) aunque haya root. |
 | `--tunnel` (`--pivoting`, `--pivot`) | Escaneo apto para **pivoting/túnel**. Ver [Pivoting / túnel](#modo-pivoting--túnel) arriba. |
 | `--resume` | Reutiliza los XML de nmap ya existentes Y, si los puertos/servicios no cambiaron, el footprint/searchsploit/credenciales por defecto del `findings.json` anterior: solo relanza fuzzing/informes y las credenciales aportadas nuevas (nunca se saltan). |
-| `--profile quick\|medium\|big` | Set de wordlists (def. `medium`; `big` usa varias). |
+| `--profile quick\|medium\|big` | Set de wordlists (def. `big`, usa varias; `medium` es una sola lista, más rápida). |
 | `-w L [L …]` | Wordlists explícitas (gana al `--profile`). |
 | `--no-big-wordlist` | No añadas `dirb/big.txt` a la(s) wordlist(s) elegida(s). |
 | `--ext .php,.txt` | Fuerza extensiones (si no, se deducen del servidor). |

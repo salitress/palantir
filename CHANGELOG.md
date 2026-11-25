@@ -6,6 +6,77 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Quick Wins now falls back to a brute-force suggestion when there's no clear critica/alta
+  vector** (operator-asked: "que si no hay vector claro de entrada que recomiende fuerza
+  bruta"). Before, an empty Quick Wins box simply didn't print at all (`render_quick_wins`
+  returns on `not wins`), leaving the operator with no "where do I start" even when a
+  reasonable brutespray suggestion already existed further down in the full report. Now, only
+  when Quick Wins would otherwise be completely empty, the existing brutespray suggestion (built
+  the same step, whenever 2+ crackeable services were detected) is promoted into the box as an
+  explicit `info`-severity, clearly-labeled "sin vector claro" entry — never silently mixed in
+  with a real critica/alta finding.
+
+### Changed
+
+- **`--profile` now defaults to `big`** (was `medium`) (operator-asked: "pon profile big por
+  defecto").
+
+### Fixed
+
+- **ffuf never fuzzed INSIDE a subdirectory it discovered** (operator-asked, from a real
+  diff against wfuzz: "comprueba que hace ffuf también a los subdirectorios que encuentra" — a
+  redirect like `/aspnet_client` → `/aspnet_client/` was recorded but never fuzzed further).
+  ffuf already supports this natively (`-recursion`/`-recursion-depth`/`-recursion-strategy
+  default`, confirmed in its own `-h`): a new pass only fires on a real redirect to a
+  subdirectory (not on every match, which would be `-greedy` and open-ended), bounded to 3
+  levels deep, disabled under `--stealth`. Fixing this surfaced a second bug: a recursed hit's
+  JSON `input.FUZZ` field only carries the bare matched word (`flag.txt`), losing the
+  subdirectory prefix — confirmed by standing up a real test server with `-recursion` — so the
+  displayed path is now derived from the `url` field (always the full real path) instead.
+
+- **The WSL2-mirrored-networking SYN-ACK-loss timing fix only applied with an explicit
+  `--tunnel`, not to the automatic retry it exists to treat.** When a root SYN scan (`-sS`)
+  comes back with 0 ports and palantir already auto-retries with `-sT`, that retry still used
+  the default aggressive timing (`-T4 --min-rate`) unless the operator also happened to pass
+  `--tunnel` — which nobody does when scanning a local VM with no VPN/pivot in the way.
+  Confirmed live, twice, against the same WSL2 setup: `-sS` reported a port `filtered` that
+  `-sT` showed open, and the auto-retry still came back empty. Reaching that retry already means
+  "raw SYN isn't coming back" — the exact symptom `--tunnel`'s timing profile (`-T3`, no
+  `--min-rate`, 10 retries) exists for — so this retry now always forces it, regardless of
+  whether `--tunnel` was passed.
+
+- **nxc's internal RichHandler debug log (the `Creating SMBv1/SMBv3 connection...` /
+  `Error creating SMBv1 connection...` block) cluttered the HTML/Markdown report on every SMB
+  call** (operator-reported, from a real run: "sobre todo te he pasado el error de nxc" — the
+  same block repeated across ~10 `nxc smb` calls). Confirmed in nxc's own source
+  (`nxc/protocols/smb.py`/`nxc/logger.py`): nxc always tries SMBv1 first and falls back to
+  SMBv3, and that internal log always ends in `file.py:NNN` — a suffix real protocol output
+  (`display()`/`success()`/`fail()`) never has, even when it contains the word "Error". New
+  `_strip_nxc_noise()`, wired into the shared `_step()` used by every nxc call, drops only
+  lines matching that suffix from what's saved for the report. `commands.log` is untouched —
+  it deliberately keeps the full raw output.
+
+- **A valid LOCAL/workgroup credential against a non-domain SMB target could be rejected by
+  nxc with `STATUS_LOGON_FAILURE`** (operator-reported, confirmed live against 3 separate real
+  targets: "el problema de nxc es que contra ese samba parece que no funcionaba, solo iba
+  smbmap con sudo" → "cierto, funciona" once `-d WORKGROUP` was added by hand). Confirmed
+  reading nxc's own source (`nxc/protocols/smb.py`): without an explicit `-d`, nxc's domain
+  falls back to the target's own hostname whenever there's no AD DNS domain to resolve — not
+  the NetBIOS workgroup the credential actually belongs to — so a perfectly valid local account
+  gets validated against the wrong "domain" and fails. Fixed everywhere nxc is given a
+  default or provided credential for a protocol that does real NTLM auth (`_PWN_IS_ADMIN`):
+  Fase 5c's `_cc_nxc` (default-creds check) and, mirroring it, every Fase 5d/"provided
+  credentials" path — `provided_creds_check`'s single-pair loop, its bulk/spray path
+  (`_nxc_bulk`), the cross-protocol reuse chain (`_nxc_try_cred`), the post-Pwn3d! SAM/LSA dump
+  (`_dump_sam_lsa`), and the post-auth domain enumeration (`_creds_enum`) — now all pass
+  `-d <domain>`, using the already-resolved AD domain when there is one, falling back to the
+  NetBIOS workgroup (`netbios_workgroup`) when there isn't. Ignored wherever `--local-auth` is
+  already set, since nxc forces `domain=hostname` in that mode regardless of `-d` anyway.
+
 ## [2.3.0] - 2026-11-25
 
 ### Added
