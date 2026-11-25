@@ -19021,12 +19021,20 @@ def selftest():
     # .local/bin); el fix añadió ese mismo directorio a _crtsh_bin. Se simula un $HOME con
     # SUDO_UID (mismo camino que toma _bin_with_sudo_fallback bajo sudo) en vez de tocar el
     # HOME real.
+    #
+    # linux-exploit-suggester: MISMA familia de bug, pero un escalón más arriba —
+    # _les_bin() SIEMPRE miró bien en .local/bin, el roto era _tool_present(), que caía al
+    # `have(tool)` genérico con la key del dict ('linux-exploit-suggester', un nombre que el
+    # binario real NUNCA usa: se instala como 'les.sh' o 'linux-exploit-suggester.sh') — así
+    # que preflight lo daba por "instalación MANUAL" sin posibilidad de descarga aunque ya
+    # estuviera instalado con uno de sus dos nombres válidos (pedido explícito del usuario,
+    # al ver ese mensaje en un escaneo real). Se prueba junto a crt.sh/kerbrute.
     _real_rh, _real_have_fb = globals()["_real_home"], globals()["have"]
     _real_sudo_uid = os.environ.get("SUDO_UID")
     with tempfile.TemporaryDirectory() as _bd:
         _bindir = Path(_bd) / ".local" / "bin"
         _bindir.mkdir(parents=True)
-        for _name in ("crt.sh", "kerbrute"):
+        for _name in ("crt.sh", "kerbrute", "linux-exploit-suggester.sh"):
             _f = _bindir / _name
             _f.write_text("#!/bin/sh\n")
             _f.chmod(0o755)
@@ -19036,12 +19044,40 @@ def selftest():
         try:
             assert _crtsh_bin() == str(_bindir / "crt.sh")
             assert _kerbrute_bin() == str(_bindir / "kerbrute")
+            assert _les_bin() == str(_bindir / "linux-exploit-suggester.sh")
+            assert _tool_present("linux-exploit-suggester") is True   # el fix: ya no cae en have() a pelo
         finally:
             globals()["_real_home"], globals()["have"] = _real_rh, _real_have_fb
             if _real_sudo_uid is None:
                 os.environ.pop("SUDO_UID", None)
             else:
                 os.environ["SUDO_UID"] = _real_sudo_uid
+
+    # _install_les: descarga directa de un único fichero (mismo patrón que _install_kerbrute,
+    # sin tarball ni API de GitHub de por medio) — se mockea urlopen + _install_dest_bin, nunca
+    # toca la red ni GitHub de verdad. Confirma que llega ejecutable y con el contenido exacto.
+    _real_idb_les = globals()["_install_dest_bin"]
+    with tempfile.TemporaryDirectory() as _ld:
+        _ldest = Path(_ld) / "una-carpeta-que-no-existe-todavia" / "linux-exploit-suggester.sh"
+        globals()["_install_dest_bin"] = lambda name: (_ldest, None)
+        _les_bytes = b"#!/bin/bash\necho fake les\n"
+        _ur.urlopen = lambda req, timeout=None: _FakeResp(_les_bytes)
+        try:
+            ok_les, err_les = _install_les()
+            assert ok_les and err_les is None, err_les
+            assert _ldest.is_file() and os.access(_ldest, os.X_OK)
+            assert _ldest.read_bytes() == _les_bytes
+        finally:
+            globals()["_install_dest_bin"] = _real_idb_les
+            _ur.urlopen = _real_urlopen
+
+    # joomscan: BUG real encontrado en la misma revisión (pedido explícito del usuario:
+    # "revisa si hay más herramientas que no den la opción de instalarlas") — TOOL_PKGS lo
+    # marcaba (None, ...), como si no existiera paquete apt, pero Kali SÍ lo empaqueta tal
+    # cual ('sudo apt install joomscan', confirmado contra la página oficial de Kali
+    # Tools) — preflight lo daba por "instalación MANUAL" y nunca ofrecía instalarlo con
+    # apt pese a que el paquete existe. No hay parser que probar aquí, solo fijar el dato.
+    assert TOOL_PKGS["joomscan"][0] == "joomscan", TOOL_PKGS["joomscan"]
 
     # ── Tests de los nuevos parsers de módulos OSCP-safe (ninguna red, solo cadenas) ──────
     # _nxc_split_by_module + _nxc_payload_lines son la base; el resto llama a payload_lines.
@@ -19284,9 +19320,18 @@ def selftest():
 # Separado de TOOL_PKGS (que es solo "apt install X"): preflight() los enseña SIEMPRE
 # junto a su fuente exacta (URL o paquete) ANTES de preguntar, y solo los toca si el
 # operador confirma (o pasó --install-missing) — primero verificar (`_tool_present`),
-# LUEGO actuar, nunca al revés. Las que NO están aquí (p. ej. joomscan: cadena de
-# dependencias Perl/cpan demasiado distinta entre distros para automatizar con
-# confianza) se quedan en instalación puramente manual, igual que antes.
+# LUEGO actuar, nunca al revés. Las que NO están aquí (p. ej. mongosh: el paquete real se
+# llama 'mongodb-mongosh' y vive en el repo propio de MongoDB, no en los repos ya
+# configurados — un "apt install" a secas fallaría con 'Unable to locate package'; además
+# su punto de uso (fp_mongo) hoy resuelve con un `have("mongosh")` a pelo, sin el
+# resolver de .local/bin que tienen los demás, así que arreglarlo de verdad pide tocar
+# ese punto de uso, no solo añadir un fetcher aquí) se quedan en instalación puramente
+# manual. joomscan YA NO está en este grupo: se asumía (incorrectamente — BUG real
+# encontrado al revisar esto a fondo, pedido explícito del usuario) que su cadena de
+# dependencias Perl/cpan era demasiado distinta entre distros para automatizar con
+# confianza, pero Kali lo empaqueta tal cual ('sudo apt install joomscan', confirmado
+# contra la página oficial de Kali Tools) — apt ya resuelve esas dependencias solo, así que
+# ahora vive en TOOL_PKGS como un apt normal, igual que wpscan/nikto.
 def _download_file(url, dest, timeout=60):
     """Descarga `url` a `dest` (crea el directorio padre si hace falta) con urllib —
     stdlib puro, sin dependencias nuevas, mismo patrón que el resto del fichero (ver
@@ -19402,6 +19447,25 @@ def _install_kerbrute():
     dest, ids = _install_dest_bin("kerbrute")
     ok, errmsg = _download_file(
         "https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_amd64", dest)
+    if ok:
+        os.chmod(dest, 0o755)
+        _chown_real(dest, ids)
+    return ok, errmsg
+
+
+def _install_les():
+    """linux-exploit-suggester.sh (mzet-/linux-exploit-suggester) — a diferencia de kerbrute
+    (binario compilado por arquitectura) esto es un ÚNICO script bash autocontenido: la base
+    de CVEs va embebida en el propio fichero, sin dependencias externas ni compilación
+    (confirmado descargando y leyendo el fichero real de la rama 'master': 2771 líneas,
+    cabecera '#!/bin/bash', ningún 'source'/import de otro fichero del repo) — mismo patrón
+    de descarga directa que _install_kerbrute, sin tocar la API de GitHub. _les_bin() ya
+    busca 'linux-exploit-suggester.sh'/'les.sh' en .local/bin (ver _bin_with_sudo_fallback),
+    así que basta con dejarlo ahí con el nombre largo para que el resto de palantir lo
+    encuentre solo."""
+    dest, ids = _install_dest_bin("linux-exploit-suggester.sh")
+    ok, errmsg = _download_file(
+        "https://raw.githubusercontent.com/mzet-/linux-exploit-suggester/master/linux-exploit-suggester.sh", dest)
     if ok:
         os.chmod(dest, 0o755)
         _chown_real(dest, ids)
@@ -19536,9 +19600,12 @@ _FETCHABLE_RESOURCES = {
     # adidnsdump, mongosh se resuelve hoy con un `have("mongosh")` a pelo (ver fp_mongo),
     # sin el fallback a .local/bin que tienen los demás. Arreglarlo de verdad pide un
     # resolver dedicado + tocar el punto de uso, no solo el instalador — mismo nivel de
-    # riesgo que joomscan (ver abajo), así que se queda fuera de la lista, igual que esa.
+    # riesgo que tenía joomscan antes de pasar a ser un apt normal (ver TOOL_PKGS), así que
+    # se queda fuera de esta lista.
     "crt.sh":     {"fetch": _install_crtsh,
                    "source": "binario precompilado de la última release de github.com/az7rb/crt.sh"},
+    "linux-exploit-suggester": {"fetch": _install_les,
+                   "source": "script de github.com/mzet-/linux-exploit-suggester (un solo fichero, sin releases)"},
     "brutespray": {"fetch": _install_brutespray,
                    "source": "binario precompilado de la última release de github.com/x90skysn3k/brutespray"},
 }
@@ -19571,7 +19638,7 @@ TOOL_PKGS = {
     "ffuf":             ("ffuf", "fuzzing de directorios y vhosts", ("fuzz",)),
     "nikto":            ("nikto", "web: escaneo de vulnerabilidades/config conocidas (--nikto, opt-in — lento)", ("nikto",)),
     "wpscan":           ("wpscan", "CMS: WPScan contra WordPress — plugins/temas/usuarios/vulns (--cms-scan, opt-in)", ("cms",)),
-    "joomscan":         (None, "CMS: JoomScan contra Joomla (--cms-scan, opt-in — no está en apt, github.com/OWASP/joomscan)", ("cms",)),
+    "joomscan":         ("joomscan", "CMS: JoomScan contra Joomla (--cms-scan, opt-in)", ("cms",)),
     "katana":           ("katana", "web: crawling real con katana — sigue enlaces/JS/formularios de verdad (--crawl, opt-in)", ("crawl",)),
     "nuclei":           ("nuclei", "web: nuclei — plantillas de CVEs/exposiciones/misconfig (--nuclei, opt-in — lento/ruidoso)", ("nuclei",)),
     "searchsploit":     ("exploitdb", "exploits conocidos (consulta offline)", ("sploit",)),
@@ -19594,14 +19661,21 @@ TOOL_PKGS = {
 
 def _tool_present(tool):
     """nxc puede llamarse nxc/netexec/crackmapexec; crt.sh/impacket-rpcdump pueden vivir
-    fuera del PATH de root bajo sudo (pipx/Go); 'seclists'/'jsmith.txt' no son binarios
-    (carpeta/fichero, sin `have()`); el resto por su nombre."""
+    fuera del PATH de root bajo sudo (pipx/Go); linux-exploit-suggester se instala como
+    'les.sh'/'linux-exploit-suggester.sh' (nunca con el nombre de la key), así que un
+    `have(tool)` a pelo nunca lo encontraría ni en el PATH ni en .local/bin — BUG real
+    (mismo tipo que ya costó crt.sh, ver el test de _crtsh_bin/_kerbrute_bin): hacía que
+    preflight lo marcara "instalación MANUAL" y jamás lo ofreciera para descargar aunque ya
+    estuviera instalado con otro de sus dos nombres válidos; 'seclists'/'jsmith.txt' no son
+    binarios (carpeta/fichero, sin `have()`); el resto por su nombre."""
     if tool == "nxc":
         return nxc_bin() is not None
     if tool == "crt.sh":
         return _crtsh_bin() is not None
     if tool == "impacket-rpcdump":
         return _rpcdump_bin() is not None
+    if tool == "linux-exploit-suggester":
+        return _les_bin() is not None
     if tool == "certipy":
         return certipy_bin() is not None
     if tool == "creds":

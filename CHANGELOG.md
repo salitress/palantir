@@ -6,6 +6,40 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **linux-exploit-suggester.sh is now auto-installable** (operator-asked, after seeing it listed
+  as "instalación MANUAL" on a real scan) — confirmed against the real file on the repo's
+  `master` branch: it's a single self-contained bash script (no release artifacts, no
+  compilation, the curated CVE database is embedded in the file itself), so the same direct-
+  download pattern already used for kerbrute applies here too. New `_install_les()` downloads
+  it straight to `.local/bin` and marks it executable; registered in `_FETCHABLE_RESOURCES` so
+  `--install-missing` now offers it like any other fetchable tool.
+
+### Fixed
+
+- **`_tool_present("linux-exploit-suggester")` never actually matched how the tool is detected
+  elsewhere** — `_les_bin()` has always correctly looked for `les.sh`/`linux-exploit-suggester.sh`
+  in `.local/bin` (see `_bin_with_sudo_fallback`), but preflight's own presence check fell
+  through to a bare `have("linux-exploit-suggester")`, a literal binary name the real tool is
+  never installed under. Same class of bug already found and fixed for `crt.sh` (see the
+  `_crtsh_bin`/`_kerbrute_bin` test above) — it meant the tool was reported "falta" and offered
+  no install option even when already present under one of its real names. Fixed by routing
+  `_tool_present` through `_les_bin()` like the other home-dir-fallback tools.
+
+- **`joomscan` was wrongly marked as "no apt package" and stuck on purely manual install**
+  (follow-up to the `linux-exploit-suggester` fix above — operator asked to audit the rest of
+  `TOOL_PKGS` for the same class of gap). It isn't: Kali packages it directly (`sudo apt install
+  joomscan`, confirmed against the official Kali Tools page), so apt already resolves its
+  Perl/cpan dependencies on its own — the old assumption that this needed a distro-aware custom
+  installer no longer holds. `TOOL_PKGS["joomscan"]` now carries the real apt package name, same
+  as `wpscan`/`nikto`, instead of `None`. `mongosh` stays manual: its real package is
+  `mongodb-mongosh`, which lives in MongoDB's own apt repo (not the repos palantir can assume are
+  already configured), and its use site (`fp_mongo`) would need a dedicated resolver too — a
+  genuinely different, bigger problem than a missing `TOOL_PKGS` entry.
+
 ## [2.2.0] - 2026-11-24
 
 ### Added
