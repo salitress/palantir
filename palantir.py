@@ -11577,6 +11577,31 @@ def _downgrade_old_samba_exploits(vulns, samba_version):
                 e["title"] += f"  [versión real confirmada: Samba {shown} — probablemente no aplica]"
 
 
+def _downgrade_wrong_product_exploits(vulns, product_word):
+    """searchsploit hace matching por SUBCADENA, no por producto real: buscar 'Samba'/'Samba 4'
+    también casa con 'Sambar Server' (un servidor web discontinuado de Cogent/Watcher, ~2000-2004,
+    SIN relación con Samba/SMB) — confirmado en un run real contra un Debian con Samba 4.13.13:
+    EDB-19761/20223/20570/21026/21027/21390/22185/22434/24076/25694, todas tituladas 'Sambar
+    Server ...', coladas como 'alta' entre los exploits de Samba tras limpiar el ruido de versiones
+    antiguas (ver _downgrade_old_samba_exploits). r'\\bSamba\\b' (límite de palabra) NUNCA casa con
+    'Sambar' (la 'r' que sigue rompe el \\b), así que cualquier exploit de una fila cuyo 'product'
+    SÍ es 'product_word' pero cuyo TÍTULO no lo menciona como palabra suelta es casi con toda
+    seguridad este cruce de nombres — no hace falta conocer la versión real para esto, a
+    diferencia de _downgrade_old_samba_exploits (por eso va aparte, y aplica siempre, no solo
+    cuando se conoce la versión). Muta 'vulns' en su sitio. Puro → testeable sin red."""
+    rx = re.compile(r"\b" + re.escape(product_word) + r"\b", re.I)
+    for v in vulns:
+        if product_word.lower() not in (v.get("product") or "").lower():
+            continue
+        for e in v.get("exploits", []):
+            if e["sev"] == "baja":
+                continue
+            if not rx.search(e["title"]):
+                e["sev"] = "baja"
+                e["title"] += (f"  [el título no menciona '{product_word}' como palabra suelta — "
+                                "probable cruce de nombres con otro producto, verifica antes de asumir que aplica]")
+
+
 def vuln_search(services, host=None, whatweb_by_port=None):
     """Por cada versión detectada (product+version), busca en searchsploit.
     Devuelve None si no está instalado, o una lista (una fila por versión única,
@@ -14810,6 +14835,29 @@ def selftest():
     assert _same_major[0]["exploits"][0]["sev"] == "alta"
     _downgrade_old_samba_exploits(_samba_vulns, None)   # sin versión conocida: no toca nada (ya rebajado arriba, re-chequeo no rompe)
     assert _smb_ex[0]["sev"] == "baja"
+
+    # _downgrade_wrong_product_exploits (operador, mismo run real): buscar 'Samba 4' también casa
+    # con 'Sambar Server' — producto DISTINTO y sin relación (confirmado: EDB-19761/20223/20570/…,
+    # todas tituladas 'Sambar Server ...') — se cuela como 'alta' incluso DESPUÉS de limpiar las
+    # versiones antiguas, porque 'Sambar Server 4.1 Beta' tiene el MISMO major (4) que el real.
+    # No hace falta versión conocida para esto: r'\bSamba\b' nunca casa con 'Sambar' (la 'r' rompe
+    # el límite de palabra).
+    _wp_vulns = [
+        {"product": "Samba smbd", "exploits": [
+            {"title": "Samba 4.5.2 - Symlink Race Permits Opening Files Outside Share Directory", "sev": "alta"},
+            {"title": "Sambar Server 4.1 Beta - Admin Access", "sev": "alta"},
+            {"title": "Sambar Server 5.x - Information Disclosure", "sev": "alta"},
+        ]},
+        {"product": "Apache httpd", "exploits": [
+            {"title": "Apache 2.4.49 - Path Traversal", "sev": "critica"},  # producto NO samba: intacto
+        ]},
+    ]
+    _downgrade_wrong_product_exploits(_wp_vulns, "Samba")
+    _wp_ex = _wp_vulns[0]["exploits"]
+    assert _wp_ex[0]["sev"] == "alta"   # 'Samba' SÍ aparece como palabra suelta: no se toca
+    assert _wp_ex[1]["sev"] == "baja" and "cruce de nombres" in _wp_ex[1]["title"]
+    assert _wp_ex[2]["sev"] == "baja" and "cruce de nombres" in _wp_ex[2]["title"]
+    assert _wp_vulns[1]["exploits"][0]["sev"] == "critica"   # Apache: no es 'samba', intacto
 
     # ── Resultados parciales por timeout presentados como completos (complaint #2) ───────────────
     # #23: la sonda de Zerologon de fp_smb usa _run_capture_retry — una PRIMERA salida vacía (blip
@@ -20685,6 +20733,7 @@ def run_one(ip, name, args, folder=None):
         try:
             vulns = vuln_search(services, host, whatweb_cache)
             _downgrade_old_samba_exploits(vulns, _detect_samba_version(footprints))
+            _downgrade_wrong_product_exploits(vulns, "Samba")
             render_vulns(vulns)
             searchsploit_ok = True
         except Exception as e:

@@ -6,6 +6,21 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`searchsploit`'s substring matching for "Samba" also pulled in "Sambar Server"** — a
+  completely unrelated, discontinued web server (Cogent/Watcher, ~2000-2004), confirmed from a
+  real run against a Debian box with Samba 4.13.13: EDB-19761/20223/20570/21026/21027/21390/
+  22185/22434/24076/25694, all titled "Sambar Server ...", showed up as "alta" right alongside
+  the real Samba exploits — and the version-based downgrade added in 2.2.3 didn't catch them,
+  since "Sambar Server 4.1 Beta" shares the same major version number (4) as the real install.
+  New `_downgrade_wrong_product_exploits()`: an exploit whose title doesn't mention the searched
+  product as a whole word (`\bSamba\b` never matches "Sambar" — the trailing "r" breaks the word
+  boundary) gets downgraded to `baja` with a note. Needs no known version, so it runs
+  unconditionally, not just when `_detect_samba_version()` succeeds.
+
 ## [2.2.3] - 2026-11-25
 
 ### Fixed
