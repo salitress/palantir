@@ -6,6 +6,24 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`ms17-010`/`smbghost`/`webdav` ran against a confirmed Samba target** (operator-reported,
+  live scan against a Debian box: "ha tirado webdav y cosas de windows... sabiendo al 100 por
+  100 que es un debian?"). nmap's own service detection had already confirmed `Samba smbd 4` in
+  Fase 2, before Fase 5 even started, but `fp_smb` never used that signal to decide whether these
+  three checks were worth running — all three are bugs/services exclusive to the real Windows
+  codebase (`srv.sys`/`srv2.sys` for MS17-010/SMBGhost, the WebClient service for `webdav`), none
+  of which Samba shares or implements, so they can never produce a true finding against it. New
+  `_is_samba(ports)` gates the three checks and replaces them with a single `info` finding
+  explaining the skip. Deliberately narrower than the existing `_target_is_windows()` heuristic
+  (used elsewhere for a wordlist-casing decision, where a wrong guess only costs some noise):
+  here a wrong skip would hide a real vulnerability, so it only triggers on an explicit `Samba`
+  product string rather than reasoning from the absence of Windows signals (a real Windows host
+  with SMB1 disabled and an ambiguous banner would show neither).
+
 ## [2.2.1] - 2026-11-25
 
 ### Added

