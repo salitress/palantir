@@ -6,6 +6,31 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The RID-cycling next-step was always suggested, even when it was already redundant**
+  (operator-reported, from real scan output: "porque me da esto si ya lo ha hecho el" —
+  `fp_smb` reported "Usuarios por RPC null-session: ken, takeshi", found via `enumdomusers` in
+  that same null-session `rpcclient` call, and in the same breath suggested manually redoing
+  exactly that via RID cycling). The suggestion only earns its place when `enumdomusers` itself
+  comes back empty (a scenario where that one subcommand is blocked but the rest of the null
+  session still responds, so RID cycling genuinely finds something `enumdomusers` couldn't) —
+  moved it to that branch instead of firing unconditionally whenever usernames were found.
+
+- **Samba exploit-db matches were almost all noise from 20-year-old versions** (same operator
+  upload: 62 "critica" hits against a Debian box, nearly all for Samba 1.x-3.x, 2003-2012).
+  nmap's `-sV` only gives the major version ("Samba smbd" version "4"), but the PRECISE version
+  (`4.13.13-Debian`) was already sitting unused in the IPC$ share comment that `nxc`/`smbclient`
+  print when listing shares during Fase 5 — confirmed in the operator's own `commands.log`. New
+  `_detect_samba_version()` + `_downgrade_old_samba_exploits()`, called right after Fase 5b's
+  `vuln_search()`: once the real version is known, any exploit whose title mentions version
+  numbers *only* from an earlier major gets downgraded to `baja` with a note explaining why —
+  same pattern already used to downgrade pre-Windows-10 CVEs against a confirmed modern host.
+  Deliberately conservative: a title with no recognizable version number, or one from the same
+  or a later major, is left untouched.
+
 ## [2.2.2] - 2026-11-25
 
 ### Fixed

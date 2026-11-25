@@ -3262,7 +3262,15 @@ def fp_smb(ip, ports, services, host, deep, base=None):
                    "grupos y (getdompwinfo) longitud mínima/complejidad de la política de contraseñas")
         users = re.findall(r"user:\[([^\]]+)\]", out)
         if users:
+            # BUG real (operador, run en vivo: "porque me da esto si ya lo ha hecho el"): este
+            # 'if' solo entra cuando 'enumdomusers' YA devolvió la lista completa de usuarios en
+            # la MISMA llamada de rpcclient de arriba — sugerir encima el RID cycling manual
+            # (queryuser/seq) es proponer rehacer a mano, más lento, EXACTAMENTE lo que ya se hizo
+            # solo y ya está en el hallazgo. El RID cycling de verdad aporta algo cuando
+            # 'enumdomusers' NO devuelve nada (p. ej. ese subcomando bloqueado pero el resto de la
+            # sesión nula sí responde) — ver el 'else' de abajo.
             res["findings"].append(("alta", f"Usuarios por RPC null-session: {', '.join(users[:15])}"))
+        else:
             res["next"].append("rpcclient: 'queryuser <RID>' / brute de RIDs con seq+queryuser")
         if not nxc:   # sin nxc, 'getdompwinfo' es la ÚNICA fuente de pass-pol por sesión nula
             pp = _format_pass_pol_finding(_parse_rpcclient_dompwinfo(out))
@@ -11514,6 +11522,61 @@ def _detect_win_build(services, host=None):
     return None
 
 
+# nmap -sV solo da el major de Samba ('Samba smbd' versión '4': confirmado en un run real,
+# operador: "62 exploits en exploit-db... critica" contra un Debian con Samba 4.13.13, casi
+# todos de Samba 1.x/2.x/3.x de hace 20 años) — pero la versión PRECISA ('4.13.13-Debian') ya
+# queda capturada en el comentario del share IPC$ que nxc/smbclient imprimen al listar shares
+# (formato real: 'IPC Service (Samba 4.13.13-Debian)', confirmado en commands.log de un run
+# real) — disponible en los 'steps' del footprint SMB de la Fase 5, que YA corrió para cuando
+# arranca esta búsqueda de Fase 5b (ver el comentario en run_one: footprint_services() va justo
+# antes de vuln_search()). _detect_win_build no sirve de modelo aquí porque esa versión viene de
+# 'services'/'host' (disponibles desde el principio); esta necesita los footprints de Fase 5, así
+# que la rebaja va APARTE (_downgrade_old_samba_exploits), llamada en run_one justo después de
+# vuln_search(), no dentro de vuln_search() mismo.
+_SAMBA_VERSION_RX = re.compile(r"\bSamba\s+(\d+)\.(\d+)\.(\d+)", re.I)
+
+
+def _detect_samba_version(footprints):
+    """(major, minor, patch) de la versión REAL de Samba, sacada del comentario del share IPC$
+    en el footprint SMB de la Fase 5 (ver _SAMBA_VERSION_RX) — None si no hay footprint SMB o su
+    salida no trae la versión (p.ej. el servidor no es Samba, o el comentario del share viene
+    desactivado). Puro → testeable sin red."""
+    for fpr in footprints:
+        if fpr.get("proto") != "smb":
+            continue
+        for step in fpr.get("steps", []):
+            m = _SAMBA_VERSION_RX.search(step.get("output", "") or "")
+            if m:
+                return tuple(int(g) for g in m.groups())
+    return None
+
+
+def _downgrade_old_samba_exploits(vulns, samba_version):
+    """Con la versión PRECISA de Samba ya confirmada (ver _detect_samba_version), cualquier
+    exploit de 'vulns' cuyo título mencione SOLO números de versión de un major ANTERIOR (p.ej.
+    '2.2.8', '3.0.20 < 3.0.25rc3') se rebaja a severidad 'baja' con una nota — mismo patrón que
+    la rebaja de SO antiguo de Windows en vuln_search() (_detect_win_build/_OLD_OS_TITLE_RX),
+    aplicado aparte porque esta versión solo se conoce DESPUÉS del footprint de la Fase 5 (ver el
+    comentario de _SAMBA_VERSION_RX). Conservador a propósito: si el título no trae NINGÚN número
+    de versión reconocible, o trae alguno del mismo major o más reciente, se deja tal cual — jamás
+    se rebaja por asumir, solo cuando TODOS los números de versión del título son de un major
+    estrictamente anterior al real. Muta 'vulns' en su sitio. Puro → testeable sin red."""
+    if not samba_version:
+        return
+    major = samba_version[0]
+    shown = ".".join(str(n) for n in samba_version)
+    for v in vulns:
+        if "samba" not in (v.get("product") or "").lower():
+            continue
+        for e in v.get("exploits", []):
+            if e["sev"] == "baja":
+                continue
+            majors = [int(m) for m in re.findall(r"\b(\d+)\.\d+(?:\.\d+)?\b", e["title"])]
+            if majors and all(m < major for m in majors):
+                e["sev"] = "baja"
+                e["title"] += f"  [versión real confirmada: Samba {shown} — probablemente no aplica]"
+
+
 def vuln_search(services, host=None, whatweb_by_port=None):
     """Por cada versión detectada (product+version), busca en searchsploit.
     Devuelve None si no está instalado, o una lista (una fila por versión única,
@@ -14683,6 +14746,70 @@ def selftest():
     finally:
         globals()["nxc_bin"], globals()["run_capture"] = _real_nxcbin_v, _real_rc_v
     assert any(s == "info" and "Samba detectado" in t for s, t in _sambares["findings"]), _sambares["findings"]
+
+    # BUG real (operador, run en vivo: "porque me da esto si ya lo ha hecho el"): cuando
+    # 'enumdomusers' por sesión nula YA devuelve los usuarios (van al hallazgo), el next-step de
+    # RID cycling manual era redundante — proponía rehacer a mano exactamente lo que ya se acababa
+    # de hacer solo. Solo debe aparecer cuando 'enumdomusers' NO da nada (el cycling manual sí
+    # aporta algo ahí). have()=False para smbclient (aísla el path al rpcclient compuesto).
+    _real_have_rid, _real_rc_rid, _real_nxcbin_rid = have, run_capture, nxc_bin
+    globals()["have"] = lambda name: name == "rpcclient"
+    globals()["nxc_bin"] = lambda: None
+
+    def _fake_rpc_users(cmd, timeout=None, **kw):
+        return 0, "user:[ken] rid:[0x3e8]\nuser:[takeshi] rid:[0x3e9]\n"
+    globals()["run_capture"] = _fake_rpc_users
+    try:
+        _ridres_found = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}], {}, False)
+    finally:
+        globals()["have"], globals()["run_capture"], globals()["nxc_bin"] = _real_have_rid, _real_rc_rid, _real_nxcbin_rid
+    assert any("Usuarios por RPC null-session: ken, takeshi" in t for _s, t in _ridres_found["findings"])
+    assert not any("queryuser <RID>" in n for n in _ridres_found["next"]), _ridres_found["next"]
+
+    globals()["have"] = lambda name: name == "rpcclient"
+    globals()["nxc_bin"] = lambda: None
+    globals()["run_capture"] = lambda cmd, timeout=None, **kw: (0, "srvinfo ok, pero enumdomusers sin usuarios\n")
+    try:
+        _ridres_empty = fp_smb("10.0.0.1", [{"port": 445}], [{"port": 445, "name": "smb", "scripts": {}}], {}, False)
+    finally:
+        globals()["have"], globals()["run_capture"], globals()["nxc_bin"] = _real_have_rid, _real_rc_rid, _real_nxcbin_rid
+    assert not any("Usuarios por RPC null-session" in t for _s, t in _ridres_empty["findings"])
+    assert any("queryuser <RID>" in n for n in _ridres_empty["next"]), _ridres_empty["next"]
+
+    # _detect_samba_version / _downgrade_old_samba_exploits (operador, mismo run: 62 exploits de
+    # exploit-db "critica" contra un Debian con Samba 4.13.13 real, casi todos de Samba 1.x/2.x/3.x
+    # de hace 20 años — nmap -sV solo da el major ('Samba smbd' versión '4'), pero la versión
+    # PRECISA ya queda en el comentario del share IPC$ que nxc/smbclient imprimen al listar shares
+    # — formato real confirmado en un commands.log real: 'IPC Service (Samba 4.13.13-Debian)').
+    _samba_fp = [{"proto": "smb", "steps": [
+        {"cmd": "nxc smb ... --shares", "ok": True,
+         "output": "SMB  10.0.0.1  445  X  IPC$   IPC Service (Samba 4.13.13-Debian)", "note": ""}]}]
+    assert _detect_samba_version(_samba_fp) == (4, 13, 13)
+    assert _detect_samba_version([{"proto": "smb", "steps": [{"cmd": "x", "ok": True, "output": "", "note": ""}]}]) is None
+    assert _detect_samba_version([]) is None   # sin footprint SMB: no revienta
+
+    _samba_vulns = [
+        {"product": "Samba smbd", "exploits": [
+            {"title": "Samba 2.2.8 - Brute Force Method Remote Command Execution", "sev": "critica"},
+            {"title": "Samba 3.0.20 < 3.0.25rc3 - 'Username' map script' Command Execution", "sev": "critica"},
+            {"title": "Samba - generic RCE sin versión en el título", "sev": "alta"},  # sin versión: NUNCA se rebaja
+        ]},
+        {"product": "Apache httpd", "exploits": [
+            {"title": "Apache 2.4.49 - Path Traversal", "sev": "critica"},  # producto NO samba: intacto
+        ]},
+    ]
+    _downgrade_old_samba_exploits(_samba_vulns, (4, 13, 13))
+    _smb_ex = _samba_vulns[0]["exploits"]
+    assert _smb_ex[0]["sev"] == "baja" and "Samba 4.13.13" in _smb_ex[0]["title"]
+    assert _smb_ex[1]["sev"] == "baja" and "probablemente no aplica" in _smb_ex[1]["title"]
+    assert _smb_ex[2]["sev"] == "alta"   # sin versión reconocible: conservador, se deja tal cual
+    assert _samba_vulns[1]["exploits"][0]["sev"] == "critica"   # Apache: no es 'samba', intacto
+    # Mismo major (o posterior) que el real: NUNCA se rebaja, aunque haya versión en el título.
+    _same_major = [{"product": "Samba smbd", "exploits": [{"title": "Samba 4.5.0 - algo", "sev": "alta"}]}]
+    _downgrade_old_samba_exploits(_same_major, (4, 13, 13))
+    assert _same_major[0]["exploits"][0]["sev"] == "alta"
+    _downgrade_old_samba_exploits(_samba_vulns, None)   # sin versión conocida: no toca nada (ya rebajado arriba, re-chequeo no rompe)
+    assert _smb_ex[0]["sev"] == "baja"
 
     # ── Resultados parciales por timeout presentados como completos (complaint #2) ───────────────
     # #23: la sonda de Zerologon de fp_smb usa _run_capture_retry — una PRIMERA salida vacía (blip
@@ -20557,6 +20684,7 @@ def run_one(ip, name, args, folder=None):
     elif not args.no_searchsploit:
         try:
             vulns = vuln_search(services, host, whatweb_cache)
+            _downgrade_old_samba_exploits(vulns, _detect_samba_version(footprints))
             render_vulns(vulns)
             searchsploit_ok = True
         except Exception as e:
