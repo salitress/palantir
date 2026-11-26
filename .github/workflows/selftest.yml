@@ -1,18 +1,59 @@
-name: selftest
+name: CI
+
+# El fichero sigue llamándose selftest.yml para no romper la insignia del README
+# (apunta a .../workflows/selftest.yml/badge.svg), pero ahora corre todo el CI:
+# lint (ruff) + type-check (mypy) + selftest en varias versiones de Python + build.
 
 on:
   push:
   pull_request:
 
 jobs:
-  selftest:
+  lint:
+    name: Lint (ruff) + type-check (mypy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Instalar linters (versiones fijadas para CI reproducible)
+        run: python -m pip install "ruff==0.17.6" "mypy==2.4.1"
+      - name: Ruff (lint de alta señal — config en pyproject.toml)
+        run: ruff check palantir.py
+      - name: Mypy (type-check, segunda red — config en pyproject.toml)
+        run: mypy palantir.py
+
+  test:
+    name: Selftest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Sintaxis
-        run: python3 -m py_compile palantir.py
+        run: python -m py_compile palantir.py
       - name: Selftest (parsers, informes, utilidades — sin red)
-        run: python3 palantir.py --selftest
+        run: python palantir.py --selftest
+
+  build:
+    name: Build + install (empaquetado)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Construir sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Instalar la wheel y comprobar el comando y la versión
+        run: |
+          python -m pip install dist/*.whl
+          palantir --version

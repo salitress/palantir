@@ -1,0 +1,87 @@
+# Empaquetado de palantir.
+#
+# palantir es un único módulo (palantir.py), así que el proyecto usa el layout
+# "single-module" de setuptools (py-modules). Esto permite:
+#     pip install .                      # desde un clon
+#     pipx install git+https://github.com/salitress/palantir
+# y deja un ejecutable `palantir` en el PATH (console_scripts → palantir:_cli),
+# equivalente a `python3 palantir.py`.
+#
+# La versión NO se duplica aquí: se lee de palantir.__version__ (fuente única,
+# en sincronía con CHANGELOG.md y el tag de git).
+#
+# Nota: si algún día se publica en PyPI y el nombre "palantir" estuviera cogido,
+# basta cambiar `name` abajo; el módulo y el comando siguen llamándose palantir.
+
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "palantir"
+dynamic = ["version"]
+description = "Reconocimiento guiado por Nmap: descubrir → enumerar → footprinting por protocolo → fuzz web/vhost → informe HTML. Solo-lectura, para labs HTB/CPTS autorizados."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Adrián Salas Pérez" }]
+keywords = [
+    "pentesting", "recon", "nmap", "enumeration", "footprinting",
+    "ctf", "htb", "oscp", "cpts", "security",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Security",
+]
+# El núcleo es solo stdlib; las herramientas externas (nmap, ffuf, nxc…) son
+# opcionales y el script se salta solo las que falten. Sin dependencias pip.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/salitress/palantir"
+Repository = "https://github.com/salitress/palantir"
+Changelog = "https://github.com/salitress/palantir/blob/main/CHANGELOG.md"
+Issues = "https://github.com/salitress/palantir/issues"
+
+[project.scripts]
+palantir = "palantir:_cli"
+
+[tool.setuptools]
+py-modules = ["palantir"]
+
+[tool.setuptools.dynamic]
+version = { attr = "palantir.__version__" }
+
+# ───────────────────────────── Lint (ruff) ─────────────────────────────
+# Conjunto curado y de alta señal: caza errores reales (pyflakes F, bugbear B,
+# sintaxis E9) y ordena imports (I), SIN pelearse con el estilo deliberado del
+# proyecto. palantir usa a propósito líneas largas (comentarios en español) y
+# sentencias compactas (`def why(m): print(...)`, `selftest(); return 0`), así
+# que E501 y E701/E702/E741 quedan fuera. La idea no es reformatear 22k líneas
+# ya verificadas a mano, sino cazar regresiones en PRs futuros.
+[tool.ruff]
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "W", "I"]
+ignore = [
+    "E701",  # `def why(m): print(...)` — una sentencia por línea tras ':' es estilo deliberado
+    "E702",  # `selftest(); return 0`   — sentencias con ';' es estilo deliberado
+    "E741",  # nombres de 1 letra (l/I/O) en comprehensions teras — intencional
+]
+
+# ───────────────────────── Type-check (mypy) ─────────────────────────
+# El código no está anotado; mypy NO exige type hints — actúa como segunda red
+# que caza errores reales inferibles (variables mal reusadas, retornos imposibles).
+[tool.mypy]
+# Sin python_version fijo: mypy reciente exige target >=3.10 y la CI corre en una
+# versión moderna; el código sigue siendo compatible con 3.8 (lo garantiza ruff
+# con target-version=py38). mypy no exige anotaciones; solo caza errores reales.
+ignore_missing_imports = true
+warn_unused_ignores = true

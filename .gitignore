@@ -5,6 +5,12 @@ __pycache__/
 .venv/
 venv/
 
+# Artefactos de empaquetado (python -m build / pip install .)
+build/
+dist/
+*.whl
+*.tar.gz
+
 # Resultados de palantir (por si se ejecuta dentro del repo)
 htb/
 */report.html

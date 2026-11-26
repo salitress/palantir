@@ -6,7 +6,28 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
-## [2.4.0] - 2026-11-25
+## [Unreleased]
+
+### Added
+
+- **`--version` / `-V` flag and a single-source `__version__`.** The binary can now report its
+  own version (`palantir --version` → `palantir 2.4.0`). The same `__version__` is reused by the
+  banner footer and the HTML report footer, so what you run, what you see on screen and what the
+  report says always agree. Source of truth kept in sync with this changelog and the git tag.
+- **Packaging (`pyproject.toml`).** palantir is now pip/pipx-installable from a clone
+  (`pip install .`, `pipx install git+https://github.com/salitress/palantir`), leaving a
+  `palantir` command on the PATH (console-script → `palantir:_cli`, same Ctrl-C handling as
+  `python3 palantir.py`). Single-module layout, no runtime pip dependencies (core is stdlib-only;
+  external tools stay optional), version read dynamically from `palantir.__version__`.
+
+### Changed
+
+- **CI now runs lint + type-check + a Python matrix + a packaging build** (was syntax +
+  `--selftest` only). Adds `ruff` (curated, high-signal rules — real bugs and import order,
+  while respecting the project's deliberate long lines and compact style) and `mypy` (no
+  annotations required; a second net for inferable errors), runs the selftest across Python
+  3.8–3.13, and builds + installs the wheel to verify the packaging. Lint/type-check config
+  lives in `pyproject.toml`.
 
 ### Added
 

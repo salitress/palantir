@@ -157,6 +157,10 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 
+# Versión de la herramienta. Fuente única: la usan --version, el banner y el pie
+# del informe HTML. Mantener en sincronía con CHANGELOG.md y el tag de git.
+__version__ = "2.4.0"
+
 # ───────────────────────── Colores ─────────────────────────
 if sys.stdout.isatty() and os.name == "posix" and not os.environ.get("NO_COLOR"):
     C_RESET, C_BOLD = "\033[0m", "\033[1m"
@@ -548,6 +552,8 @@ def _build_banner():
 
 
 BANNER = _build_banner()
+# Pie del banner: versión + lema, en gris tenue (en no-tty C_GREY='' → texto plano).
+BANNER += f"{C_GREY}  v{__version__} · recon guiado por Nmap · solo objetivos autorizados{C_RESET}\n"
 
 # ───────────────────────── Scripts NSE ─────────────────────────
 # Nombres verificados contra /usr/share/nmap/scripts. Nmap ejecuta cada script
@@ -2296,7 +2302,7 @@ def fp_ftp(ip, ports, services, host, deep):
     for p in ports:
         port = p["port"]
         last_err = None
-        for attempt in (1, 2):                    # el saludo 220 a veces tarda → un reintento
+        for _attempt in (1, 2):                   # el saludo 220 a veces tarda → un reintento
             try:
                 f = ftplib.FTP()
                 f.connect(ip, port, timeout=12)
@@ -3598,7 +3604,7 @@ def fp_smb(ip, ports, services, host, deep, base=None):
             others = [a for a in ioxid_ips if a != ip]
             if others:
                 res["findings"].append(("info",
-                    f"SMB: ioxidresolver — interface(s) adicional(es) del host (multi-homed): "
+                    "SMB: ioxidresolver — interface(s) adicional(es) del host (multi-homed): "
                     + ", ".join(others[:5]) + (" …" if len(others) > 5 else "")
                     + " — superficie para pivoting lateral si alguna es alcanzable"))
         res["steps"][-1]["ok"] = _ahit
@@ -5157,9 +5163,9 @@ def _http_get(url, timeout=8, method="GET", host=None, follow=True, max_bytes=65
     `host`: fuerza la cabecera Host (para comprobar vhosts por IP sin tocar /etc/hosts).
     `follow`: si False, NO sigue redirects → devuelve el 30x con su cabecera Location
     (urllib los sigue por defecto; sin esto no se puede ver que un 80 solo reenvía a su 443)."""
-    import urllib.request
-    import urllib.error
     import ssl
+    import urllib.error
+    import urllib.request
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -5693,7 +5699,7 @@ def fp_couchdb(ip, ports, services, host, deep):
         res["next"] += [
             f"curl -s {scheme}://{ip}:{port}/_all_dbs   # listar bases",
             f"curl -s '{scheme}://{ip}:{port}/_users/_all_docs?include_docs=true'   # usuarios/hashes",
-            f"# CVE-2017-12636: RCE vía _config si tienes admin (o CVE-2017-12635 para ganarlo)",
+            "# CVE-2017-12636: RCE vía _config si tienes admin (o CVE-2017-12635 para ganarlo)",
         ]
     return res
 
@@ -5729,7 +5735,7 @@ def fp_ajp(ip, ports, services, host, deep):
     port = ports[0]["port"]
     res = fp_generic("ajp", "AJP (Tomcat)", ip, ports, services, host, ("ajp",), [
         f"nmap -p{port} --script ajp-headers,ajp-methods {ip}",
-        f"# Ghostcat (CVE-2020-1938) — leer el webroot (Tomcat < 9.0.31/8.5.51/7.0.100):",
+        "# Ghostcat (CVE-2020-1938) — leer el webroot (Tomcat < 9.0.31/8.5.51/7.0.100):",
         f"msfconsole -q -x 'use auxiliary/admin/http/tomcat_ghostcat; set RHOSTS {ip}; set RPORT {port}; run; exit'",
     ])
     res["findings"].append(("media", f"AJP expuesto ({port}) — revisar Ghostcat (CVE-2020-1938)"))
@@ -5742,7 +5748,7 @@ def fp_rmi(ip, ports, services, host, deep):
     res = fp_generic("rmi", "Java RMI", ip, ports, services, host, ("rmi",), [
         f"nmap -p{port} --script rmi-dumpregistry,rmi-vuln-classloader {ip}",
         f"java -jar BaRMIe.jar -enum {ip} {port}   # enumerar objetos RMI expuestos",
-        f"# Deserialización: ysoserial + el gadget adecuado si hay endpoint vulnerable",
+        "# Deserialización: ysoserial + el gadget adecuado si hay endpoint vulnerable",
     ])
     res["findings"].append(("media", f"Java RMI expuesto ({port}) — objetos remotos / deserialización Java"))
     return res
@@ -6473,7 +6479,7 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
                     f"sudo nmap -sU --script ipmi-version -p623 {ip}",
                     "msf > use auxiliary/scanner/ipmi/ipmi_dumphashes   # volcar hashes (RAKP)",
                 ])
-                for lbl, txt in _nse_for(services, host, ("ipmi",)):
+                for _lbl, txt in _nse_for(services, host, ("ipmi",)):
                     if "cipher" in txt.lower() and "zero" in txt.lower():
                         r["findings"].append(("alta", "IPMI: cipher 0 (login sin contraseña)"))
                 out.append(r)
@@ -6677,9 +6683,9 @@ def _is_tomcat(p):
 def _http_get_auth(url, u, p, timeout=8):
     """GET con cabecera Basic auth. Devuelve (status, primeros 4 KiB del cuerpo).
     (status, '') ante error de red/URL. Ignora el certificado TLS (labs)."""
-    import urllib.request
-    import urllib.error
     import ssl
+    import urllib.error
+    import urllib.request
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -8822,7 +8828,7 @@ def _dump_sam_lsa(res, nxc, ip, u, p, port=None, dp=None, local_auth=False, is_h
                 bare = re.split(r"[\\/]", user)[-1]   # 'INLANEFREIGHT\\tpetty' → 'tpetty'
                 _pool_add(pool, bare, secret, False)
         # MSCache v2 / DCC2: crackeable offline, NO al pool (no es PtH ni contraseña).
-        for user, dcc in lsa["mscache"]:
+        for user, _dcc in lsa["mscache"]:
             res["findings"].append(("alta",
                 f"LSA/MSCache: hash DCC2 de «{user}» — crackeable offline con hashcat -m 2100 (no sirve para pass-the-hash)"))
         if lsa["mscache"]:
@@ -9995,7 +10001,7 @@ def _creds_enum(res, nxc, np, ip, u, secret, is_hash, local_auth, is_dc, port, d
                                    "capturable ahí")
                         if _add_once(res, "critica", _ud_txt, "unconstrained-deleg", seen):
                             res["next"].append(
-                                f"Rubeus.exe monitor /interval:5 /nowrap   # en el equipo con delegación sin "
+                                "Rubeus.exe monitor /interval:5 /nowrap   # en el equipo con delegación sin "
                                 "restricciones, mientras coaccionas (coercer/coerce_plus, ver Spooler arriba) "
                                 "a un DC para que se autentique contra él — captura su TGT y haz DCSync con él")
                 # PSO/FGPP (Fine-Grained Password Policy): política de contraseñas POR GRUPO/USUARIO,
@@ -12941,7 +12947,7 @@ def build_html(ip, services, host, footprints, vulns, domains, web_hits, vhosts,
   {vuln_html}
   {web_html}
   {host_html}
-  <footer>palantir.py · recon guiado por Nmap · uso solo en objetivos autorizados (labs HTB/CPTS)</footer>
+  <footer>palantir.py v{__version__} · recon guiado por Nmap · uso solo en objetivos autorizados (labs HTB/CPTS)</footer>
 </div>
 <script>{HTML_JS}</script>
 </body></html>"""
@@ -13298,7 +13304,7 @@ def write_index(outdir):
   <div class="cards">{cards_html}</div>
   <details open><summary>Objetivos <span class="pill">{len(rows)}</span></summary>
     <div class="body">{tbl}</div></details>
-  <footer>palantir.py · recon guiado por Nmap · uso solo en objetivos autorizados (labs HTB/CPTS)</footer>
+  <footer>palantir.py v{__version__} · recon guiado por Nmap · uso solo en objetivos autorizados (labs HTB/CPTS)</footer>
 </div>
 </body></html>"""
     idx_path = Path(outdir) / "index.html"
@@ -17274,7 +17280,8 @@ def selftest():
     # reportado en vivo: contra un AD de >2000 usuarios, 15 minutos sin NINGUNA señal en pantalla
     # durante --users/--rid-brute, sin forma de distinguir "sigue avanzando" de "se colgó" (y
     # ad_users.txt tampoco ayuda: se escribe UNA VEZ al terminar, no según va progresando).
-    import io as _io_rcp, contextlib as _cl_rcp
+    import contextlib as _cl_rcp
+    import io as _io_rcp
     _buf_rcp = _io_rcp.StringIO()
     with _cl_rcp.redirect_stdout(_buf_rcp):
         _run_capture_progressive(
@@ -17341,7 +17348,8 @@ def selftest():
         confirm_creds_spray(_small)
         assert _small.user_list == _ul2                                   # no lo tocó
         _big = _pc(user_list=_ul2, pass_list=_pl2)                        # 10×10 = 100, sobre el umbral
-        import io as _io_csp, contextlib as _cl_csp
+        import contextlib as _cl_csp
+        import io as _io_csp
         _csp_out = _io_csp.StringIO()
         with _cl_csp.redirect_stdout(_csp_out):
             confirm_creds_spray(_big)                                     # no debe bloquear ni petar
@@ -17416,7 +17424,7 @@ def selftest():
     assert _reconcile_domain("a.htb", "a.htb") == "a.htb"   # ambos, iguales → ok
     assert _reconcile_domain(None, None) is None            # ninguno
     try:
-        _reconcile_domain("a.htb", "b.htb"); assert False, "debería petar con dominios distintos"
+        _reconcile_domain("a.htb", "b.htb"); raise AssertionError("debería petar con dominios distintos")
     except ValueError:
         pass
     # SMTP user enum: parsea 'IP: user@dom exists' → parte local, dedup
@@ -17444,7 +17452,7 @@ def selftest():
     _real_have_d19, _real_rc_d19 = globals()["have"], run_capture
     def _fake_dns19(cmd, timeout=None, **kw):
         s = " ".join(cmd)
-        if "NS" in cmd and f"@1.2.3.4" in s:
+        if "NS" in cmd and "@1.2.3.4" in s:
             return 0, "ns1.corp.local.\n"
         if "NS" in cmd:   # resolutor del sistema: vacío
             return 0, ""
@@ -18617,7 +18625,8 @@ def selftest():
     assert _idx_chown_calls and _idx_chown_calls[0] == str(_idx_dir / "index.html")
     # Si falla con PermissionError (justo el síntoma real), el aviso da el comando exacto para
     # arreglarlo — no el genérico de cualquier otro OSError.
-    import io as _io_idx, contextlib as _cl_idx
+    import contextlib as _cl_idx
+    import io as _io_idx
     _real_wt = Path.write_text
     Path.write_text = lambda self, *a, **kw: (_ for _ in ()).throw(PermissionError(13, "Permission denied"))
     _idx_buf = _io_idx.StringIO()
@@ -18674,7 +18683,8 @@ def selftest():
     _rb_svcs = [{"port": 22, "proto": "tcp", "banner": ""},
                 {"port": 80, "proto": "tcp", "banner": ""},
                 {"port": 445, "proto": "tcp", "banner": "YA-TENGO"}]   # no estaba antes: no se toca
-    import contextlib as _ctx_rb, io as _io_rb
+    import contextlib as _ctx_rb
+    import io as _io_rb
     with _ctx_rb.redirect_stdout(_io_rb.StringIO()):
         reuse_banners_from_prev(_rb_svcs, _rb_prev)
     assert _rb_svcs[0]["banner"] == "SSH-2.0-OpenSSH_8.9"   # reutilizado del run anterior
@@ -18689,7 +18699,8 @@ def selftest():
 
     # write_reports: si RENDERIZAR un informe peta (bug tipo TypeError/KeyError), no debe abortar el
     # resto — sobre todo findings.json. Regresión del crash de _all_findings con findings-lista en --resume.
-    import contextlib as _ctx, io as _io
+    import contextlib as _ctx
+    import io as _io
     _wr_dir = Path(tempfile.mkdtemp())
     _wr_svc = [{"port": 80, "proto": "tcp", "name": "http", "product": "Apache", "version": "2.4",
                 "extrainfo": "", "banner": "", "scripts": {}}]
@@ -18923,7 +18934,8 @@ def selftest():
     assert _fmt_elapsed(3725) == "1h 2m 5s"
 
     # print_run_summary: no revienta y trae lo esencial (tiempo, puertos, severidad, 'empieza por')
-    import io as _io_sum, contextlib as _ctx_sum
+    import contextlib as _ctx_sum
+    import io as _io_sum
     _svc6000 = fake(port=6000, name="x11"); _svc6000["proto"] = "tcp"; _svc6000["state"] = "open"
     _fpx = _fp("x11", "X11", [6000])
     _fpx["findings"].append(("alta", "X11 en :6000 SIN control de acceso (display :0)"))
@@ -19216,7 +19228,8 @@ def selftest():
 
     # Cajas: ninguna fila debe descuadrar (ancho visible constante), ni siquiera
     # con una línea larguísima (se trunca) o en cada estilo.
-    import io as _io, contextlib as _cl
+    import contextlib as _cl
+    import io as _io
     for _st in ("simple", "double", "grad"):
         _buf = _io.StringIO()
         with _cl.redirect_stdout(_buf):
@@ -19322,6 +19335,10 @@ def selftest():
     # del wordmark es degradado con truecolor y cae a cian plano sin él.
     _bare = _ANSI_RE.sub("", BANNER)
     assert "=" in _bare and "█" in _bare, "el banner debe traer el orbe y el wordmark 3D"
+    # Versión: semver simple (X.Y.Z) y presente en el pie del banner y, por tanto, disponible
+    # para --version y el informe HTML. Fuente única __version__.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", __version__), f"__version__ no es semver: {__version__!r}"
+    assert f"v{__version__}" in _bare, "el pie del banner debe mostrar la versión"
     _rt = _TRUECOLOR
     try:
         globals()["_TRUECOLOR"] = True
@@ -19349,7 +19366,9 @@ def selftest():
     # ── Descarga automática de recursos sin apt (jsmith.txt, kerbrute, certipy…) ──
     # _download_file: éxito (escribe el contenido, crea el directorio padre) y fallo (red
     # caída / lo que sea) sin lanzar nunca — se mockea urllib.request.urlopen, no la red real.
-    import urllib.request as _ur, io as _urio, tempfile as _tf
+    import io as _urio
+    import tempfile as _tf
+    import urllib.request as _ur
     _real_urlopen = _ur.urlopen
 
     class _FakeResp(_urio.BytesIO):
@@ -19860,7 +19879,8 @@ def selftest():
     assert "» ARGS:smb 1.2.3.4 --verbose" in _logged   # la salida cruda de nxc SÍ queda en commands.log
 
     # quiet=True + VERBOSE=False (modo normal): nada a pantalla.
-    import io as _io_v, contextlib as _cl_v
+    import contextlib as _cl_v
+    import io as _io_v
     _buf_v = _io_v.StringIO()
     _log_path2 = _vdir / "commands2.log"
     _set_commands_log(str(_log_path2))
@@ -19949,7 +19969,8 @@ def _github_release_asset(repo, name_re, timeout=20):
     None en cualquier fallo (red, repo sin releases, ningún asset que case) — NUNCA
     lanza. Es una consulta de SOLO LECTURA a la API pública de GitHub (no escribe nada,
     no necesita token)."""
-    import urllib.request, json
+    import json
+    import urllib.request
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{repo}/releases/latest",
@@ -20101,7 +20122,8 @@ def _install_brutespray():
     url = _github_release_asset("x90skysn3k/brutespray", r"_linux_amd64\.tar\.gz$")
     if not url:
         return False, "no se pudo resolver la URL del binario en la última release de GitHub"
-    import tempfile, tarfile
+    import tarfile
+    import tempfile
     with tempfile.TemporaryDirectory() as td:
         tgz = Path(td) / "brutespray.tar.gz"
         ok, errmsg = _download_file(url, tgz)
@@ -20137,7 +20159,8 @@ def _install_crtsh():
     url = _github_release_asset("az7rb/crt.sh", r"linux_amd64\.tar\.gz$")
     if not url:
         return False, "no se pudo resolver la URL del binario en la última release de GitHub"
-    import tempfile, tarfile
+    import tarfile
+    import tempfile
     with tempfile.TemporaryDirectory() as td:
         tgz = Path(td) / "crt.sh.tar.gz"
         ok, errmsg = _download_file(url, tgz)
@@ -21494,9 +21517,9 @@ def run_one(ip, name, args, folder=None):
                       "cada vhost puede servir un árbol de directorios distinto; la Fase 6 solo vio el vhost por defecto del servidor")
                 for fqdn in vh_fqdns:
                     for p in webs_fuzz:
-                        e = ext if ext is not None else guess_extensions(p, whatweb_cache.get(p["port"], ""))
+                        exts = ext if ext is not None else guess_extensions(p, whatweb_cache.get(p["port"], ""))
                         tag = f"{web_scheme(p)}://{fqdn}:{p['port']} (Host:)"
-                        hits = fuzz_dirs(ip, p, wls, e, webdir, stealth=args.stealth,
+                        hits = fuzz_dirs(ip, p, wls, exts, webdir, stealth=args.stealth,
                                          proxy=args.proxy, host_header=fqdn)
                         if hits:
                             web_hits[f"{fqdn}:{p['port']}"] = hits
@@ -21587,6 +21610,9 @@ def _load_rc_args(path=None):
 
 def main():
     ap = argparse.ArgumentParser(description="palantir — recon guiado por Nmap (Kali).")
+    ap.add_argument("-V", "--version", action="version",
+                    version=f"palantir {__version__}",
+                    help="Muestra la versión y sale.")
     g_objetivo = ap.add_argument_group("Objetivo y salida")
     g_fuzzing = ap.add_argument_group("Wordlists y fuzzing web")
     g_dominio = ap.add_argument_group("Dominio / AD / DNS")
@@ -22076,8 +22102,15 @@ def main():
     return rc
 
 
-if __name__ == "__main__":
+def _cli():
+    """Punto de entrada único: lo usan tanto `python3 palantir.py` como el ejecutable
+    'palantir' que instala pip (console_scripts → palantir:_cli). Traduce Ctrl-C a 130."""
     try:
-        sys.exit(main())
+        return main()
     except KeyboardInterrupt:
-        err("interrumpido por el usuario."); sys.exit(130)
+        err("interrumpido por el usuario.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(_cli())
