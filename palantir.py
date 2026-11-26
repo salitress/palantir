@@ -159,7 +159,7 @@ from pathlib import Path
 
 # Versión de la herramienta. Fuente única: la usan --version, el banner y el pie
 # del informe HTML. Mantener en sincronía con CHANGELOG.md y el tag de git.
-__version__ = "2.4.0"
+__version__ = "2.5.1"
 
 # ───────────────────────── Colores ─────────────────────────
 if sys.stdout.isatty() and os.name == "posix" and not os.environ.get("NO_COLOR"):

@@ -26,11 +26,25 @@ jobs:
 
   test:
     name: Selftest (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        # 3.8/3.9 están EOL y setup-python ya no trae binarios para ellas en el runner
+        # ubuntu-latest actual (Ubuntu 26.04) — se fijan a ubuntu-22.04, que sí los tiene.
+        include:
+          - python-version: "3.8"
+            os: ubuntu-22.04
+          - python-version: "3.9"
+            os: ubuntu-22.04
+          - python-version: "3.10"
+            os: ubuntu-latest
+          - python-version: "3.11"
+            os: ubuntu-latest
+          - python-version: "3.12"
+            os: ubuntu-latest
+          - python-version: "3.13"
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

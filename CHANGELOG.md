@@ -6,14 +6,26 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.5.1] - 2026-11-26
+
+### Fixed
+
+- **CI's Python 3.8/3.9 selftest jobs failed outright on `setup-python@v5` ("version not found
+  for Ubuntu 26.04")** — not a code bug: `ubuntu-latest` now resolves to Ubuntu 26.04, and
+  `setup-python` no longer ships prebuilt binaries for 3.8/3.9 (both EOL upstream) on that image.
+  Those two matrix entries now pin `runs-on: ubuntu-22.04` (which still has them); 3.10–3.13
+  keep `ubuntu-latest`. `requires-python = ">=3.8"` stays accurate — the code itself needs
+  nothing newer, confirmed by reading every use of `|=`/walrus in it.
+
+## [2.5.0] - 2026-11-26
 
 ### Added
 
 - **`--version` / `-V` flag and a single-source `__version__`.** The binary can now report its
-  own version (`palantir --version` → `palantir 2.4.0`). The same `__version__` is reused by the
-  banner footer and the HTML report footer, so what you run, what you see on screen and what the
-  report says always agree. Source of truth kept in sync with this changelog and the git tag.
+  own version (`palantir --version` prints the running version). The same `__version__` is
+  reused by the banner footer and the HTML report footer, so what you run, what you see on
+  screen and what the report says always agree. Source of truth kept in sync with this
+  changelog and the git tag.
 - **Packaging (`pyproject.toml`).** palantir is now pip/pipx-installable from a clone
   (`pip install .`, `pipx install git+https://github.com/salitress/palantir`), leaving a
   `palantir` command on the PATH (console-script → `palantir:_cli`, same Ctrl-C handling as
@@ -28,6 +40,8 @@ this project follows [Semantic Versioning](https://semver.org/).
   annotations required; a second net for inferable errors), runs the selftest across Python
   3.8–3.13, and builds + installs the wheel to verify the packaging. Lint/type-check config
   lives in `pyproject.toml`.
+
+## [2.4.0] - 2026-11-25
 
 ### Added
 
