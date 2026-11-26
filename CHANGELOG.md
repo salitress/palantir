@@ -6,6 +6,29 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] - 2026-11-26
+
+### Added
+
+- **Active subdomain fuzzing by real DNS resolution** (`fuzz_subdomains`/`fp_subdomains_active`,
+  Fase 5) — complements the existing vhost fuzzing (Fase 7, Host-header based) with a
+  genuinely different confirmation method: whether `<candidate>.<domain>` actually resolves in
+  DNS, not just whether the same web server answers any Host header the same way. Finds
+  subdomains that aren't even web servers (mail/vpn/ns/dc2…), and its results feed straight
+  into Fase 7's existing "confirmed-first" vhost wordlist, same as crt.sh subdomains already
+  did. Queries the system resolver when it knows the domain, falling back to the scanned
+  target directly otherwise (same criterion `fp_dns_nameservers` already used) — filters DNS
+  wildcard catch-alls the same way `fuzz_vhost` filters an HTTP catch-all. Shares
+  `--vhost-wordlist` with the vhost fuzzing and is skipped by the same `--no-vhost-fuzz` (both
+  are "fuzz a dictionary of domain names" — a bug-bounty scope with a tasated hostname list
+  wants to skip both together).
+
+### Fixed
+
+- **`--no-fuzz`'s help text said "Salta las Fases 5 y 6"**, but the code it gates (a single
+  `if not args.no_fuzz` block) wraps Fase 6 (directory fuzzing) *and* Fase 7 (vhost fuzzing) —
+  Fase 5 (credentials) was never part of it. Now correctly says "Fases 6 y 7".
+
 ## [2.5.1] - 2026-11-26
 
 ### Fixed

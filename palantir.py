@@ -72,9 +72,10 @@ Fases (cada una alimenta a la siguiente; el número es el orden real en pantalla
      el espejo (el que solo redirige al otro) se detecta ANTES de footprintear (5)
      y se salta tanto ahí como aquí — nunca se repite el mismo sitio 2-4 veces.
   7. Vhost/subdominio fuzzing (Host: FUZZ.dominio). El dominio se descubre solo
-     de los certificados/redirecciones/SMB, o se pasa con --vhost. Si la Fase 5
-     sacó subdominios de crt.sh para ese dominio, se confirman primero (wordlist
-     mínima, ya sabida por certificado) antes del diccionario grande.
+     de los certificados/redirecciones/SMB, o se pasa con --vhost. La Fase 5 ya
+     intentó confirmar subdominios por DNS REAL (fp_subdomains_active, misma
+     wordlist) y por crt.sh — ambos se prueban primero aquí (wordlist mínima,
+     ya confirmada) antes del diccionario grande.
   8. Informe: tabla ANSI en pantalla + <ip>/report.html (desplegables, tema
      ámbar, hallazgos por severidad, índice de salto a cada sección y botón de
      copiar en cada comando) + <ip>/report.md + <ip>/findings.json (máquina-legible).
@@ -159,7 +160,7 @@ from pathlib import Path
 
 # Versión de la herramienta. Fuente única: la usan --version, el banner y el pie
 # del informe HTML. Mantener en sincronía con CHANGELOG.md y el tag de git.
-__version__ = "2.5.1"
+__version__ = "2.6.0"
 
 # ───────────────────────── Colores ─────────────────────────
 if sys.stdout.isatty() and os.name == "posix" and not os.environ.get("NO_COLOR"):
@@ -1756,6 +1757,60 @@ def fuzz_vhost(ip, p, domain, wordlist, webdir, stealth=False, proxy=None):
         control = _vhost_sig(ip, p, os.urandom(6).hex() + "." + domain)
         out = _drop_catchall(out, control, lambda h: _vhost_sig(ip, p, h["host"]))
     return out
+
+
+_IPV4_RX = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def _dig_a_ips(out):
+    """IPs de una salida `dig +short a <nombre>`: una línea por registro A; una resolución vía
+    CNAME añade la(s) línea(s) del CNAME intermedio (terminan en '.', nunca son una IP) antes
+    de la IP final — se descartan, junto con las vacías. Puro → testable sin red."""
+    return [l.strip() for l in (out or "").splitlines() if _IPV4_RX.match(l.strip())]
+
+
+def fuzz_subdomains(domain, wordlist, server=None, max_workers=20):
+    """Fuzzing REAL de subdominios por DNS — a diferencia de fuzz_vhost (que prueba si el
+    MISMO IP responde a un Host: concreto, sin que el nombre tenga que existir en DNS), aquí
+    se comprueba si <candidato>.<domain> RESUELVE de verdad. Encuentra subdominios que ni
+    siquiera sirven el mismo (o ningún) servidor web — mail/vpn/ns/dc2… — y, al revés, evita
+    colar un "vhost" que solo existe porque el servidor responde igual a cualquier Host (eso
+    ya lo filtra fuzz_vhost por su cuenta; esto es un origen de confirmación DISTINTO).
+    `server`: IP de un DNS al que preguntar directamente (`dig @server`) — para un dominio
+    interno/solo-lab que el resolutor del sistema no conoce (mismo criterio que
+    fp_dns_nameservers: ahí se decide SI hace falta); None pregunta al resolutor del sistema.
+    Antes de barrer la wordlist entera, resuelve un nombre de control aleatorio: si la consulta
+    en sí FALLA (DNS inalcanzable — timeout/rc != 0), no sigue con las ~miles restantes (mismo
+    coste de red multiplicado por nada: todas fallarían igual) y devuelve []. Si el control
+    resuelve (aunque sea NXDOMAIN, rc==0 y vacío — lo normal, confirma que no hay wildcard, o
+    con IP — DNS wildcard real, _drop_catchall lo filtra abajo), sigue con el barrido completo
+    en paralelo (ThreadPoolExecutor — miles de `dig` secuenciales serían demasiado lentos)."""
+    try:
+        words = [w.strip() for w in Path(wordlist).read_text(errors="ignore").splitlines()
+                 if w.strip() and not w.startswith("#")]
+    except OSError:
+        return []
+
+    def _resolve(name):
+        cmd = ["dig", "+short", "+tries=1", "+time=3", "a", name]
+        if server:
+            cmd.append(f"@{server}")
+        rc, out = run_capture(cmd, timeout=8)
+        return rc, frozenset(_dig_a_ips(out))
+
+    crc, cips = _resolve(f"{os.urandom(6).hex()}.{domain}")
+    if crc != 0:
+        return []
+    control = (0, cips, None)
+
+    hits = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_resolve, f"{w}.{domain}"): w for w in words}
+        for fut in concurrent.futures.as_completed(futs):
+            rc, ips = fut.result()
+            if rc == 0 and ips:
+                hits.append({"host": f"{futs[fut]}.{domain}", "ips": sorted(ips)})
+    return _drop_catchall(hits, control, lambda h: (0, frozenset(h["ips"]), None))
 
 
 def _mirror_map(webs, root_redirect, targets=()):
@@ -4035,6 +4090,41 @@ def fp_subdomains(domains, extra_domain):
     if found:
         res["next"].append("Confirma estos subdominios como vhost real (ya se prueban solos en la Fase 7) y añádelos a /etc/hosts")
         res["passive_subdomains"] = sorted(set(found))
+    return res
+
+
+def fp_subdomains_active(ip, domains, extra_domain, wordlist, no_vhost_fuzz=False):
+    """Fuzzing ACTIVO de subdominios por DNS (fuzz_subdomains) — a diferencia de fp_subdomains/
+    fp_ctlogs (pasivos, dependen de un servicio externo), aquí se confirma por RESOLUCIÓN DNS
+    REAL contra el dominio descubierto, con la MISMA wordlist que usa la Fase 7 para el vhost
+    fuzzing por Host: — mismo "diccionario de nombres candidatos", dos formas de confirmarlos.
+    Se salta con --no-vhost-fuzz: es la misma categoría de fuzzing por diccionario que esa Fase
+    7 (un scope de bug bounty con subdominios tasados quiere saltarse las dos a la vez, no solo
+    una) — mismo criterio que ya documenta esa flag."""
+    res = _fp("subdomains_active", "Subdominios (DNS activo)", [])
+    if no_vhost_fuzz or not have("dig") or not Path(wordlist).is_file():
+        return res
+    targets = sorted({base_domain(d) for d in
+                      (([extra_domain] if extra_domain else []) + list(domains))})
+    found = []
+    for dom in targets:
+        # ¿el resolutor del sistema conoce este dominio? Mismo chequeo que fp_dns_nameservers:
+        # si NO (dominio interno/solo-lab, lo normal en un lab por VPN/túnel), se pregunta
+        # directamente al objetivo escaneado (`ip`) en vez de rendirse.
+        rc_ns, out_ns = run_capture(["dig", "NS", dom, "+short"], timeout=15)
+        server = None if (rc_ns == 0 and out_ns.strip()) else ip
+        hits = fuzz_subdomains(dom, wordlist, server=server)
+        _step(res, f"fuzz DNS {dom} ({Path(wordlist).name}, @{server or 'resolutor del sistema'})",
+              bool(hits), "\n".join(f"{h['host']} -> {','.join(h['ips'])}" for h in hits),
+              note="subdominios confirmados por resolución DNS real (no solo porque el servidor "
+                   "responda igual a cualquier Host, como el vhost fuzzing de la Fase 7)")
+        if hits:
+            shown = ", ".join(h["host"] for h in hits[:10]) + (f" (+{len(hits) - 10} más)" if len(hits) > 10 else "")
+            res["findings"].append(("info", f"DNS activo ({dom}): {len(hits)} subdominio(s) resuelven de verdad — {shown}"))
+            found += [h["host"] for h in hits]
+    if found:
+        res["next"].append("Confirma estos subdominios como vhost real (ya se prueban solos en la Fase 7) y añádelos a /etc/hosts")
+        res["active_subdomains"] = sorted(set(found))
     return res
 
 
@@ -6364,7 +6454,8 @@ def fp_gitdaemon(ip, ports, services, host, deep):
     return res
 
 
-def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=None, has_creds=False):
+def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=None, has_creds=False,
+                       no_vhost_fuzz=False, vhost_wordlist=None):
     """Agrupa los puertos abiertos por protocolo y lanza su footprint una sola vez.
 
     `webs_fp`: puertos web ya deduplicados por espejo (80→443, 8080→8443…; ver
@@ -6376,6 +6467,10 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
     Se le pasa a fp_kerberos para que deje que la Fase 5d (SMB/LDAP con esa credencial,
     autoritativo) saque los usuarios del dominio antes de molestarse en lanzar kerbrute
     userenum — ver fp_kerberos y _run_deferred_kerbrute_fallback.
+
+    `no_vhost_fuzz`/`vhost_wordlist`: hilan --no-vhost-fuzz/--vhost-wordlist hasta
+    fp_subdomains_active (fuzzing DE VERDAD por DNS, misma wordlist que la Fase 7 usa
+    para el vhost fuzzing por Host: — se salta con el mismo flag, ver esa función).
 
     Devuelve (footprints, whatweb_cache): whatweb_cache es {puerto: salida de
     whatweb} para que footprint_web_slow() (nikto/nuclei/cms-scan/crawl, que corre
@@ -6408,6 +6503,8 @@ def footprint_services(ip, services, host, extra_domain, deep, webs_fp, base=Non
         out.append(fp_whois(domains, extra_domain))
         out.append(fp_ctlogs(domains, extra_domain))
         out.append(fp_subdomains(domains, extra_domain))
+        out.append(fp_subdomains_active(ip, domains, extra_domain, vhost_wordlist or DNS_WORDLIST,
+                                        no_vhost_fuzz=no_vhost_fuzz))
         out.append(fp_wayback(domains, extra_domain))
         out.append(fp_dns_nameservers(domains, extra_domain, dc_ip=ip))
     # kerberos se procesa EL ÚLTIMO a propósito (no por número de puerto, que lo pondría
@@ -17781,6 +17878,55 @@ def selftest():
     _vh_sig = {"real.x": (200, 120, "A"), "catch.x": (301, 20, "B")}
     assert _drop_catchall(_vh_hits, (301, 20, "B"), lambda h: _vh_sig[h["host"]]) == [{"host": "real.x"}]
     assert _drop_catchall(_vh_hits, (None, 0, ""), lambda h: _vh_sig[h["host"]]) == _vh_hits  # sin baseline: no filtra
+
+    # fuzz_subdomains: _dig_a_ips descarta la(s) línea(s) de CNAME intermedio (acaban en '.',
+    # nunca son una IP) y se queda solo con el/los registro(s) A finales. Puro, sin red.
+    assert _dig_a_ips("mail.example.com.\n10.1.1.1\n") == ["10.1.1.1"]
+    assert _dig_a_ips("") == [] and _dig_a_ips(None) == []
+    _real_rc_dns = run_capture
+    _tmp_dnswl = Path(tempfile.mkdtemp()) / "subs.txt"
+    _tmp_dnswl.write_text("admin\ndev\ntest\n")
+    try:
+        # caso normal: 'admin' resuelve, el resto (y el control aleatorio) da NXDOMAIN — ni
+        # rastro de wildcard, así que 'admin' es un hallazgo real.
+        def _fake_rc_ok(cmd, timeout=None):
+            name = cmd[5]
+            return (0, "10.0.0.5\n") if name.startswith("admin.") else (0, "")
+        globals()["run_capture"] = _fake_rc_ok
+        _sub_hits = fuzz_subdomains("x.test", str(_tmp_dnswl))
+        assert _sub_hits == [{"host": "admin.x.test", "ips": ["10.0.0.5"]}], _sub_hits
+
+        # wildcard DNS: TODO resuelve a la misma IP (incluido el control) → _drop_catchall
+        # tira hasta 'admin', que si no sería un falso positivo.
+        globals()["run_capture"] = lambda cmd, timeout=None: (0, "10.0.0.9\n")
+        assert fuzz_subdomains("x.test", str(_tmp_dnswl)) == []
+
+        # DNS inalcanzable: el propio control falla (rc != 0) → ni se intenta barrer la
+        # wordlist entera (todas fallarían igual; sería tiempo tirado) y devuelve [].
+        globals()["run_capture"] = lambda cmd, timeout=None: (1, "")
+        assert fuzz_subdomains("x.test", str(_tmp_dnswl)) == []
+    finally:
+        globals()["run_capture"] = _real_rc_dns
+
+    # fp_subdomains_active: --no-vhost-fuzz la salta entera (misma categoría de fuzzing por
+    # diccionario que la Fase 7 — un scope con subdominios tasados se salta las dos a la vez).
+    assert fp_subdomains_active("10.0.0.1", ["x.test"], None, str(_tmp_dnswl),
+                                no_vhost_fuzz=True).get("active_subdomains") is None
+    _real_have_dns, _real_rc_dns2 = have, run_capture
+    globals()["have"] = lambda name: True
+
+    def _fake_rc_active(cmd, timeout=None):
+        if cmd[:2] == ["dig", "NS"]:
+            return 0, "ns1.x.test.\n"   # el resolutor del sistema SÍ conoce el dominio
+        name = cmd[5]
+        return (0, "10.0.0.5\n") if name.startswith("admin.") else (0, "")
+    globals()["run_capture"] = _fake_rc_active
+    try:
+        _fpa = fp_subdomains_active("10.0.0.1", ["x.test"], None, str(_tmp_dnswl))
+    finally:
+        globals()["have"], globals()["run_capture"] = _real_have_dns, _real_rc_dns2
+    assert _fpa["active_subdomains"] == ["admin.x.test"], _fpa
+    assert any("DNS activo" in f[1] for f in _fpa["findings"])
     # dedup web (#5): un HTTP que redirige a la HTTPS DEL MISMO host/puerto abierto es espejo; a
     # OTRO host (SSO externo) o a un puerto https que no está abierto NO lo es (se conserva el puerto).
     _wm = [fake(name="http", port=80), fake(name="https", port=443)]
@@ -21117,7 +21263,9 @@ def run_one(ip, name, args, folder=None):
     elif not args.no_footprint and not args.default_creds:
         try:
             footprints, whatweb_cache = footprint_services(ip, services, host, extra_dom, args.aggressive, webs_fp,
-                                                            base=base, has_creds=bool(pcreds))
+                                                            base=base, has_creds=bool(pcreds),
+                                                            no_vhost_fuzz=args.no_vhost_fuzz,
+                                                            vhost_wordlist=args.vhost_wordlist)
             for f in footprints:
                 f["phase"] = "footprint"
             footprint_ok = True
@@ -21293,7 +21441,8 @@ def run_one(ip, name, args, folder=None):
             add.add(f"{_nxc_name.lower()}.{_nxc_dom}")
         domains = sorted(set(domains) | add)
     passive_subs = sorted({s for f in footprints for s in f.get("ctlog_subdomains", [])} |
-                           {s for f in footprints for s in f.get("passive_subdomains", [])})
+                           {s for f in footprints for s in f.get("passive_subdomains", [])} |
+                           {s for f in footprints for s in f.get("active_subdomains", [])})
     if passive_subs:
         domains = sorted(set(domains) | set(passive_subs))
     vhost_names = _parse_hostnames(args.vhost_names) if args.vhost_names else []
@@ -21651,7 +21800,9 @@ def main():
                          "web/cert que lo filtre. Si pones --vhost y -D/--domain a la vez, deben coincidir "
                          "(si no, error: son el mismo campo).")
     g_dominio.add_argument("--vhost-wordlist", metavar="FICHERO",
-                    help="Wordlist de subdominios para el vhost fuzzing (def.: la de subdominios de seclists).")
+                    help="Wordlist de subdominios para el vhost fuzzing (Host: FUZZ.dominio) Y para el "
+                         "fuzzing de subdominios por DNS real (Fase 5) — la misma lista, dos formas de "
+                         "confirmarla (def.: la de subdominios de seclists).")
     g_dominio.add_argument("--vhost-names", metavar="LISTA",
                     help="Nombres de vhost YA CONOCIDOS, separados por coma (p. ej. "
                          "'app.inlanefreight.local,dev.inlanefreight.local' — el enunciado del lab te los da). "
@@ -21830,11 +21981,13 @@ def main():
     g_tools.add_argument("--no-add-hosts", action="store_true",
                     help="No ofrecer añadir dominios a /etc/hosts.")
     g_lentas.add_argument("--no-fuzz", action="store_true",
-                    help="Salta las Fases 5 y 6 (fuzzing de directorios y de vhosts con ffuf).")
+                    help="Salta las Fases 6 y 7 (fuzzing de directorios y de vhosts con ffuf).")
     g_lentas.add_argument("--no-vhost-fuzz", action="store_true",
-                    help="Salta SOLO la Fase 7 (vhost fuzzing por diccionario); mantiene la Fase 6 (fuzzing de "
-                         "directorios). Para scopes de bug bounty donde los hostnames están tasados y el resto "
-                         "de subdominios (p. ej. '*.dominio.com') está fuera de scope explícitamente.")
+                    help="Salta el fuzzing por diccionario de nombres de dominio: la Fase 7 (vhost fuzzing "
+                         "por Host:) Y el fuzzing de subdominios por DNS real de la Fase 5 — mantiene la "
+                         "Fase 6 (fuzzing de directorios). Para scopes de bug bounty donde los hostnames "
+                         "están tasados y el resto de subdominios (p. ej. '*.dominio.com') está fuera de "
+                         "scope explícitamente.")
     g_lentas.add_argument("--nikto", action="store_true",
                     help="Lanza nikto DE VERDAD contra cada servicio web (Fase 5), no solo lo sugiere. "
                          "OFF por defecto: es un escaneo completo de vulnerabilidades/config conocidas, "
