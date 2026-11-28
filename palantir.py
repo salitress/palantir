@@ -160,7 +160,7 @@ from pathlib import Path
 
 # Versión de la herramienta. Fuente única: la usan --version, el banner y el pie
 # del informe HTML. Mantener en sincronía con CHANGELOG.md y el tag de git.
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 # ───────────────────────── Colores ─────────────────────────
 if sys.stdout.isatty() and os.name == "posix" and not os.environ.get("NO_COLOR"):
@@ -5167,6 +5167,54 @@ def _parse_katana_jsonl(out):
     return {"urls": sorted(set(urls)), "forms": sorted(set(forms))}
 
 
+def _wordlist_recos(url, forms=None, emails=None):
+    """Recomendaciones de wordlists A MEDIDA tras un crawl web (--crawl): en vez de tirar
+    SIEMPRE de rockyou/SecLists genéricas, el siguiente paso natural es construir un diccionario
+    pegado al objetivo con lo que el propio crawling ya destapó. CeWL raspa las palabras REALES
+    del mismo sitio (jerga, productos, nombres internos); Username Anarchy convierte un nombre
+    en candidatos de usuario; CUPP convierte un perfil OSINT en contraseñas. Si katana vio
+    formularios (superficie de login), se cierra el círculo con hydra contra ESE login usando la
+    lista a medida. Puro → testable sin red: devuelve la lista de next-steps (strings), no ejecuta
+    nada. Encaja el flujo del módulo HTB 'Custom Wordlists' (CeWL/Username Anarchy/CUPP → hydra)."""
+    recos = []
+    # CeWL: el acompañante natural de katana — crawlea el MISMO sitio y saca un diccionario con las
+    # palabras que de verdad aparecen en él, mucho más certero que una lista genérica para brute-force.
+    recos.append(
+        f"cewl -d 3 -m 5 -e -w cewl.txt {url}   # wordlist A MEDIDA con las palabras reales del sitio "
+        f"(-e además extrae emails) — pega mucho más que rockyou genérica para brute-force del login")
+    # Username Anarchy: nombre real → candidatos de usuario (jsmith/j.smith/smithj/…) cuando no conoces
+    # el formato de cuenta del objetivo. Si el crawl sacó emails, la parte local ya te da el nombre.
+    if emails:
+        recos.append(
+            "username-anarchy <nombre> <apellido> > users.txt   # nombre real (p. ej. del email "
+            f"crawleado {sorted(emails)[0]}) → candidatos de usuario (jsmith/j.smith/smithj/…)")
+    else:
+        recos.append(
+            "username-anarchy <nombre> <apellido> > users.txt   # nombre real → candidatos de usuario "
+            "(jsmith/j.smith/smithj/…) cuando no conoces el formato de cuenta del objetivo")
+    # CUPP: perfil OSINT (fechas, mascota, empresa, aficiones) → contraseñas a medida; luego se filtran
+    # a la política de contraseñas del objetivo con grep antes de dárselas a hydra.
+    recos.append(
+        "cupp -i   # perfil OSINT (nombre/fechas/mascota/empresa) → contraseñas a medida; fíltralas a la "
+        "política con: grep -E '^.{8,}$' jane.txt | grep -E '[A-Z]' | grep -E '[0-9]' > pass.txt")
+    # Si katana vio un formulario, cerramos el círculo: hydra al login con la lista A MEDIDA, no rockyou.
+    if forms:
+        import urllib.parse
+        pu = urllib.parse.urlsplit(sorted(forms)[0])
+        _fpath = pu.path or "/"
+        try:
+            _port = pu.port   # urlsplit.port lanza ValueError con un puerto raro/fuera de rango
+        except ValueError:
+            _port = None
+        _fport = _port or (443 if pu.scheme == "https" else 80)
+        _ssl = " -S" if pu.scheme == "https" else ""
+        recos.append(
+            f"hydra -L users.txt -P cewl.txt {pu.hostname or url} -s {_fport}{_ssl} http-post-form "
+            f"\"{_fpath}:username=^USER^&password=^PASS^:F=credenciales inválidas\"   # brute del login que "
+            "vio katana, con la wordlist a medida (ajusta ruta/campos/mensaje de error al formulario real)")
+    return recos
+
+
 def _wpscan_summary(out):
     """De la salida JSON de wpscan (-f json): (componente, nº vulns) por plugin/tema/core
     con vulnerabilidades conocidas + usuarios enumerados. Tolerante a JSON roto/parcial
@@ -5720,6 +5768,11 @@ def fp_web_slow(ip, p, res, whatweb_out, host, deep, hostname=None):
                     res["findings"].append(
                         ("alta", f"Katana {port}: {len(all_comments)} comentario(s) HTML — " +
                                  "; ".join(f"{u}: {sanitize(c)[:150]}" for u, c in all_comments[:5])))
+                # Con el crawl ya hecho, el siguiente paso natural NO es rockyou genérica: es construir
+                # una wordlist A MEDIDA con lo que el propio sitio acaba de destapar (CeWL raspa sus
+                # palabras; Username Anarchy/CUPP perfilan usuario/contraseña) y cerrar con hydra contra
+                # el login que vio katana. Ver _wordlist_recos / módulo HTB 'Custom Wordlists'.
+                res["next"] += _wordlist_recos(url, crawled["forms"], all_emails)
                 # LFI confirmado contra parámetros vistos DENTRO del JS (ver _extract_js_params):
                 # katana no ejecuta JS, así que 'script.php?param=' solo como string literal
                 # nunca se visita como URL por sí solo — caso real: index.php?referer= hallado
@@ -17713,6 +17766,24 @@ def selftest():
     assert _kr["urls"] == ["http://x.com/", "http://x.com/app.js", "http://x.com/login"]
     assert _kr["forms"] == ["http://x.com/login"]
     assert _parse_katana_jsonl("")["urls"] == []
+    # --crawl → wordlists A MEDIDA (CeWL/Username Anarchy/CUPP → hydra): el helper siempre propone
+    # las tres herramientas y, si katana vio un formulario, añade el hydra contra ESE login (host,
+    # puerto y ruta sacados de la URL del formulario; -S si era https).
+    _wr = _wordlist_recos("http://x.com/", ["https://x.com:8443/login"], {"a@b.com"})
+    assert any(r.startswith("cewl ") and r.split("   #", 1)[0].rstrip().endswith("http://x.com/")
+               for r in _wr)  # url al final del comando (canónico: cewl [opciones] url)
+    assert any("username-anarchy" in r for r in _wr) and any(r.startswith("cupp -i") for r in _wr)
+    _hy = [r for r in _wr if r.startswith("hydra ")][0]
+    assert "x.com -s 8443 -S http-post-form" in _hy and '"/login:username=^USER^' in _hy
+    assert "a@b.com" in [r for r in _wr if "username-anarchy" in r][0]   # usa el email crawleado
+    # sin formularios ni emails: tres recomendaciones, ninguna de hydra, hint genérico de usuario
+    _wr0 = _wordlist_recos("http://x.com/")
+    assert len(_wr0) == 3 and not any(r.startswith("hydra ") for r in _wr0)
+    assert "cuando no conoces el formato de cuenta" in [r for r in _wr0 if "username-anarchy" in r][0]
+    # puerto malformado en la URL del formulario: NO debe lanzar; cae al puerto por defecto (80/http)
+    _wrp = _wordlist_recos("http://x.com/", ["http://x.com:99999/bad"])
+    _hyp = [r for r in _wrp if r.startswith("hydra ")][0]
+    assert "x.com -s 80 http-post-form" in _hyp and "-S" not in _hyp
     # --nuclei: parseo del jsonl (tolerante a líneas no-JSON) + orden/mapeo de severidad
     _nuclei_jsonl = "\n".join([
         json.dumps({"template-id": "tls-version", "info": {"name": "TLS", "severity": "low"}, "matched-at": "x:443"}),

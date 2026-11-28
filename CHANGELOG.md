@@ -6,6 +6,23 @@ commit log — see `git log` for that.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project follows [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] - 2026-11-28
+
+### Added
+
+- **Custom-wordlist next-steps after a real web crawl** (`_wordlist_recos`, surfaced from the
+  `--crawl`/katana block in `fp_web_slow`). Once katana has crawled a site and surfaced its real
+  attack surface (forms, emails, on-page words), palantir now recommends the natural follow-up —
+  building a target-specific wordlist instead of reaching for generic `rockyou`/SecLists — mirroring
+  the HTB "Custom Wordlists" workflow: **CeWL** to scrape the site's own words into a dictionary,
+  **Username Anarchy** to turn a real name (e.g. from a crawled email) into username candidates, and
+  **CUPP** to turn an OSINT profile into a password list (with the password-policy `grep` filter).
+  When katana saw a login form, it closes the loop with a ready `hydra http-post-form` against that
+  exact login — host, port, path and `-S` (SSL) all derived from the form's own URL — using the
+  tailored list rather than `rockyou`. Suggestions only, nothing is executed; they only appear when a
+  crawl actually ran, and the HTML report's existing next-step dedup collapses the generic ones across
+  ports. Parsing of the form URL tolerates a malformed port without raising.
+
 ## [2.6.0] - 2026-11-26
 
 ### Added
